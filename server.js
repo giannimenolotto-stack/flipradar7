@@ -10,6 +10,7 @@ app.use(express.json());
 
 let watchlist     = [];
 let seenListings  = new Set();
+let listings      = [];
 let lastScanTime  = null;
 let lastScanCount = 0;
 
@@ -58,10 +59,13 @@ async function scrapeKeyword(keyword, maxPrice) {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
       return {
         id,
-        title:   item.title || item.name || item.listing_title || keyword,
-        price:   parsePrice(item.price || item.listing_price || item.priceAmount),
-        url:     item.url || item.listing_url || `https://www.facebook.com/marketplace/item/${id}/`,
+        title:    item.title || item.name || item.listing_title || keyword,
+        price:    parsePrice(item.price || item.listing_price || item.priceAmount),
+        url:      item.url || item.listing_url || `https://www.facebook.com/marketplace/item/${id}/`,
+        image:    item.image || item.thumbnail || item.photos?.[0] || null,
+        location: item.location || item.city || null,
         keyword,
+        foundAt:  new Date().toISOString(),
       };
     }).filter(l => l.id);
 
@@ -91,13 +95,17 @@ async function runScan() {
 
   for (const item of watchlist) {
     try {
-      const listings = await scrapeKeyword(item.keyword, item.maxPrice);
-      for (const listing of listings) {
+      const found = await scrapeKeyword(item.keyword, item.maxPrice);
+      for (const listing of found) {
         const key = `${item.keyword}:${listing.id}`;
         if (seenListings.has(key)) continue;
         seenListings.add(key);
         if (item.maxPrice && listing.price > item.maxPrice) continue;
         totalNew++;
+
+        listings.unshift(listing);
+        if (listings.length > 200) listings = listings.slice(0, 200);
+
         const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
         await sendPushover(`FlipRadar: ${item.keyword}`, `${listing.title}\n${priceStr}`, listing.url);
         await sleep(500);
@@ -117,6 +125,7 @@ app.get('/', (req, res) => res.json({
   status: 'ok',
   apify: APIFY_TOKEN ? 'connected' : 'NO APIFY_TOKEN SET',
   watchlist: watchlist.length,
+  listingsCount: listings.length,
   lastScan: lastScanTime,
   lastScanNewListings: lastScanCount,
   seenTotal: seenListings.size,
@@ -141,6 +150,14 @@ app.delete('/watchlist/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/listings', (req, res) => res.json(listings));
+
+app.delete('/listings', (req, res) => {
+  listings = [];
+  seenListings = new Set();
+  res.json({ ok: true });
+});
+
 app.post('/scan/now', async (req, res) => {
   res.json({ ok: true, message: 'Scan started' });
   runScan().catch(e => console.error('[Scan/now]', e.message));
@@ -150,8 +167,8 @@ app.post('/scan/test', async (req, res) => {
   const { keyword, maxPrice } = req.body;
   if (!keyword) return res.status(400).json({ error: 'keyword required' });
   try {
-    const listings = await scrapeKeyword(keyword, maxPrice ? parseInt(maxPrice) : null);
-    res.json({ keyword, count: listings.length, listings });
+    const found = await scrapeKeyword(keyword, maxPrice ? parseInt(maxPrice) : null);
+    res.json({ keyword, count: found.length, listings: found });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
