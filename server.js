@@ -26,12 +26,11 @@ async function sendPushover(title, message, url) {
 }
 
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
-const APIFY_ACTOR = 'curious_coder~facebook-marketplace-scraper';
+const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 
 async function scrapeKeyword(keyword, maxPrice) {
   if (!APIFY_TOKEN) { console.warn('[Apify] No token'); return []; }
 
-  // Build Melbourne search URL
   const encoded    = encodeURIComponent(keyword);
   const priceParam = maxPrice ? `&maxPrice=${maxPrice}` : '';
   const fbUrl      = `https://www.facebook.com/marketplace/melbourne/search/?query=${encoded}${priceParam}&sortBy=creation_time_descend&daysSinceListed=1`;
