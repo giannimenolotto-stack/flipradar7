@@ -36,7 +36,7 @@ async function scrapeKeyword(keyword, maxPrice) {
   const fbUrl      = `https://www.facebook.com/marketplace/melbourne/search/?query=${encoded}${priceParam}&sortBy=creation_time_descend&daysSinceListed=1`;
 
   const input = {
-    startUrls: [{ url: fbUrl }],
+    urls: [fbUrl],
     maxItems: 25,
   };
 
