@@ -54,6 +54,7 @@ async function scrapeKeyword(keyword, maxPrice) {
 
     const items = Array.isArray(runRes.data) ? runRes.data : [];
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s)`);
+    if (items.length > 0) console.log('[Apify] Sample item:', JSON.stringify(items[0]));
 
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
