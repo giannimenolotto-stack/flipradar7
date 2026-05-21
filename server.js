@@ -173,6 +173,29 @@ app.delete('/listings', (req, res) => {
   res.json({ ok: true });
 });
 
+
+// Image proxy — fetches FB CDN images server-side and returns base64
+app.get('/proxy-image', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  try {
+    const response = await axios.get(url, {
+      responseType: 'arraybuffer',
+      timeout: 10000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
+        'Referer': 'https://www.facebook.com/'
+      }
+    });
+    const base64 = Buffer.from(response.data).toString('base64');
+    const mediaType = response.headers['content-type'] || 'image/jpeg';
+    res.json({ base64, mediaType });
+  } catch (e) {
+    console.error('[Proxy] Image fetch failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/scan/now', async (req, res) => {
   res.json({ ok: true, message: 'Scan started' });
   runScan().catch(e => console.error('[Scan/now]', e.message));
