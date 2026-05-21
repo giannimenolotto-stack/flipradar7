@@ -34,10 +34,26 @@ async function redisSet(key, value) {
 
 // ── In-memory state (backed by Redis on startup) ──────────
 let watchlist    = [];
-let seenListings = new Set();
+let seenListings = {}; // { "keyword:id": timestamp } — expires after 48h
 let listings     = [];
 let lastScanTime  = null;
 let lastScanCount = 0;
+
+const SEEN_TTL_MS = 48 * 60 * 60 * 1000; // 48 hours
+
+function hasSeen(key) {
+  const ts = seenListings[key];
+  if (!ts) return false;
+  if (Date.now() - ts > SEEN_TTL_MS) { delete seenListings[key]; return false; }
+  return true;
+}
+function markSeen(key) { seenListings[key] = Date.now(); }
+function pruneSeen() {
+  const cutoff = Date.now() - SEEN_TTL_MS;
+  for (const key of Object.keys(seenListings)) {
+    if (seenListings[key] < cutoff) delete seenListings[key];
+  }
+}
 
 async function loadFromRedis() {
   console.log('[Redis] Loading state...');
@@ -46,12 +62,25 @@ async function loadFromRedis() {
   const savedSeen     = await redisGet('flipradar:seen');
   if (savedWatch && Array.isArray(savedWatch))    { watchlist = savedWatch; console.log(`[Redis] Loaded ${watchlist.length} watches`); }
   if (savedListings && Array.isArray(savedListings)) { listings  = savedListings; console.log(`[Redis] Loaded ${listings.length} listings`); }
-  if (savedSeen && Array.isArray(savedSeen))     { seenListings = new Set(savedSeen); console.log(`[Redis] Loaded ${seenListings.size} seen IDs`); }
+  if (savedSeen && typeof savedSeen === 'object' && !Array.isArray(savedSeen)) {
+    seenListings = savedSeen;
+    pruneSeen();
+    console.log(`[Redis] Loaded ${Object.keys(seenListings).length} seen IDs`);
+  } else if (savedSeen && Array.isArray(savedSeen)) {
+    // Migrate old array format — stamp with current time
+    savedSeen.forEach(k => { seenListings[k] = Date.now(); });
+    console.log(`[Redis] Migrated ${Object.keys(seenListings).length} seen IDs from old format`);
+  }
 }
 
 async function saveWatchlist() { await redisSet('flipradar:watchlist', watchlist); }
 async function saveListings()  { await redisSet('flipradar:listings', listings); }
-async function saveSeen()      { await redisSet('flipradar:seen', [...seenListings].slice(-2000)); }
+async function saveSeen() {
+  pruneSeen();
+  // Keep only the most recent 2000 entries by timestamp
+  const entries = Object.entries(seenListings).sort((a, b) => b[1] - a[1]).slice(0, 2000);
+  await redisSet('flipradar:seen', Object.fromEntries(entries));
+}
 
 // ── Pushover ──────────────────────────────────────────────
 async function sendPushover(token, user, title, message, url) {
@@ -118,10 +147,14 @@ async function runScan() {
     const found = await scrapeKeyword(keyword);
     for (const listing of found) {
       const key = `${keyword}:${listing.id}`;
-      if (seenListings.has(key)) continue;
-      seenListings.add(key);
-      listings.unshift(listing);
-      if (listings.length > 500) listings = listings.slice(0, 500);
+      if (hasSeen(key)) continue;
+      markSeen(key);
+
+      // Avoid storing duplicate listing IDs across keywords
+      if (!listings.find(l => l.id === listing.id)) {
+        listings.unshift(listing);
+        if (listings.length > 500) listings = listings.slice(0, 500);
+      }
       totalNew++;
 
       const watchers = watchlist.filter(w => w.keyword.toLowerCase() === keyword);
@@ -140,16 +173,26 @@ async function runScan() {
   lastScanCount = totalNew;
   console.log(`[Scan] Done — ${totalNew} new listing(s)`);
 
-  // Persist to Redis after scan
-  if (totalNew > 0) {
-    await saveListings();
-    await saveSeen();
-  }
+  // Always persist after every scan so Redis stays current even if no new listings
+  await saveListings();
+  await saveSeen();
 }
 
 cron.schedule('*/30 * * * *', () => {
   runScan().catch(e => console.error('[Cron]', e.message));
 });
+
+// Keep Render free tier awake — ping self every 14 mins so the process never sleeps
+// (Render spins down after 15 mins of inactivity, which would kill the cron)
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
+if (SELF_URL) {
+  setInterval(() => {
+    axios.get(SELF_URL + '/').catch(() => {});
+    console.log('[Ping] Self-ping sent');
+  }, 14 * 60 * 1000);
+} else {
+  console.warn('[Ping] No RENDER_EXTERNAL_URL set — server may sleep and miss cron jobs on free tier');
+}
 
 // ── Routes ────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
@@ -161,8 +204,25 @@ app.get('/', (req, res) => res.json({
   listingsCount: listings.length,
   lastScan: lastScanTime,
   lastScanNewListings: lastScanCount,
-  seenTotal: seenListings.size,
+  seenTotal: Object.keys(seenListings).length,
 }));
+
+app.get('/status', (req, res) => {
+  const now = new Date();
+  const mins = now.getMinutes();
+  // Next 30-min mark
+  const nextMins = mins < 30 ? 30 - mins : 60 - mins;
+  res.json({
+    ok: true,
+    lastScan: lastScanTime,
+    lastScanNewListings: lastScanCount,
+    nextScanInMins: nextMins,
+    watches: watchlist.length,
+    listingsStored: listings.length,
+    seenEntries: Object.keys(seenListings).length,
+    uptime: Math.floor(process.uptime()) + 's',
+  });
+});
 
 app.get('/watchlist', (req, res) => {
   const userId = req.query.userId;
@@ -203,7 +263,7 @@ app.get('/listings', (req, res) => {
 
 app.delete('/listings', async (req, res) => {
   listings = [];
-  seenListings = new Set();
+  seenListings = {};
   await saveListings();
   await saveSeen();
   console.log('[Clear] Feed cleared');
@@ -228,51 +288,6 @@ app.get('/proxy-image', async (req, res) => {
     res.json({ base64, mediaType });
   } catch (e) {
     console.error('[Proxy] Image fetch failed:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
-// Scan a single keyword immediately — used when user first adds a watch
-app.post('/scan/keyword', async (req, res) => {
-  const { keyword, maxPrice } = req.body;
-  if (!keyword) return res.status(400).json({ error: 'keyword required' });
-
-  // Use daysSinceListed=1 but limit to recent (Apify sorts by newest first)
-  const fbUrl = `https://www.facebook.com/marketplace/melbourne/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=1`;
-  try {
-    const res2 = await axios.post(
-      `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [fbUrl], maxItems: 10, includeDetails: false },
-      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
-    );
-    const items = Array.isArray(res2.data) ? res2.data.filter(i => !i.error) : [];
-    let added = 0;
-    for (const item of items) {
-      const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
-      if (!id) continue;
-      const key = `${keyword.toLowerCase()}:${id}`;
-      if (seenListings.has(key)) continue;
-      seenListings.add(key);
-      const listing = {
-        id,
-        title:    item.marketplace_listing_title || item.title || keyword,
-        price:    parsePrice(item.listing_price?.amount || item.listing_price?.formatted_amount || item.price),
-        url:      item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
-        image:    item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
-        location: typeof item.location === 'string' ? item.location : (item.location?.reverse_geocode?.city || null),
-        keyword: keyword.toLowerCase(),
-        foundAt: new Date().toISOString(),
-      };
-      listings.unshift(listing);
-      if (listings.length > 500) listings = listings.slice(0, 500);
-      added++;
-    }
-    if (added > 0) { await saveListings(); await saveSeen(); }
-    console.log(`[Scan/Keyword] "${keyword}" -> ${added} new listing(s)`);
-    res.json({ ok: true, count: added });
-  } catch (e) {
-    console.error('[Scan/Keyword] Error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
