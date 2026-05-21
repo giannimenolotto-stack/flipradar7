@@ -54,17 +54,21 @@ async function scrapeKeyword(keyword, maxPrice) {
 
     const items = Array.isArray(runRes.data) ? runRes.data : [];
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s)`);
-    if (items.length > 0) console.log('[Apify] Sample item:', JSON.stringify(items[0]));
 
     return items.map(item => {
-      const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
+      const id = item.id || String(item.marketplace_listing_id || '');
+      const price = parsePrice(
+        item.listing_price?.amount ||
+        item.listing_price?.formatted_amount ||
+        item.price
+      );
       return {
         id,
-        title:    item.title || item.name || item.listing_title || keyword,
-        price:    parsePrice(item.price || item.listing_price || item.priceAmount),
-        url:      item.url || item.listing_url || `https://www.facebook.com/marketplace/item/${id}/`,
-        image:    item.image || item.thumbnail || item.photos?.[0] || null,
-        location: item.location || item.city || null,
+        title:    item.marketplace_listing_title || item.title || item.name || keyword,
+        price,
+        url:      item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
+        image:    item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
+        location: item.location?.reverse_geocode?.city || null,
         keyword,
         foundAt:  new Date().toISOString(),
       };
@@ -93,6 +97,8 @@ async function runScan() {
   console.log(`[Scan] Starting — ${watchlist.length} keyword(s)`);
   lastScanTime = new Date().toISOString();
   let totalNew = 0;
+  let pushCount = 0;
+  const MAX_PUSH = 3; // max Pushover alerts per scan
 
   for (const item of watchlist) {
     try {
@@ -107,15 +113,23 @@ async function runScan() {
         listings.unshift(listing);
         if (listings.length > 200) listings = listings.slice(0, 200);
 
-        const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
-        await sendPushover(`FlipRadar: ${item.keyword}`, `${listing.title}\n${priceStr}`, listing.url);
-        await sleep(500);
+        // Only push first MAX_PUSH new listings per scan
+        if (pushCount < MAX_PUSH) {
+          const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
+          await sendPushover(`FlipRadar: ${item.keyword}`, `${listing.title}\n${priceStr}`, listing.url);
+          pushCount++;
+          await sleep(500);
+        }
       }
     } catch (e) { console.error(`[Scan] Error on "${item.keyword}":`, e.message); }
   }
 
+  if (totalNew > MAX_PUSH) {
+    await sendPushover('FlipRadar', `+${totalNew - MAX_PUSH} more new listings found`, null);
+  }
+
   lastScanCount = totalNew;
-  console.log(`[Scan] Done — ${totalNew} new listing(s)`);
+  console.log(`[Scan] Done — ${totalNew} new listing(s), ${pushCount} alerts sent`);
 }
 
 cron.schedule('*/15 * * * *', () => {
