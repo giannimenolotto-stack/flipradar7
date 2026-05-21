@@ -44,9 +44,9 @@ async function loadFromRedis() {
   const savedWatch    = await redisGet('flipradar:watchlist');
   const savedListings = await redisGet('flipradar:listings');
   const savedSeen     = await redisGet('flipradar:seen');
-  if (savedWatch)    { watchlist = savedWatch; console.log(`[Redis] Loaded ${watchlist.length} watches`); }
-  if (savedListings) { listings  = savedListings; console.log(`[Redis] Loaded ${listings.length} listings`); }
-  if (savedSeen)     { seenListings = new Set(savedSeen); console.log(`[Redis] Loaded ${seenListings.size} seen IDs`); }
+  if (savedWatch && Array.isArray(savedWatch))    { watchlist = savedWatch; console.log(`[Redis] Loaded ${watchlist.length} watches`); }
+  if (savedListings && Array.isArray(savedListings)) { listings  = savedListings; console.log(`[Redis] Loaded ${listings.length} listings`); }
+  if (savedSeen && Array.isArray(savedSeen))     { seenListings = new Set(savedSeen); console.log(`[Redis] Loaded ${seenListings.size} seen IDs`); }
 }
 
 async function saveWatchlist() { await redisSet('flipradar:watchlist', watchlist); }
