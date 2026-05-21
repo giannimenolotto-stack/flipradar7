@@ -98,9 +98,15 @@ async function sendPushover(token, user, title, message, url) {
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 
-async function scrapeKeyword(keyword) {
+async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
-  const fbUrl = `https://www.facebook.com/marketplace/melbourne/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=1`;
+  let fbUrl;
+  if (opts.lat && opts.lng) {
+    fbUrl = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(keyword)}&latitude=${opts.lat}&longitude=${opts.lng}&radius=${opts.radius||50}&sortBy=creation_time_descend&daysSinceListed=1`;
+  } else {
+    const city = (opts.city || 'melbourne').toLowerCase().replace(/\s+/g, '');
+    fbUrl = `https://www.facebook.com/marketplace/${city}/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=1`;
+  }
   try {
     const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
@@ -139,7 +145,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // ── Per-watchlist scan ────────────────────────────────────
 async function scanWatchItem(watcher) {
   const keyword = watcher.keyword.toLowerCase();
-  const found = await scrapeKeyword(keyword);
+  const found = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
   let newCount = 0;
 
   for (const listing of found) {
@@ -252,6 +258,10 @@ app.post('/watchlist', async (req, res) => {
     name: name || keyword.trim(),
     maxPrice: maxPrice ? parseInt(maxPrice) : null,
     minPrice: minPrice ? parseInt(minPrice) : null,
+    location: req.body.location || null,
+    lat: req.body.lat ? parseFloat(req.body.lat) : null,
+    lng: req.body.lng ? parseFloat(req.body.lng) : null,
+    radius: req.body.radius ? parseInt(req.body.radius) : 50,
     plan: watchPlan,
     pushoverToken: pushoverToken || null,
     pushoverUser:  pushoverUser  || null,
@@ -320,7 +330,7 @@ app.post('/scan/test', async (req, res) => {
   const { keyword } = req.body;
   if (!keyword) return res.status(400).json({ error: 'keyword required' });
   try {
-    const found = await scrapeKeyword(keyword);
+    const found = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
     res.json({ keyword, count: found.length, listings: found });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
