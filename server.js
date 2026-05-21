@@ -8,12 +8,52 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ── Upstash Redis ─────────────────────────────────────────
+const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+async function redisGet(key) {
+  if (!REDIS_URL) return null;
+  try {
+    const res = await axios.get(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+    });
+    return res.data.result ? JSON.parse(res.data.result) : null;
+  } catch (e) { console.error('[Redis] GET error:', e.message); return null; }
+}
+
+async function redisSet(key, value) {
+  if (!REDIS_URL) return;
+  try {
+    await axios.post(`${REDIS_URL}/set/${encodeURIComponent(key)}`,
+      JSON.stringify(JSON.stringify(value)),
+      { headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  } catch (e) { console.error('[Redis] SET error:', e.message); }
+}
+
+// ── In-memory state (backed by Redis on startup) ──────────
 let watchlist    = [];
 let seenListings = new Set();
 let listings     = [];
 let lastScanTime  = null;
 let lastScanCount = 0;
 
+async function loadFromRedis() {
+  console.log('[Redis] Loading state...');
+  const savedWatch    = await redisGet('flipradar:watchlist');
+  const savedListings = await redisGet('flipradar:listings');
+  const savedSeen     = await redisGet('flipradar:seen');
+  if (savedWatch)    { watchlist = savedWatch; console.log(`[Redis] Loaded ${watchlist.length} watches`); }
+  if (savedListings) { listings  = savedListings; console.log(`[Redis] Loaded ${listings.length} listings`); }
+  if (savedSeen)     { seenListings = new Set(savedSeen); console.log(`[Redis] Loaded ${seenListings.size} seen IDs`); }
+}
+
+async function saveWatchlist() { await redisSet('flipradar:watchlist', watchlist); }
+async function saveListings()  { await redisSet('flipradar:listings', listings); }
+async function saveSeen()      { await redisSet('flipradar:seen', [...seenListings].slice(-2000)); }
+
+// ── Pushover ──────────────────────────────────────────────
 async function sendPushover(token, user, title, message, url) {
   if (!token || !user) return;
   try {
@@ -23,49 +63,37 @@ async function sendPushover(token, user, title, message, url) {
   } catch (e) { console.error('[Pushover] Error:', e.message); }
 }
 
+// ── Apify ─────────────────────────────────────────────────
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 
 async function scrapeKeyword(keyword) {
   if (!APIFY_TOKEN) return [];
-
   const fbUrl = `https://www.facebook.com/marketplace/melbourne/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=1`;
-
-  const input = {
-    urls: [fbUrl],
-    maxItems: 25,
-    includeDetails: true,
-  };
-
   try {
     const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      input,
+      { urls: [fbUrl], maxItems: 25, includeDetails: true },
       { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
-
-    const items = Array.isArray(res.data) ? res.data : [];
-    const valid = items.filter(i => !i.error);
-    console.log(`[Apify] "${keyword}" -> ${valid.length} item(s)`);
-    if (valid.length > 0) console.log('[Apify] Sample:', JSON.stringify(valid[0]).slice(0, 500));
-
-    return valid.map(item => {
+    const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
+    console.log(`[Apify] "${keyword}" -> ${items.length} item(s)`);
+    return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
       return {
         id,
-        title:       item.marketplace_listing_title || item.title || item.name || keyword,
+        title:       item.marketplace_listing_title || item.title || keyword,
         price:       parsePrice(item.listing_price?.amount || item.listing_price?.formatted_amount || item.price),
         url:         item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
-        image:       item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || item.imageUrl || null,
+        image:       item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
         location:    typeof item.location === 'string' ? item.location : (item.location?.reverse_geocode?.city || null),
-        description: item.redacted_description?.text || item.description || item.listing_description || null,
+        description: item.redacted_description?.text || item.description || null,
         keyword,
         foundAt:     new Date().toISOString(),
       };
     }).filter(l => l.id);
-
   } catch (e) {
-    console.error(`[Apify] Error for "${keyword}":`, e.response ? JSON.stringify(e.response.data).slice(0,300) : e.message);
+    console.error(`[Apify] Error for "${keyword}":`, e.response ? JSON.stringify(e.response.data).slice(0,200) : e.message);
     return [];
   }
 }
@@ -78,9 +106,9 @@ function parsePrice(raw) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ── Scan ──────────────────────────────────────────────────
 async function runScan() {
   if (watchlist.length === 0) { console.log('[Scan] No keywords'); return; }
-
   const uniqueKeywords = [...new Set(watchlist.map(w => w.keyword.toLowerCase()))];
   console.log(`[Scan] ${watchlist.length} watches, ${uniqueKeywords.length} unique keyword(s)`);
   lastScanTime = new Date().toISOString();
@@ -88,12 +116,10 @@ async function runScan() {
 
   for (const keyword of uniqueKeywords) {
     const found = await scrapeKeyword(keyword);
-
     for (const listing of found) {
       const key = `${keyword}:${listing.id}`;
       if (seenListings.has(key)) continue;
       seenListings.add(key);
-
       listings.unshift(listing);
       if (listings.length > 500) listings = listings.slice(0, 500);
       totalNew++;
@@ -108,21 +134,28 @@ async function runScan() {
         await sleep(300);
       }
     }
-
     await sleep(500);
   }
 
   lastScanCount = totalNew;
-  console.log(`[Scan] Done — ${totalNew} new listing(s) from ${uniqueKeywords.length} unique keyword(s)`);
+  console.log(`[Scan] Done — ${totalNew} new listing(s)`);
+
+  // Persist to Redis after scan
+  if (totalNew > 0) {
+    await saveListings();
+    await saveSeen();
+  }
 }
 
 cron.schedule('*/15 * * * *', () => {
   runScan().catch(e => console.error('[Cron]', e.message));
 });
 
+// ── Routes ────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'ok',
   apify: APIFY_TOKEN ? 'connected' : 'NO APIFY_TOKEN SET',
+  redis: REDIS_URL ? 'connected' : 'not set',
   watches: watchlist.length,
   uniqueKeywords: [...new Set(watchlist.map(w => w.keyword.toLowerCase()))].length,
   listingsCount: listings.length,
@@ -136,7 +169,7 @@ app.get('/watchlist', (req, res) => {
   res.json(userId ? watchlist.filter(w => w.userId === userId) : watchlist);
 });
 
-app.post('/watchlist', (req, res) => {
+app.post('/watchlist', async (req, res) => {
   const { keyword, maxPrice, userId, pushoverToken, pushoverUser } = req.body;
   if (!keyword || keyword.trim().length < 2)
     return res.status(400).json({ error: 'keyword required' });
@@ -150,14 +183,16 @@ app.post('/watchlist', (req, res) => {
     addedAt: new Date().toISOString(),
   };
   watchlist.push(item);
+  await saveWatchlist();
   console.log(`[Watch] Added "${item.keyword}" for user ${item.userId}`);
   res.json(item);
 });
 
-app.delete('/watchlist/:id', (req, res) => {
+app.delete('/watchlist/:id', async (req, res) => {
   const before = watchlist.length;
   watchlist = watchlist.filter(w => w.id !== req.params.id);
   if (watchlist.length === before) return res.status(404).json({ error: 'not found' });
+  await saveWatchlist();
   res.json({ ok: true });
 });
 
@@ -166,15 +201,16 @@ app.get('/listings', (req, res) => {
   res.json(keyword ? listings.filter(l => l.keyword === keyword) : listings);
 });
 
-app.delete('/listings', (req, res) => {
+app.delete('/listings', async (req, res) => {
   listings = [];
   seenListings = new Set();
+  await saveListings();
+  await saveSeen();
   console.log('[Clear] Feed cleared');
   res.json({ ok: true });
 });
 
-
-// Image proxy — fetches FB CDN images server-side and returns base64
+// Image proxy
 app.get('/proxy-image', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'url required' });
@@ -210,9 +246,13 @@ app.post('/scan/test', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Start ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`FlipRadar backend on port ${PORT}`);
   console.log(`Apify: ${APIFY_TOKEN ? 'token set' : 'NO TOKEN'}`);
+  console.log(`Redis: ${REDIS_URL ? 'connected' : 'NOT SET — data will not persist'}`);
   console.log(`Pushover: ${process.env.PUSHOVER_TOKEN ? 'set' : 'not set'}`);
+  await loadFromRedis();
+  console.log('[Ready] Server fully loaded');
 });
