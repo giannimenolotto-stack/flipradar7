@@ -147,7 +147,7 @@ async function runScan() {
   }
 }
 
-cron.schedule('*/15 * * * *', () => {
+cron.schedule('*/30 * * * *', () => {
   runScan().catch(e => console.error('[Cron]', e.message));
 });
 
