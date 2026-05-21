@@ -8,15 +8,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Store ─────────────────────────────────────────────────
-// In production swap this for Redis/Postgres
-let watchlist    = []; // [{ id, userId, keyword, maxPrice, pushover: {token,user} }]
+let watchlist    = [];
 let seenListings = new Set();
 let listings     = [];
 let lastScanTime  = null;
 let lastScanCount = 0;
 
-// ── Pushover ──────────────────────────────────────────────
 async function sendPushover(token, user, title, message, url) {
   if (!token || !user) return;
   try {
@@ -26,36 +23,39 @@ async function sendPushover(token, user, title, message, url) {
   } catch (e) { console.error('[Pushover] Error:', e.message); }
 }
 
-// ── Apify ─────────────────────────────────────────────────
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
-const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
+const APIFY_ACTOR = 'crowdpull~facebook-marketplace-scraper';
 
 async function scrapeKeyword(keyword) {
   if (!APIFY_TOKEN) return [];
 
-  const fbUrl = `https://www.facebook.com/marketplace/melbourne/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=1`;
+  const input = {
+    searchTerm: keyword,
+    city: 'Melbourne',
+    maxResults: 25,
+  };
 
   try {
     const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [fbUrl], maxItems: 25 },
+      input,
       { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
     );
 
     const items = Array.isArray(res.data) ? res.data : [];
-    // Filter out error objects
     const valid = items.filter(i => !i.error);
     console.log(`[Apify] "${keyword}" -> ${valid.length} item(s)`);
+    if (valid.length > 0) console.log('[Apify] Sample:', JSON.stringify(valid[0]).slice(0, 400));
 
     return valid.map(item => {
-      const id = item.id || String(item.marketplace_listing_id || '');
+      const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
       return {
         id,
-        title:    item.marketplace_listing_title || item.title || keyword,
-        price:    parsePrice(item.listing_price?.amount || item.listing_price?.formatted_amount || item.price),
-        url:      item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
-        image:    item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
-        location: item.location?.reverse_geocode?.city || null,
+        title:    item.title || item.name || item.marketplace_listing_title || keyword,
+        price:    parsePrice(item.price || item.listing_price?.amount || item.listing_price?.formatted_amount),
+        url:      item.url || item.listingUrl || `https://www.facebook.com/marketplace/item/${id}/`,
+        image:    item.image || item.thumbnail || item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
+        location: item.location || item.city || item.location?.reverse_geocode?.city || null,
         keyword,
         foundAt:  new Date().toISOString(),
       };
@@ -75,11 +75,9 @@ function parsePrice(raw) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Main scan — deduplicates keywords ─────────────────────
 async function runScan() {
   if (watchlist.length === 0) { console.log('[Scan] No keywords'); return; }
 
-  // Get unique keywords across all users
   const uniqueKeywords = [...new Set(watchlist.map(w => w.keyword.toLowerCase()))];
   console.log(`[Scan] ${watchlist.length} watches, ${uniqueKeywords.length} unique keyword(s)`);
   lastScanTime = new Date().toISOString();
@@ -93,17 +91,13 @@ async function runScan() {
       if (seenListings.has(key)) continue;
       seenListings.add(key);
 
-      // Add to global feed
       listings.unshift(listing);
       if (listings.length > 500) listings = listings.slice(0, 500);
       totalNew++;
 
-      // Notify each user watching this keyword who hasn't exceeded their maxPrice
       const watchers = watchlist.filter(w => w.keyword.toLowerCase() === keyword);
       for (const watcher of watchers) {
         if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
-
-        // Use watcher's own Pushover if set, else fall back to server default
         const pToken = watcher.pushoverToken || process.env.PUSHOVER_TOKEN;
         const pUser  = watcher.pushoverUser  || process.env.PUSHOVER_USER;
         const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
@@ -112,7 +106,7 @@ async function runScan() {
       }
     }
 
-    await sleep(500); // gap between keyword scrapes
+    await sleep(500);
   }
 
   lastScanCount = totalNew;
@@ -123,7 +117,6 @@ cron.schedule('*/15 * * * *', () => {
   runScan().catch(e => console.error('[Cron]', e.message));
 });
 
-// ── Routes ────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'ok',
   apify: APIFY_TOKEN ? 'connected' : 'NO APIFY_TOKEN SET',
