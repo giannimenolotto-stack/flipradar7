@@ -29,10 +29,13 @@ const APIFY_ACTOR = 'crowdpull~facebook-marketplace-scraper';
 async function scrapeKeyword(keyword) {
   if (!APIFY_TOKEN) return [];
 
+  const fbUrl = `https://www.facebook.com/marketplace/melbourne/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend`;
   const input = {
-    searchTerm: keyword,
-    city: 'Melbourne',
-    maxResults: 25,
+    marketplaceUrls: [fbUrl],
+    maxListings: 25,
+    enableDedup: false,
+    includeDetails: false,
+    strictFiltering: false,
   };
 
   try {
