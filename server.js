@@ -86,8 +86,9 @@ async function scrapeKeyword(keyword, maxPrice) {
 
 function parsePrice(raw) {
   if (!raw) return 0;
-  if (typeof raw === 'number') return raw;
-  return parseInt(String(raw).replace(/[^0-9]/g, ''), 10) || 0;
+  if (typeof raw === 'number') return Math.round(raw);
+  var f = parseFloat(String(raw).replace(/[^0-9.]/g, ''));
+  return Math.round(f) || 0;
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -98,7 +99,7 @@ async function runScan() {
   lastScanTime = new Date().toISOString();
   let totalNew = 0;
   let pushCount = 0;
-  const MAX_PUSH = 3; // max Pushover alerts per scan
+  const MAX_PUSH = 3;
 
   for (const item of watchlist) {
     try {
@@ -113,7 +114,6 @@ async function runScan() {
         listings.unshift(listing);
         if (listings.length > 200) listings = listings.slice(0, 200);
 
-        // Only push first MAX_PUSH new listings per scan
         if (pushCount < MAX_PUSH) {
           const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
           await sendPushover(`FlipRadar: ${item.keyword}`, `${listing.title}\n${priceStr}`, listing.url);
