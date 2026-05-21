@@ -48,17 +48,17 @@ async function scrapeKeyword(keyword) {
     const items = Array.isArray(res.data) ? res.data : [];
     const valid = items.filter(i => !i.error);
     console.log(`[Apify] "${keyword}" -> ${valid.length} item(s)`);
-    if (valid.length > 0) console.log('[Apify] Sample:', JSON.stringify(valid[0]).slice(0, 400));
+    if (valid.length > 0) console.log('[Apify] Sample fields:', JSON.stringify({price: valid[0].price, priceFormatted: valid[0].priceFormatted, imageUrl: valid[0].imageUrl, image: valid[0].image, primaryImageUrl: valid[0].primaryImageUrl}));
 
     return valid.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
       return {
         id,
         title:    item.title || item.name || item.marketplace_listing_title || keyword,
-        price:    parsePrice(item.price || item.listing_price?.amount || item.listing_price?.formatted_amount),
-        url:      item.url || item.listingUrl || `https://www.facebook.com/marketplace/item/${id}/`,
-        image:    item.image || item.thumbnail || item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
-        location: item.location || item.city || item.location?.reverse_geocode?.city || null,
+        price:    parsePrice(item.priceFormatted || item.listing_price?.formatted_amount || item.listing_price?.amount),
+        url:      item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
+        image:    item.imageUrl || item.primaryImageUrl || item.image || item.thumbnail || item.primary_listing_photo_url || null,
+        location: typeof item.location === 'string' ? item.location : (item.location?.reverse_geocode?.city || item.city || null),
         keyword,
         foundAt:  new Date().toISOString(),
       };
@@ -72,8 +72,16 @@ async function scrapeKeyword(keyword) {
 
 function parsePrice(raw) {
   if (!raw) return 0;
-  if (typeof raw === 'number') return Math.round(raw);
-  return Math.round(parseFloat(String(raw).replace(/[^0-9.]/g, '')) || 0);
+  // Handle "A$2,750" or "$2,750" formatted strings
+  if (typeof raw === 'string') {
+    const cleaned = raw.replace(/[^0-9.]/g, '');
+    return Math.round(parseFloat(cleaned) || 0);
+  }
+  // Handle raw number in cents (if > 10000 and looks like cents, divide by 100)
+  if (typeof raw === 'number') {
+    return Math.round(raw);
+  }
+  return 0;
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
