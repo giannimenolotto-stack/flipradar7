@@ -54,6 +54,7 @@ async function scrapeKeyword(keyword, maxPrice) {
 
     const items = Array.isArray(runRes.data) ? runRes.data : [];
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s)`);
+    if (items.length > 0) console.log('[Apify] Sample:', JSON.stringify(items[0]).slice(0, 300));
 
     return items.map(item => {
       const id = item.id || String(item.marketplace_listing_id || '');
@@ -106,11 +107,16 @@ async function runScan() {
       const found = await scrapeKeyword(item.keyword, item.maxPrice);
       for (const listing of found) {
         const key = `${item.keyword}:${listing.id}`;
-        if (seenListings.has(key)) continue;
+        if (seenListings.has(key)) {
+          console.log(`[Skip] Already seen: ${key}`);
+          continue;
+        }
         seenListings.add(key);
-        if (item.maxPrice && listing.price > item.maxPrice) continue;
+        if (item.maxPrice && listing.price > item.maxPrice) {
+          console.log(`[Skip] Over max price: ${listing.title} $${listing.price} > $${item.maxPrice}`);
+          continue;
+        }
         totalNew++;
-
         listings.unshift(listing);
         if (listings.length > 200) listings = listings.slice(0, 200);
 
@@ -170,6 +176,7 @@ app.get('/listings', (req, res) => res.json(listings));
 app.delete('/listings', (req, res) => {
   listings = [];
   seenListings = new Set();
+  console.log('[Clear] Listings and seenListings cleared');
   res.json({ ok: true });
 });
 
