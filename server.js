@@ -232,6 +232,51 @@ app.get('/proxy-image', async (req, res) => {
   }
 });
 
+
+// Scan a single keyword immediately — used when user first adds a watch
+app.post('/scan/keyword', async (req, res) => {
+  const { keyword, maxPrice } = req.body;
+  if (!keyword) return res.status(400).json({ error: 'keyword required' });
+
+  // Use daysSinceListed=1 but limit to recent (Apify sorts by newest first)
+  const fbUrl = `https://www.facebook.com/marketplace/melbourne/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=1`;
+  try {
+    const res2 = await axios.post(
+      `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
+      { urls: [fbUrl], maxItems: 10, includeDetails: false },
+      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
+    );
+    const items = Array.isArray(res2.data) ? res2.data.filter(i => !i.error) : [];
+    let added = 0;
+    for (const item of items) {
+      const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
+      if (!id) continue;
+      const key = `${keyword.toLowerCase()}:${id}`;
+      if (seenListings.has(key)) continue;
+      seenListings.add(key);
+      const listing = {
+        id,
+        title:    item.marketplace_listing_title || item.title || keyword,
+        price:    parsePrice(item.listing_price?.amount || item.listing_price?.formatted_amount || item.price),
+        url:      item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
+        image:    item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
+        location: typeof item.location === 'string' ? item.location : (item.location?.reverse_geocode?.city || null),
+        keyword: keyword.toLowerCase(),
+        foundAt: new Date().toISOString(),
+      };
+      listings.unshift(listing);
+      if (listings.length > 500) listings = listings.slice(0, 500);
+      added++;
+    }
+    if (added > 0) { await saveListings(); await saveSeen(); }
+    console.log(`[Scan/Keyword] "${keyword}" -> ${added} new listing(s)`);
+    res.json({ ok: true, count: added });
+  } catch (e) {
+    console.error('[Scan/Keyword] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/scan/now', async (req, res) => {
   res.json({ ok: true, message: 'Scan started' });
   runScan().catch(e => console.error('[Scan/now]', e.message));
