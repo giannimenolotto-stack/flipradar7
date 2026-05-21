@@ -98,39 +98,199 @@ const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 
 async function scrapeKeyword(keyword) {
   if (!APIFY_TOKEN) return [];
-  const fbUrl = `https://www.facebook.com/marketplace/melbourne/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=1`;
+
+  // Use both sort orders so we catch listings regardless of what FB surfaces first.
+  // daysSinceListed=2 gives us a slightly wider net without blowing up seen-IDs.
+  const fbUrl = `https://www.facebook.com/marketplace/melbourne/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=2`;
+
   try {
     const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [fbUrl], maxItems: 25, includeDetails: true },
-      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+      {
+        urls: [fbUrl],
+        maxItems: 40,          // Increased — more raw results = fewer misses
+        includeDetails: true,  // Required for vehicle_odometer_data, location object, etc.
+      },
+      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 240000 }
     );
+
     const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
-    console.log(`[Apify] "${keyword}" -> ${items.length} item(s)`);
+    console.log(`[Apify] "${keyword}" -> ${items.length} raw item(s)`);
+
     return items.map(item => {
-      const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
-      return {
-        id,
-        title:       item.marketplace_listing_title || item.title || keyword,
-        price:       parsePrice(item.listing_price?.amount || item.listing_price?.formatted_amount || item.price),
-        url:         item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
-        image:       item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
-        location:    typeof item.location === 'string' ? item.location : (item.location?.reverse_geocode?.city || null),
-        description: item.redacted_description?.text || item.description || null,
-        keyword,
-        foundAt:     new Date().toISOString(),
-      };
+      // ── ID ──────────────────────────────────────────────
+      const id = String(
+        item.id ||
+        item.listingId ||
+        item.marketplace_listing_id ||
+        item.listing_id ||
+        ''
+      );
+
+      // ── Description (FB sometimes splits across fields) ──
+      const description = (
+        item.redacted_description?.text ||
+        item.description?.text ||
+        item.description ||
+        item.listing_description ||
+        null
+      );
+
+      // ── Title ───────────────────────────────────────────
+      const title = (
+        item.marketplace_listing_title ||
+        item.name ||
+        item.title ||
+        keyword
+      );
+
+      // ── Price ───────────────────────────────────────────
+      const price = parsePrice(
+        item.listing_price?.amount ||
+        item.listing_price?.formatted_amount ||
+        item.price?.amount ||
+        item.price
+      );
+
+      // ── URL ─────────────────────────────────────────────
+      const url = item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`;
+
+      // ── Image — try multiple known field paths ───────────
+      const image = (
+        item.primary_listing_photo_url ||
+        item.primary_listing_photo?.image?.uri ||
+        item.primary_listing_photo?.image?.url ||
+        item.listing_photos?.[0]?.image?.uri ||
+        item.cover_photo?.photo?.image?.uri ||
+        null
+      );
+
+      // ── Location ─────────────────────────────────────────
+      const location = (
+        typeof item.location === 'string' ? item.location :
+        item.location?.reverse_geocode?.city ||
+        item.location?.reverse_geocode?.suburb ||
+        item.location?.city ||
+        item.location_text ||
+        null
+      );
+
+      // ── Mileage — FB exposes odometer in several places ──
+      // Priority: structured odometer field > custom_sub_titles > listing title > description
+      const rawOdo = (
+        item.vehicle_odometer_data?.odometer_value ||           // Structured int (km)
+        item.vehicle_odometer_data?.value ||
+        item.odometer_reading ||
+        item.odometer ||
+        item.mileage ||
+        extractOdoFromSubTitles(item.custom_sub_titles_with_rendering_flags) ||
+        extractOdoFromSubTitles(item.listing_sub_titles) ||
+        null
+      );
+
+      // Fall back to free-text extraction from title + description combined
+      const mileage = parseMileage(rawOdo) ||
+                      parseMileage(title + ' ' + (description || ''));
+
+      // ── Year / Make / Model (bonus for vehicles) ─────────
+      const year  = item.year  || item.vehicle_year  || extractYear(title)  || null;
+      const make  = item.make  || item.vehicle_make  || null;
+      const model = item.model || item.vehicle_model || null;
+
+      return { id, title, price, url, image, location, description, mileage, year, make, model, keyword, foundAt: new Date().toISOString() };
     }).filter(l => l.id);
+
   } catch (e) {
-    console.error(`[Apify] Error for "${keyword}":`, e.response ? JSON.stringify(e.response.data).slice(0,200) : e.message);
+    console.error(`[Apify] Error for "${keyword}":`, e.response ? JSON.stringify(e.response.data).slice(0, 300) : e.message);
     return [];
   }
+}
+
+/**
+ * Facebook sometimes puts "123,456 km" in a custom_sub_titles array of objects
+ * like [{ subtitle: "123,456 km" }, ...]. Extract the first km-looking entry.
+ */
+function extractOdoFromSubTitles(arr) {
+  if (!Array.isArray(arr)) return null;
+  for (const entry of arr) {
+    const text = (typeof entry === 'string') ? entry : (entry.subtitle || entry.text || entry.title || '');
+    if (/\d[\d,]*\s*k(?:m|ms)/i.test(text)) return text;
+  }
+  return null;
+}
+
+/** Pull a 4-digit year from a listing title like "2019 Honda CB300R" */
+function extractYear(title) {
+  if (!title) return null;
+  const m = title.match(/\b(19[5-9]\d|20[0-2]\d)\b/);
+  return m ? parseInt(m[1]) : null;
 }
 
 function parsePrice(raw) {
   if (!raw) return 0;
   if (typeof raw === 'number') return Math.round(raw);
   return Math.round(parseFloat(String(raw).replace(/[^0-9.]/g, '')) || 0);
+}
+
+/**
+ * Robust mileage parser for Australian Facebook Marketplace listings.
+ *
+ * Handles formats seen in the wild:
+ *   123456          — raw integer from odometer_value field
+ *   123,456 km      — comma-separated with unit
+ *   123456km        — no space
+ *   123456 kms      — plural
+ *   123,456 kilometres / kilometers
+ *   ~123,000 km     — approximate prefix
+ *   123k km / 123k kms — shorthand thousands (rare but seen)
+ *   "Odometer: 87,500" — label prefix with no unit (inferred)
+ *   "87500 klms"    — alternate Aussie spelling
+ *   "low km 45000"  — unit before number
+ */
+function parseMileage(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+
+  // ── Direct numeric value (e.g. from vehicle_odometer_data.odometer_value) ──
+  if (typeof raw === 'number') {
+    // FB sometimes stores in raw metres or as 0; ignore clearly bad values
+    if (raw > 0 && raw <= 1_500_000) return Math.round(raw);
+    return null;
+  }
+
+  if (typeof raw !== 'string') return null;
+
+  const text = raw.replace(/\u00a0/g, ' '); // Replace non-breaking spaces
+
+  // ── Pattern 1: number followed by km variant (most common) ──────────────
+  // Covers: 123,456 km | 123456km | 123,456 kilometres | 87500 klms
+  let m = text.match(/~?(\d[\d,]*)\s*k(?:lm|m|ms|ilometres?|ilometers?)s?\b/i);
+  if (m) {
+    const val = parseFloat(m[1].replace(/,/g, ''));
+    if (val >= 100 && val <= 1_500_000) return Math.round(val);
+  }
+
+  // ── Pattern 2: shorthand thousands — "123k km" or "123k kms" ─────────────
+  m = text.match(/(\d+(?:\.\d+)?)\s*k\s+k(?:m|ms)\b/i);
+  if (m) {
+    const val = parseFloat(m[1]) * 1000;
+    if (val >= 100 && val <= 1_500_000) return Math.round(val);
+  }
+
+  // ── Pattern 3: "Odometer: 87,500" — label with no unit ───────────────────
+  m = text.match(/odometer[:\s]+(\d[\d,]+)/i);
+  if (m) {
+    const val = parseFloat(m[1].replace(/,/g, ''));
+    if (val >= 100 && val <= 1_500_000) return Math.round(val);
+  }
+
+  // ── Pattern 4: "low km 45000" — unit before number ───────────────────────
+  m = text.match(/\bkms?\s+(\d[\d,]+)/i);
+  if (m) {
+    const val = parseFloat(m[1].replace(/,/g, ''));
+    if (val >= 100 && val <= 1_500_000) return Math.round(val);
+  }
+
+  return null;
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -210,8 +370,8 @@ app.get('/', (req, res) => res.json({
 app.get('/status', (req, res) => {
   const now = new Date();
   const mins = now.getMinutes();
-  // Next 30-min mark
   const nextMins = mins < 30 ? 30 - mins : 60 - mins;
+  const withMileage = listings.filter(l => l.mileage != null).length;
   res.json({
     ok: true,
     lastScan: lastScanTime,
@@ -219,6 +379,8 @@ app.get('/status', (req, res) => {
     nextScanInMins: nextMins,
     watches: watchlist.length,
     listingsStored: listings.length,
+    listingsWithMileage: withMileage,
+    mileageCoverage: listings.length ? Math.round((withMileage / listings.length) * 100) + '%' : '—',
     seenEntries: Object.keys(seenListings).length,
     uptime: Math.floor(process.uptime()) + 's',
   });
