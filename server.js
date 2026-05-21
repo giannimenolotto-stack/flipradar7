@@ -8,65 +8,51 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-let watchlist     = [];
-let seenListings  = new Set();
-let listings      = [];
+// ── Store ─────────────────────────────────────────────────
+// In production swap this for Redis/Postgres
+let watchlist    = []; // [{ id, userId, keyword, maxPrice, pushover: {token,user} }]
+let seenListings = new Set();
+let listings     = [];
 let lastScanTime  = null;
 let lastScanCount = 0;
 
-async function sendPushover(title, message, url) {
-  const token = process.env.PUSHOVER_TOKEN;
-  const user  = process.env.PUSHOVER_USER;
-  if (!token || !user) { console.log('[Pushover] Skipped — tokens not set'); return; }
+// ── Pushover ──────────────────────────────────────────────
+async function sendPushover(token, user, title, message, url) {
+  if (!token || !user) return;
   try {
     const payload = { token, user, title: title.slice(0,250), message: message.slice(0,1024), sound: 'cashregister' };
     if (url) payload.url = url;
     await axios.post('https://api.pushover.net/1/messages.json', payload);
-    console.log('[Pushover] Sent:', title);
   } catch (e) { console.error('[Pushover] Error:', e.message); }
 }
 
+// ── Apify ─────────────────────────────────────────────────
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 
-async function scrapeKeyword(keyword, maxPrice) {
-  if (!APIFY_TOKEN) { console.warn('[Apify] No token'); return []; }
+async function scrapeKeyword(keyword) {
+  if (!APIFY_TOKEN) return [];
 
-  const encoded    = encodeURIComponent(keyword);
-  const priceParam = maxPrice ? `&maxPrice=${maxPrice}` : '';
-  const fbUrl      = `https://www.facebook.com/marketplace/melbourne/search/?query=${encoded}${priceParam}&sortBy=creation_time_descend&daysSinceListed=1`;
-
-  const input = {
-    urls: [fbUrl],
-    maxItems: 25,
-  };
+  const fbUrl = `https://www.facebook.com/marketplace/melbourne/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=1`;
 
   try {
-    const runRes = await axios.post(
+    const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      input,
-      {
-        params:  { token: APIFY_TOKEN },
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 120000,
-      }
+      { urls: [fbUrl], maxItems: 25 },
+      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
     );
 
-    const items = Array.isArray(runRes.data) ? runRes.data : [];
-    console.log(`[Apify] "${keyword}" -> ${items.length} item(s)`);
-    if (items.length > 0) console.log('[Apify] Sample:', JSON.stringify(items[0]).slice(0, 300));
+    const items = Array.isArray(res.data) ? res.data : [];
+    // Filter out error objects
+    const valid = items.filter(i => !i.error);
+    console.log(`[Apify] "${keyword}" -> ${valid.length} item(s)`);
 
-    return items.map(item => {
+    return valid.map(item => {
       const id = item.id || String(item.marketplace_listing_id || '');
-      const price = parsePrice(
-        item.listing_price?.amount ||
-        item.listing_price?.formatted_amount ||
-        item.price
-      );
       return {
         id,
-        title:    item.marketplace_listing_title || item.title || item.name || keyword,
-        price,
+        title:    item.marketplace_listing_title || item.title || keyword,
+        price:    parsePrice(item.listing_price?.amount || item.listing_price?.formatted_amount || item.price),
         url:      item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
         image:    item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
         location: item.location?.reverse_geocode?.city || null,
@@ -76,11 +62,7 @@ async function scrapeKeyword(keyword, maxPrice) {
     }).filter(l => l.id);
 
   } catch (e) {
-    if (e.response) {
-      console.error(`[Apify] HTTP ${e.response.status}:`, JSON.stringify(e.response.data).slice(0, 300));
-    } else {
-      console.error(`[Apify] Error for "${keyword}":`, e.message);
-    }
+    console.error(`[Apify] Error for "${keyword}":`, e.response ? JSON.stringify(e.response.data).slice(0,200) : e.message);
     return [];
   }
 }
@@ -88,79 +70,91 @@ async function scrapeKeyword(keyword, maxPrice) {
 function parsePrice(raw) {
   if (!raw) return 0;
   if (typeof raw === 'number') return Math.round(raw);
-  var f = parseFloat(String(raw).replace(/[^0-9.]/g, ''));
-  return Math.round(f) || 0;
+  return Math.round(parseFloat(String(raw).replace(/[^0-9.]/g, '')) || 0);
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ── Main scan — deduplicates keywords ─────────────────────
 async function runScan() {
   if (watchlist.length === 0) { console.log('[Scan] No keywords'); return; }
-  console.log(`[Scan] Starting — ${watchlist.length} keyword(s)`);
+
+  // Get unique keywords across all users
+  const uniqueKeywords = [...new Set(watchlist.map(w => w.keyword.toLowerCase()))];
+  console.log(`[Scan] ${watchlist.length} watches, ${uniqueKeywords.length} unique keyword(s)`);
   lastScanTime = new Date().toISOString();
   let totalNew = 0;
-  let pushCount = 0;
-  const MAX_PUSH = 3;
 
-  for (const item of watchlist) {
-    try {
-      const found = await scrapeKeyword(item.keyword, item.maxPrice);
-      for (const listing of found) {
-        const key = `${item.keyword}:${listing.id}`;
-        if (seenListings.has(key)) {
-          console.log(`[Skip] Already seen: ${key}`);
-          continue;
-        }
-        seenListings.add(key);
-        if (item.maxPrice && listing.price > item.maxPrice) {
-          console.log(`[Skip] Over max price: ${listing.title} $${listing.price} > $${item.maxPrice}`);
-          continue;
-        }
-        totalNew++;
-        listings.unshift(listing);
-        if (listings.length > 200) listings = listings.slice(0, 200);
+  for (const keyword of uniqueKeywords) {
+    const found = await scrapeKeyword(keyword);
 
-        if (pushCount < MAX_PUSH) {
-          const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
-          await sendPushover(`FlipRadar: ${item.keyword}`, `${listing.title}\n${priceStr}`, listing.url);
-          pushCount++;
-          await sleep(500);
-        }
+    for (const listing of found) {
+      const key = `${keyword}:${listing.id}`;
+      if (seenListings.has(key)) continue;
+      seenListings.add(key);
+
+      // Add to global feed
+      listings.unshift(listing);
+      if (listings.length > 500) listings = listings.slice(0, 500);
+      totalNew++;
+
+      // Notify each user watching this keyword who hasn't exceeded their maxPrice
+      const watchers = watchlist.filter(w => w.keyword.toLowerCase() === keyword);
+      for (const watcher of watchers) {
+        if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
+
+        // Use watcher's own Pushover if set, else fall back to server default
+        const pToken = watcher.pushoverToken || process.env.PUSHOVER_TOKEN;
+        const pUser  = watcher.pushoverUser  || process.env.PUSHOVER_USER;
+        const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
+        await sendPushover(pToken, pUser, `FlipRadar: ${keyword}`, `${listing.title}\n${priceStr}`, listing.url);
+        await sleep(300);
       }
-    } catch (e) { console.error(`[Scan] Error on "${item.keyword}":`, e.message); }
-  }
+    }
 
-  if (totalNew > MAX_PUSH) {
-    await sendPushover('FlipRadar', `+${totalNew - MAX_PUSH} more new listings found`, null);
+    await sleep(500); // gap between keyword scrapes
   }
 
   lastScanCount = totalNew;
-  console.log(`[Scan] Done — ${totalNew} new listing(s), ${pushCount} alerts sent`);
+  console.log(`[Scan] Done — ${totalNew} new listing(s) from ${uniqueKeywords.length} unique keyword(s)`);
 }
 
 cron.schedule('*/15 * * * *', () => {
   runScan().catch(e => console.error('[Cron]', e.message));
 });
 
+// ── Routes ────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'ok',
   apify: APIFY_TOKEN ? 'connected' : 'NO APIFY_TOKEN SET',
-  watchlist: watchlist.length,
+  watches: watchlist.length,
+  uniqueKeywords: [...new Set(watchlist.map(w => w.keyword.toLowerCase()))].length,
   listingsCount: listings.length,
   lastScan: lastScanTime,
   lastScanNewListings: lastScanCount,
   seenTotal: seenListings.size,
 }));
 
-app.get('/watchlist', (req, res) => res.json(watchlist));
+app.get('/watchlist', (req, res) => {
+  const userId = req.query.userId;
+  res.json(userId ? watchlist.filter(w => w.userId === userId) : watchlist);
+});
 
 app.post('/watchlist', (req, res) => {
-  const { keyword, maxPrice } = req.body;
-  if (!keyword || typeof keyword !== 'string' || keyword.trim().length < 2)
+  const { keyword, maxPrice, userId, pushoverToken, pushoverUser } = req.body;
+  if (!keyword || keyword.trim().length < 2)
     return res.status(400).json({ error: 'keyword required' });
-  const item = { id: uuidv4(), keyword: keyword.trim(), maxPrice: maxPrice ? parseInt(maxPrice) : null, addedAt: new Date().toISOString() };
+  const item = {
+    id: uuidv4(),
+    userId: userId || 'default',
+    keyword: keyword.trim().toLowerCase(),
+    maxPrice: maxPrice ? parseInt(maxPrice) : null,
+    pushoverToken: pushoverToken || null,
+    pushoverUser:  pushoverUser  || null,
+    addedAt: new Date().toISOString(),
+  };
   watchlist.push(item);
-  console.log(`[Watchlist] Added: "${item.keyword}"`);
+  console.log(`[Watch] Added "${item.keyword}" for user ${item.userId}`);
   res.json(item);
 });
 
@@ -171,12 +165,15 @@ app.delete('/watchlist/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/listings', (req, res) => res.json(listings));
+app.get('/listings', (req, res) => {
+  const { keyword } = req.query;
+  res.json(keyword ? listings.filter(l => l.keyword === keyword) : listings);
+});
 
 app.delete('/listings', (req, res) => {
   listings = [];
   seenListings = new Set();
-  console.log('[Clear] Listings and seenListings cleared');
+  console.log('[Clear] Feed cleared');
   res.json({ ok: true });
 });
 
@@ -186,10 +183,10 @@ app.post('/scan/now', async (req, res) => {
 });
 
 app.post('/scan/test', async (req, res) => {
-  const { keyword, maxPrice } = req.body;
+  const { keyword } = req.body;
   if (!keyword) return res.status(400).json({ error: 'keyword required' });
   try {
-    const found = await scrapeKeyword(keyword, maxPrice ? parseInt(maxPrice) : null);
+    const found = await scrapeKeyword(keyword);
     res.json({ keyword, count: found.length, listings: found });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
