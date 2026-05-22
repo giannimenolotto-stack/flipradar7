@@ -102,15 +102,15 @@ async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
   let fbUrl;
   if (opts.lat && opts.lng) {
-    fbUrl = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(keyword)}&latitude=${opts.lat}&longitude=${opts.lng}&radius=${opts.radius||50}&sortBy=creation_time_descend&daysSinceListed=1`;
+    fbUrl = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(keyword)}&latitude=${opts.lat}&longitude=${opts.lng}&radius=${opts.radius||50}&sortBy=creation_time_descend&daysSinceListed=${opts.initialScan ? 7 : 1}`;
   } else {
     const city = (opts.city || 'melbourne').toLowerCase().replace(/\s+/g, '');
-    fbUrl = `https://www.facebook.com/marketplace/${city}/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=1`;
+    fbUrl = `https://www.facebook.com/marketplace/${city}/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=${opts.initialScan ? 7 : 1}`;
   }
   try {
     const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [fbUrl], maxItems: 50, includeDetails: true },
+      { urls: [fbUrl], maxItems: opts.initialScan ? 12 : 50, includeDetails: true },
       { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
     const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
@@ -146,9 +146,9 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function isRelevant() { return true; }
 
 // ── Per-watchlist scan ────────────────────────────────────
-async function scanWatchItem(watcher) {
+async function scanWatchItem(watcher, opts = {}) {
   const keyword = watcher.keyword.toLowerCase();
-  const raw = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
+  const raw = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius, initialScan: opts.initialScan || false });
   // Negative keyword filter
   const negWords = (watcher.negativeKeywords || '')
     .toLowerCase().split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
@@ -284,6 +284,9 @@ app.post('/watchlist', async (req, res) => {
   };
   watchlist.push(item);
   await saveWatchlist();
+
+  // Immediate initial scan — 7-day window, 12 results
+  scanWatchItem(item, { initialScan: true }).catch(e => console.error('[InitialScan]', e.message));
 
   // Start its personal timer
   startWatchTimer(item);
