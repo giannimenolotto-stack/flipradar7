@@ -142,7 +142,25 @@ function parsePrice(raw) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Per-watchlist scan ────────────────────────────────────
+// ── Keyword relevance filter ──────────────────────────────
+// Prevents FB Marketplace drift (e.g. "potter kiln" returning plain "pottery")
+// Rules:
+//   - Single word keyword: title OR description must contain it (loose, handles plurals/variants)
+//   - Multi-word keyword: ALL significant words (3+ chars) must appear somewhere in title+description
+function isRelevant(listing, keyword) {
+  const haystack = ((listing.title || '') + ' ' + (listing.description || '')).toLowerCase();
+  const words = keyword.toLowerCase().split(/\s+/).filter(w => w.length >= 3);
+
+  if (words.length <= 1) {
+    // Single word — just check the title directly (FB usually gets these right)
+    return haystack.includes(keyword.toLowerCase());
+  }
+
+  // Multi-word — every significant word must appear somewhere
+  return words.every(w => haystack.includes(w));
+}
+
+
 const _scanningKeywords = new Set(); // guard against concurrent duplicate keyword scans
 
 async function scanWatchItem(watcher) {
@@ -155,11 +173,17 @@ async function scanWatchItem(watcher) {
   }
   _scanningKeywords.add(keyword);
   const found = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
+
+  // Filter out listings that don't actually match the keyword
+  const relevant = found.filter(l => isRelevant(l, keyword));
+  const dropped = found.length - relevant.length;
+  if (dropped > 0) console.log(`[Filter] "${keyword}" dropped ${dropped}/${found.length} irrelevant results`);
+
   let newCount = 0;
 
   try {
 
-  for (const listing of found) {
+  for (const listing of relevant) {
     const key = `${keyword}:${listing.id}`;
     if (hasSeen(key)) continue;
     markSeen(key);
