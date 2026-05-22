@@ -26,7 +26,7 @@ async function redisSet(key, value) {
   if (!REDIS_URL) return;
   try {
     await axios.post(`${REDIS_URL}/set/${encodeURIComponent(key)}`,
-      JSON.stringify(value),
+      JSON.stringify(JSON.stringify(value)),
       { headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' } }
     );
   } catch (e) { console.error('[Redis] SET error:', e.message); }
@@ -35,7 +35,7 @@ async function redisSet(key, value) {
 // ── Scan intervals per plan (ms) ─────────────────────────
 const PLAN_INTERVALS = {
   basic:   30 * 60 * 1000,  // 30 mins
-  premium:  5 * 60 * 1000,  //  5 mins (matches UI)
+  premium: 15 * 60 * 1000,  // 15 mins
 };
 
 // ── In-memory state ───────────────────────────────────────
@@ -142,48 +142,20 @@ function parsePrice(raw) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Keyword relevance filter ──────────────────────────────
-// Prevents FB Marketplace drift (e.g. "potter kiln" returning plain "pottery")
-// Rules:
-//   - Single word keyword: title OR description must contain it (loose, handles plurals/variants)
-//   - Multi-word keyword: ALL significant words (3+ chars) must appear somewhere in title+description
-function isRelevant(listing, keyword) {
-  const haystack = ((listing.title || '') + ' ' + (listing.description || '')).toLowerCase();
-  const words = keyword.toLowerCase().split(/\s+/).filter(w => w.length >= 3);
+// ── Relevance filter — DISABLED, let the search engine decide ────
+// Always returns true so every result Apify returns gets through.
+function isRelevant() { return true; }
 
-  if (words.length <= 1) {
-    // Single word — just check the title directly (FB usually gets these right)
-    return haystack.includes(keyword.toLowerCase());
-  }
-
-  // Multi-word — every significant word must appear somewhere
-  return words.every(w => haystack.includes(w));
-}
-
-
-const _scanningKeywords = new Set(); // guard against concurrent duplicate keyword scans
-
+// ── Per-watchlist scan ────────────────────────────────────
 async function scanWatchItem(watcher) {
   const keyword = watcher.keyword.toLowerCase();
-
-  // Skip if this exact keyword is already being scraped right now
-  if (_scanningKeywords.has(keyword)) {
-    console.log(`[Scan] "${keyword}" already in progress, skipping duplicate`);
-    return 0;
-  }
-  _scanningKeywords.add(keyword);
-  const found = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
-
-  // Filter out listings that don't actually match the keyword
-  const relevant = found.filter(l => isRelevant(l, keyword));
-  const dropped = found.length - relevant.length;
-  if (dropped > 0) console.log(`[Filter] "${keyword}" dropped ${dropped}/${found.length} irrelevant results`);
-
+  const raw = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
+  // Pass everything through — no title/keyword relevance filtering
+  const found = raw;
+  console.log(`[Scan] "${keyword}" → ${found.length} result(s) from Apify (no filter)`);
   let newCount = 0;
 
-  try {
-
-  for (const listing of relevant) {
+  for (const listing of found) {
     const key = `${keyword}:${listing.id}`;
     if (hasSeen(key)) continue;
     markSeen(key);
@@ -206,15 +178,8 @@ async function scanWatchItem(watcher) {
     await saveSeen();
   }
 
-  // Always update lastScanned so the frontend can show it
-  watcher.lastScanned = new Date().toISOString();
-  await saveWatchlist();
-
   console.log(`[Scan] "${keyword}" (${watcher.plan||'basic'}) → ${newCount} new`);
   return newCount;
-  } finally {
-    _scanningKeywords.delete(keyword);
-  }
 }
 
 // ── Per-watchlist timers ──────────────────────────────────
@@ -369,15 +334,10 @@ app.post('/scan/now', async (req, res) => {
 });
 
 app.post('/scan/test', async (req, res) => {
-  const { keyword, location, lat, lng, radius } = req.body;
+  const { keyword } = req.body;
   if (!keyword) return res.status(400).json({ error: 'keyword required' });
   try {
-    const found = await scrapeKeyword(keyword, {
-      city: location || null,
-      lat: lat ? parseFloat(lat) : null,
-      lng: lng ? parseFloat(lng) : null,
-      radius: radius ? parseInt(radius) : 50
-    });
+    const found = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
     res.json({ keyword, count: found.length, listings: found });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
