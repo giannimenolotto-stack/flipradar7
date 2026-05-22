@@ -110,7 +110,7 @@ async function scrapeKeyword(keyword, opts = {}) {
   try {
     const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [fbUrl], maxItems: 25, includeDetails: true },
+      { urls: [fbUrl], maxItems: 50, includeDetails: true },
       { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
     const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
@@ -158,9 +158,11 @@ async function scanWatchItem(watcher) {
   for (const listing of found) {
     const key = `${keyword}:${listing.id}`;
     if (hasSeen(key)) continue;
-    markSeen(key);
+    // Check price BEFORE markSeen — so over-budget listings aren't permanently
+    // blacklisted (seller might drop the price on a future scan)
     if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
     if (watcher.minPrice && listing.price < watcher.minPrice) continue;
+    markSeen(key);
     if (!listings.find(l => l.id === listing.id)) {
       listings.unshift(listing);
       if (listings.length > 500) listings = listings.slice(0, 500);
@@ -295,8 +297,14 @@ app.delete('/watchlist/:id', async (req, res) => {
 });
 
 app.get('/listings', (req, res) => {
-  const { keyword } = req.query;
-  res.json(keyword ? listings.filter(l => l.keyword === keyword) : listings);
+  const { keyword, since } = req.query;
+  let result = keyword ? listings.filter(l => l.keyword === keyword) : listings;
+  // ?since=ISO_TIMESTAMP — only return listings newer than that time
+  if (since) {
+    const sinceMs = new Date(since).getTime();
+    if (!isNaN(sinceMs)) result = result.filter(l => new Date(l.foundAt).getTime() > sinceMs);
+  }
+  res.json(result);
 });
 
 app.delete('/listings', async (req, res) => {
@@ -337,7 +345,7 @@ app.post('/scan/test', async (req, res) => {
   const { keyword } = req.body;
   if (!keyword) return res.status(400).json({ error: 'keyword required' });
   try {
-    const found = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
+    const found = await scrapeKeyword(keyword, {});
     res.json({ keyword, count: found.length, listings: found });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
