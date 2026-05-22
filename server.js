@@ -143,23 +143,27 @@ function parsePrice(raw) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── Relevance filter — DISABLED, let the search engine decide ────
-// Always returns true so every result Apify returns gets through.
 function isRelevant() { return true; }
 
 // ── Per-watchlist scan ────────────────────────────────────
 async function scanWatchItem(watcher) {
   const keyword = watcher.keyword.toLowerCase();
   const raw = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
-  // Pass everything through — no title/keyword relevance filtering
-  const found = raw;
-  console.log(`[Scan] "${keyword}" → ${found.length} result(s) from Apify (no filter)`);
+  // Negative keyword filter
+  const negWords = (watcher.negativeKeywords || '')
+    .toLowerCase().split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+  const found = negWords.length
+    ? raw.filter(l => {
+        const hay = ((l.title || '') + ' ' + (l.description || '')).toLowerCase();
+        return !negWords.some(w => hay.includes(w));
+      })
+    : raw;
+  console.log(`[Scan] "${keyword}" → ${found.length} result(s)${negWords.length ? ` (${raw.length - found.length} removed by negative keywords)` : ''}`);
   let newCount = 0;
 
   for (const listing of found) {
     const key = `${keyword}:${listing.id}`;
     if (hasSeen(key)) continue;
-    // Check price BEFORE markSeen — so over-budget listings aren't permanently
-    // blacklisted (seller might drop the price on a future scan)
     if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
     if (watcher.minPrice && listing.price < watcher.minPrice) continue;
     markSeen(key);
@@ -253,7 +257,7 @@ app.get('/watchlist', (req, res) => {
 });
 
 app.post('/watchlist', async (req, res) => {
-  const { keyword, maxPrice, minPrice, userId, pushoverToken, pushoverUser, plan, name, speed } = req.body;
+  const { keyword, maxPrice, minPrice, userId, pushoverToken, pushoverUser, plan, name, speed, negativeKeywords } = req.body;
   if (!keyword || keyword.trim().length < 2)
     return res.status(400).json({ error: 'keyword required' });
 
@@ -267,6 +271,7 @@ app.post('/watchlist', async (req, res) => {
     name: name || keyword.trim(),
     maxPrice: maxPrice ? parseInt(maxPrice) : null,
     minPrice: minPrice ? parseInt(minPrice) : null,
+    negativeKeywords: req.body.negativeKeywords || '',
     location: req.body.location || null,
     lat: req.body.lat ? parseFloat(req.body.lat) : null,
     lng: req.body.lng ? parseFloat(req.body.lng) : null,
@@ -299,7 +304,6 @@ app.delete('/watchlist/:id', async (req, res) => {
 app.get('/listings', (req, res) => {
   const { keyword, since } = req.query;
   let result = keyword ? listings.filter(l => l.keyword === keyword) : listings;
-  // ?since=ISO_TIMESTAMP — only return listings newer than that time
   if (since) {
     const sinceMs = new Date(since).getTime();
     if (!isNaN(sinceMs)) result = result.filter(l => new Date(l.foundAt).getTime() > sinceMs);
