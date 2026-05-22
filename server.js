@@ -26,7 +26,7 @@ async function redisSet(key, value) {
   if (!REDIS_URL) return;
   try {
     await axios.post(`${REDIS_URL}/set/${encodeURIComponent(key)}`,
-      JSON.stringify(JSON.stringify(value)),
+      JSON.stringify(value),
       { headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' } }
     );
   } catch (e) { console.error('[Redis] SET error:', e.message); }
@@ -35,7 +35,7 @@ async function redisSet(key, value) {
 // ── Scan intervals per plan (ms) ─────────────────────────
 const PLAN_INTERVALS = {
   basic:   30 * 60 * 1000,  // 30 mins
-  premium: 15 * 60 * 1000,  // 15 mins
+  premium:  5 * 60 * 1000,  //  5 mins (matches UI)
 };
 
 // ── In-memory state ───────────────────────────────────────
@@ -143,10 +143,21 @@ function parsePrice(raw) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── Per-watchlist scan ────────────────────────────────────
+const _scanningKeywords = new Set(); // guard against concurrent duplicate keyword scans
+
 async function scanWatchItem(watcher) {
   const keyword = watcher.keyword.toLowerCase();
+
+  // Skip if this exact keyword is already being scraped right now
+  if (_scanningKeywords.has(keyword)) {
+    console.log(`[Scan] "${keyword}" already in progress, skipping duplicate`);
+    return 0;
+  }
+  _scanningKeywords.add(keyword);
   const found = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
   let newCount = 0;
+
+  try {
 
   for (const listing of found) {
     const key = `${keyword}:${listing.id}`;
@@ -171,8 +182,15 @@ async function scanWatchItem(watcher) {
     await saveSeen();
   }
 
+  // Always update lastScanned so the frontend can show it
+  watcher.lastScanned = new Date().toISOString();
+  await saveWatchlist();
+
   console.log(`[Scan] "${keyword}" (${watcher.plan||'basic'}) → ${newCount} new`);
   return newCount;
+  } finally {
+    _scanningKeywords.delete(keyword);
+  }
 }
 
 // ── Per-watchlist timers ──────────────────────────────────
@@ -327,10 +345,15 @@ app.post('/scan/now', async (req, res) => {
 });
 
 app.post('/scan/test', async (req, res) => {
-  const { keyword } = req.body;
+  const { keyword, location, lat, lng, radius } = req.body;
   if (!keyword) return res.status(400).json({ error: 'keyword required' });
   try {
-    const found = await scrapeKeyword(keyword, { city: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius });
+    const found = await scrapeKeyword(keyword, {
+      city: location || null,
+      lat: lat ? parseFloat(lat) : null,
+      lng: lng ? parseFloat(lng) : null,
+      radius: radius ? parseInt(radius) : 50
+    });
     res.json({ keyword, count: found.length, listings: found });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
