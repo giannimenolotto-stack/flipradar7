@@ -438,8 +438,13 @@ const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
-  const days     = opts.initialScan ? 7 : 1;
-  const maxItems = opts.initialScan ? 25 : 50;
+  const days      = opts.initialScan ? 7 : 1;
+  const maxItems  = opts.initialScan ? 25 : 50;
+  // Use isVehicleKeyword (keyword only) — not isVehicleListing which checks descriptions
+  // This prevents "callaway golf clubs" triggering vehicle mode
+  const vehicleMode    = isVehicleKeyword(keyword);
+  const includeDetails = vehicleMode; // full details only for vehicle keywords
+  console.log(`[Apify] "${keyword}" — vehicle:${vehicleMode} includeDetails:${includeDetails}`);
   let fbUrl;
   if (opts.lat && opts.lng) {
     fbUrl = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(keyword)}&latitude=${opts.lat}&longitude=${opts.lng}&radius=${opts.radius||50}&sortBy=creation_time_descend&daysSinceListed=${days}`;
@@ -450,7 +455,7 @@ async function scrapeKeyword(keyword, opts = {}) {
   try {
     const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [fbUrl], maxItems, includeDetails: false },
+      { urls: [fbUrl], maxItems, includeDetails },
       { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
     const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
@@ -528,6 +533,14 @@ const VEHICLE_KEYWORDS = ['car','ute','van','truck','bike','motorcycle','suv','4
   'civic','accord','mazda','subaru','toyota','ford','holden','honda','nissan','mitsubishi',
   'hyundai','kia','bmw','mercedes','audi','volkswagen','vw','jeep','ram','dodge'];
 
+// Only checks the KEYWORD — prevents "callaway golf clubs" triggering vehicle mode
+// just because someone mentions a Ram truck in their listing description
+function isVehicleKeyword(keyword) {
+  const kw = keyword.toLowerCase();
+  return VEHICLE_KEYWORDS.some(v => kw.includes(v));
+}
+
+// Checks keyword + title + description — used for tagging individual listings
 function isVehicleListing(keyword, title, description) {
   const text = (keyword + ' ' + title + ' ' + (description || '')).toLowerCase();
   return VEHICLE_KEYWORDS.some(kw => text.includes(kw));
@@ -535,20 +548,51 @@ function isVehicleListing(keyword, title, description) {
 
 function extractMileage(title, description) {
   const text = (title + ' ' + (description || '')).toLowerCase();
-  const patterns = [
-    [/(\d{1,3}(?:,\d{3})+)\s*k(?:m|ms|ilometres?|ilometers?)/, false],
-    [/(\d{2,6})\s*k(?:m|ms|ilometres?|ilometers?)/, false],
-    [/(\d{1,4})\s*k\s*k(?:m|ms|ilometres?|ilometers?|s)/, true],
-    [/(\d{1,4})\s*k(?=\s|$)/, true],
+
+  // Explicit odometer/odo labels — highest confidence
+  const odoPatterns = [
+    /odo(?:meter)?[\s:]*(\d{1,3}(?:,\d{3})+)/,         // odo: 210,000
+    /odo(?:meter)?[\s:]*(\d{4,6})/,                      // odo: 210000
+    /odometer[\s:]*(\d{1,3}(?:,\d{3})+)/,
+    /odometer[\s:]*(\d{4,6})/,
   ];
-  for (const [pattern, multiply] of patterns) {
-    const m = text.match(pattern);
+  for (const p of odoPatterns) {
+    const m = text.match(p);
     if (m) {
-      let val = parseInt(m[1].replace(/,/g, ''));
-      if (multiply) val *= 1000;
-      if (val > 0 && val < 1000000) return val;
+      const val = parseInt(m[1].replace(/,/g, ''));
+      if (val > 1000 && val < 1000000) return val;
     }
   }
+
+  // "210 thousand km" / "210k kilometres"
+  const thousandMatch = text.match(/(\d{1,3})\s*(?:thousand|thou)\s*k(?:m|ms|ilometres?|ilometers?)?/);
+  if (thousandMatch) {
+    const val = parseInt(thousandMatch[1]) * 1000;
+    if (val > 1000 && val < 1000000) return val;
+  }
+
+  // Standard patterns with comma-separated numbers — e.g. 210,000km
+  const commaMatch = text.match(/(\d{1,3}(?:,\d{3})+)\s*k(?:m|ms|ilometres?|ilometers?|s\b)/);
+  if (commaMatch) {
+    const val = parseInt(commaMatch[1].replace(/,/g, ''));
+    if (val > 1000 && val < 1000000) return val;
+  }
+
+  // Plain number followed by km variant — e.g. 210000km or 210000 kms
+  const plainMatch = text.match(/(\d{4,6})\s*k(?:m|ms|ilometres?|ilometers?|s\b)/);
+  if (plainMatch) {
+    const val = parseInt(plainMatch[1]);
+    if (val > 1000 && val < 1000000) return val;
+  }
+
+  // Shorthand — e.g. "210k" or "210 k" at word boundary
+  const shortMatch = text.match(/\b(\d{2,4})\s*k(?:\s|$|[^a-z])/);
+  if (shortMatch) {
+    const val = parseInt(shortMatch[1]) * 1000;
+    if (val > 10000 && val < 1000000) return val;
+  }
+
+  // "low ks" / "high ks" — can't extract exact number, return null
   return null;
 }
 
@@ -624,16 +668,21 @@ async function scanWatchItem(watcher, opts = {}) {
     await saveUserSeen(userId, seen);
   }
 
-  // Vehicle detail fallback
-  const needsDetail = userListings.filter(l =>
+  // Vehicle detail fallback — only runs if:
+  // 1. Keyword is NOT a vehicle keyword (includeDetails was false so no details in main scan)
+  // 2. A listing under that keyword looks like a vehicle AND mileage is missing
+  // Uses isVehicleKeyword (keyword only) so "callaway golf clubs" never triggers this
+  const kwIsVehicle = isVehicleKeyword(keyword);
+  const needsDetail = !kwIsVehicle ? userListings.filter(l =>
     l.keyword === keyword &&
     isVehicleListing(keyword, l.title, l.description) &&
     l.mileage === null &&
     l.url &&
     (Date.now() - new Date(l.foundAt).getTime()) < 2 * 60 * 1000
-  );
+  ) : [];
+
   if (needsDetail.length > 0) {
-    console.log(`[DetailScrape] Fetching details for ${needsDetail.length} vehicle listing(s) without mileage`);
+    console.log(`[DetailScrape] ${needsDetail.length} vehicle listing(s) found under non-vehicle keyword "${keyword}" — fetching details`);
     const chunks = [];
     for (let i = 0; i < needsDetail.length; i += 5) chunks.push(needsDetail.slice(i, i + 5));
     let detailUpdated = false;
