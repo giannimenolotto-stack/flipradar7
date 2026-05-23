@@ -534,13 +534,14 @@ async function scrapeListingDetail(listingUrl) {
 }
 
 // ── Vehicle helpers ───────────────────────────────────────
-const VEHICLE_KEYWORDS = ['car','ute','van','truck','bike','motorcycle','suv','4wd','wagon',
-  'sedan','hatch','coupe','convertible','tractor','forklift','boat','jet ski','caravan',
-  'camper','trailer','scooter','moped','excavator','loader','hilux','landcruiser','patrol',
+const VEHICLE_KEYWORDS = ['car','ute','van','truck','motorcycle','suv','4wd','wagon',
+  'sedan','hatch','coupe','convertible','tractor','forklift','boat','caravan',
+  'camper','excavator','loader','hilux','landcruiser','patrol',
   'ranger','triton','navara','colorado','dmax','bt50','pajero','prado','defender','discovery',
   'transit','sprinter','vito','ducato','daily','commodore','falcon','camry','corolla',
   'civic','accord','mazda','subaru','toyota','ford','holden','honda','nissan','mitsubishi',
   'hyundai','kia','bmw','mercedes','audi','volkswagen','vw','jeep','ram','dodge'];
+// NOTE: scooter, moped, bike removed — electric versions dont need odometer data (includeDetails:true is wasted cost)
 
 // Only checks the KEYWORD — prevents "callaway golf clubs" triggering vehicle mode
 // just because someone mentions a Ram truck in their listing description
