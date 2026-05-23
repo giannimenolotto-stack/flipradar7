@@ -460,11 +460,13 @@ async function scrapeKeyword(keyword, opts = {}) {
   try {
     const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [fbUrl], maxItems, includeDetails, maxRequestRetries: 1 },
+      { urls: [fbUrl], maxItems, includeDetails, maxRequestRetries: 1, maxPagesPerUrl: 1 },
       { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
-    const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
-    console.log(`[Apify] "${keyword}" -> ${items.length} item(s)`);
+    // Slice to maxItems ourselves — the actor ignores the cap when includeDetails:true
+    const allItems = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
+    const items = allItems.slice(0, maxItems);
+    console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
       const rawListedAt = item.creation_time || item.listed_at || item.listingCreationTime
