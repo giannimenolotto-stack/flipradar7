@@ -119,6 +119,14 @@ async function scrapeKeyword(keyword, opts = {}) {
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s)`);
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
+      // Best-effort Facebook listing date — Apify exposes several possible fields
+      const rawListedAt = item.creation_time || item.listed_at || item.listingCreationTime
+        || item.listing_creation_time || item.created_time || item.date || null;
+      const listedAt = rawListedAt
+        ? (typeof rawListedAt === 'number'
+            ? new Date(rawListedAt * 1000).toISOString()   // unix seconds
+            : new Date(rawListedAt).toISOString())
+        : new Date().toISOString();
       return {
         id,
         title:       item.marketplace_listing_title || item.title || keyword,
@@ -128,6 +136,7 @@ async function scrapeKeyword(keyword, opts = {}) {
         location:    typeof item.location === 'string' ? item.location : (item.location?.reverse_geocode?.city || null),
         description: item.redacted_description?.text || item.description || null,
         keyword,
+        listedAt,
         foundAt:     new Date().toISOString(),
       };
     }).filter(l => l.id);
@@ -167,6 +176,8 @@ async function scanWatchItem(watcher, opts = {}) {
     markSeen(key);
     if (!listings.find(l => l.id === listing.id)) {
       listings.unshift(listing);
+      // Keep sorted by Facebook listing date, newest first
+      listings.sort((a, b) => new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt));
       if (listings.length > 500) listings = listings.slice(0, 500);
     }
     newCount++;
@@ -311,6 +322,8 @@ app.get('/listings', (req, res) => {
     const sinceMs = new Date(since).getTime();
     if (!isNaN(sinceMs)) result = result.filter(l => new Date(l.foundAt).getTime() > sinceMs);
   }
+  // Always return newest Facebook listings first
+  result = [...result].sort((a, b) => new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt));
   res.json(result);
 });
 
