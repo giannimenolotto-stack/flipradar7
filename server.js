@@ -441,7 +441,7 @@ const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
   const days      = opts.initialScan ? 7 : 1;
-  const maxItems  = 20; // hard cap at 20 to control Apify costs
+  const maxItems  = opts.initialScan ? 50 : 25; // more on initial scan, less on regular scans
   // Use isVehicleKeyword (keyword only) — not isVehicleListing which checks descriptions
   // This prevents "callaway golf clubs" triggering vehicle mode
   const vehicleMode    = isVehicleKeyword(keyword);
