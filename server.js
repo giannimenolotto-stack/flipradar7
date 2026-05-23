@@ -1080,6 +1080,23 @@ app.delete('/listings', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// POST /listings/remove — remove specific listings by ID (irrelevant ones flagged by AI)
+app.post('/listings/remove', authMiddleware, async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids)) return res.status(400).json({ error: 'ids array required' });
+    const listings = await getUserListings(req.userId);
+    const filtered = listings.filter(l => !ids.includes(l.id));
+    await saveUserListings(req.userId, filtered);
+    // Also mark as seen so they don't come back next scan
+    const seen = await getUserSeen(req.userId);
+    ids.forEach(id => { seen[id] = Date.now(); });
+    await saveUserSeen(req.userId, seen);
+    console.log(`[Filter] Removed ${ids.length} irrelevant listing(s) for user ${req.userId}`);
+    res.json({ ok: true, removed: ids.length });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
 // ── Price cache route — lets frontend check before triggering AI ──
 // GET /prices?keyword=ps5
 app.get('/prices', authMiddleware, async (req, res) => {
