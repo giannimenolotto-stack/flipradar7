@@ -466,8 +466,18 @@ async function scrapeKeyword(keyword, opts = {}) {
     );
     // Slice to maxItems ourselves — the actor ignores the cap when includeDetails:true
     const allItems = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
-    const items = allItems.slice(0, maxItems);
-    console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
+    const sliced   = allItems.slice(0, maxItems);
+
+    // Keyword relevance filter — drop listings where keyword words don't appear in title
+    // Prevents "moped" returning car listings just because description mentions moped accessories
+    const kwWords = keyword.replace(/['"]/g, '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    const items = sliced.filter(item => {
+      const title = (item.marketplace_listing_title || item.title || '').toLowerCase();
+      // All keyword words must appear in the title
+      return kwWords.every(word => title.includes(word));
+    });
+
+    console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned, ${sliced.length - items.length} filtered out)`);
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
       const rawListedAt = item.creation_time || item.listed_at || item.listingCreationTime
@@ -645,10 +655,33 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
   const userListings = await getUserListings(userId);
   let newCount       = 0;
 
-  for (const listing of raw) {
+  // Filter 1: all keyword words must appear in listing title
+  const kwWords = keyword.replace(/['"]/g, '').split(/\s+/).filter(w => w.length > 2);
+
+  // Filter 2: exclude banned words from title AND description
+  const excludeWords = Array.isArray(watcher.excludeWords) ? watcher.excludeWords : [];
+
+  const relevant = raw.filter(l => {
+    const title = (l.title || '').toLowerCase();
+    const desc  = (l.description || '').toLowerCase();
+    const full  = title + ' ' + desc;
+    // Must contain all keyword words in title
+    if (!kwWords.every(w => title.includes(w))) return false;
+    // Must NOT contain any excluded words in title or description
+    if (excludeWords.length && excludeWords.some(w => full.includes(w))) return false;
+    return true;
+  });
+
+  if (excludeWords.length) {
+    const dropped = raw.length - relevant.length;
+    if (dropped > 0) console.log(`[Filter] "${keyword}" — dropped ${dropped} listing(s) matching exclude words: ${excludeWords.join(', ')}`);
+  }
+
+  let seenSkipped = 0;
+  for (const listing of relevant) {
     const key    = `${keyword}:${listing.id}`;
     const seenTs = seen[key];
-    if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS) continue;
+    if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS) { seenSkipped++; continue; }
     if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
     if (watcher.minPrice && listing.price < watcher.minPrice) continue;
     seen[key] = Date.now();
@@ -720,6 +753,18 @@ async function scanWatchItem(watcher, opts = {}) {
     }
   }
 
+  // ── On initial scan, clear seen cache for this keyword ──
+  // So listings always come through fresh when user first adds a watch
+  if (opts.initialScan) {
+    const seen = await getUserSeen(watcher.userId);
+    const cleared = Object.keys(seen).filter(k => k.startsWith(keyword + ':'));
+    cleared.forEach(k => delete seen[k]);
+    if (cleared.length > 0) {
+      await saveUserSeen(watcher.userId, seen);
+      console.log(`[InitialScan] Cleared ${cleared.length} seen entries for "${keyword}"`);
+    }
+  }
+
   // ── Distribute to this user ───────────────────────────────
   const { newCount, userListings } = await distributeListingsToUser(watcher, raw, opts);
 
@@ -762,7 +807,7 @@ async function scanWatchItem(watcher, opts = {}) {
 
   watcher.lastScanned = new Date().toISOString();
   await saveWatch(watcher);
-  console.log(`[Scan] "${keyword}" (${watcher.plan||'basic'}) → ${newCount} new`);
+  console.log(`[Scan] "${keyword}" (${watcher.plan||'basic'}) → ${newCount} new | relevant:${relevant?.length||0} seenSkipped:${seenSkipped||0}`);
   return newCount;
 }
 
@@ -967,6 +1012,11 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     if (existingWatches.length >= planLimit)
       return res.status(403).json({ error: 'Watchlist limit reached for your plan', plan: user?.plan, limit: planLimit });
     const watchPlan = plan || (speed === 'premium' ? 'premium' : 'basic');
+    const rawExclude = req.body.excludeWords || [];
+    const excludeWords = Array.isArray(rawExclude)
+      ? rawExclude.map(w => w.toLowerCase().trim()).filter(Boolean)
+      : [];
+
     const item = {
       id: uuidv4(),
       userId:   req.userId,
@@ -981,6 +1031,7 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
       plan:     watchPlan,
       pushoverToken: pushoverToken || null,
       pushoverUser:  pushoverUser  || null,
+      excludeWords,  // stored on watch — used to filter listings before saving
       paused:    false,
       addedAt:   new Date().toISOString(),
       lastScanned: null,
