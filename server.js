@@ -439,7 +439,7 @@ const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
   const days      = opts.initialScan ? 7 : 1;
-  const maxItems  = opts.initialScan ? 25 : 50;
+  const maxItems  = opts.initialScan ? 20 : 20; // capped at 20 to control Apify costs
   // Use isVehicleKeyword (keyword only) — not isVehicleListing which checks descriptions
   // This prevents "callaway golf clubs" triggering vehicle mode
   const vehicleMode    = isVehicleKeyword(keyword);
@@ -938,6 +938,8 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     startWatchTimer(item);
     console.log(`[Watch] Added "${item.keyword}" for user ${req.userId}`);
     res.json(item);
+    // Initial backfill — runs once when watch is added
+    // DO NOT also call /scan/now — that causes a double scan
     scanWatchItem(item, { initialScan: true })
       .then(n => console.log(`[InitialScan] "${item.keyword}" → ${n} listing(s)`))
       .catch(e => console.error(`[InitialScan] Error:`, e.message));
