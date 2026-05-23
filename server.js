@@ -755,25 +755,13 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     const desc  = (l.description || '').toLowerCase();
     const full  = title + ' ' + desc;
 
-    // Always block excluded words
+    // Always block user-defined excluded words
     if (excludeWords.length && excludeWords.some(w => w && full.includes(w))) return false;
 
-    // Pass if a known synonym/brand appears in the title
-    if (kwSynonyms.length && kwSynonyms.some(s => title.includes(s))) return true;
-
-    // Multi-word keyword — try exact phrase first
-    if (kwWords.length > 1) {
-      // Exact phrase match in title (e.g. "electric scooter" must appear together)
-      if (title.includes(keyword)) return true;
-      // Or all words present — but ONLY if no conflicting modifier
-      // e.g. "electric scooter" blocks plain "scooter" or "petrol scooter"
-      const hasAllWords = kwWords.every(w => title.includes(w));
-      if (!hasAllWords) return false;
-      return true;
-    }
-
-    // Single word — must appear in title
-    return title.includes(keyword);
+    // Everything else passes through to AI + synonym map for filtering
+    // The keyword was already used by Apify to search — don't double-filter here
+    // AI relevance check will remove anything truly off-topic
+    return true;
   });
 
   const dropped = raw.length - relevant.length;
