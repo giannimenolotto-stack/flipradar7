@@ -664,7 +664,15 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     const pToken   = watcher.pushoverToken || process.env.PUSHOVER_TOKEN;
     const pUser    = watcher.pushoverUser  || process.env.PUSHOVER_USER;
     const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
+    // Pushover notification (if configured)
     await sendPushover(pToken, pUser, `FlipRadar: ${keyword}`, `${listing.title}\n${priceStr}`, listing.url);
+    // Web push notification — works even when app is closed, no extra app needed
+    sendWebPush(watcher.userId, {
+      title:  `FlipRadar: ${listing.title}`,
+      body:   `${priceStr} · ${listing.location || keyword}`,
+      url:    listing.url,
+      tag:    `listing-${listing.id}`,
+    }).catch(() => {});
     await sleep(300);
   }
 
@@ -1257,9 +1265,70 @@ app.post('/auth/appraisal', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ── Web Push notification sender ─────────────────────────
+async function sendWebPush(userId, payload) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  try {
+    const subs = await redisGet(K_push(userId));
+    if (!subs || !subs.length) return;
+    const webpush = require('web-push');
+    webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    const msg = JSON.stringify(payload);
+    const results = await Promise.allSettled(
+      subs.map(sub => webpush.sendNotification(sub, msg))
+    );
+    // Remove expired/invalid subscriptions
+    const valid = subs.filter((_, i) => results[i].status === 'fulfilled');
+    if (valid.length !== subs.length) await redisSet(K_push(userId), valid);
+  } catch (e) {
+    console.error('[WebPush] Error:', e.message);
+  }
+}
+
+// POST /push/subscribe — save user's push subscription
+app.post('/push/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const { subscription } = req.body;
+    if (!subscription || !subscription.endpoint) return res.status(400).json({ error: 'subscription required' });
+    const subs = await redisGet(K_push(req.userId)) || [];
+    // Avoid duplicates
+    const exists = subs.find(s => s.endpoint === subscription.endpoint);
+    if (!exists) {
+      subs.push(subscription);
+      await redisSet(K_push(req.userId), subs);
+    }
+    console.log(`[WebPush] Subscribed user ${req.userId}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE /push/subscribe — remove subscription
+app.delete('/push/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    const subs = await redisGet(K_push(req.userId)) || [];
+    await redisSet(K_push(req.userId), subs.filter(s => s.endpoint !== endpoint));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /push/vapid-key — gives frontend the public key to subscribe with
+app.get('/push/vapid-key', (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.status(500).json({ error: 'Push not configured' });
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
 // ── AI proxy routes — keys live on server, never in browser ──
 const GEMINI_API_KEY    = process.env.GEMINI_API_KEY    || null;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
+
+// ── Web Push (VAPID) ──────────────────────────────────────
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
+const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
+
+// Redis key for push subscriptions
+const K_push = userId => `fr:push:${userId}`;
 
 // POST /ai/image — image scan via Gemini Flash
 // Body: { parts: [ { inline_data: { mime_type, data } }, { text: prompt } ] }
