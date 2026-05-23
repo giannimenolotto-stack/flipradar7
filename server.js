@@ -6,6 +6,8 @@ const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const cron    = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
+const Stripe = require('stripe');
+const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const app = express();
 app.use(cors());
@@ -58,6 +60,25 @@ const K = {
 // ── Auth ──────────────────────────────────────────────────
 const JWT_SECRET    = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
+
+// ── Stripe ────────────────────────────────────────────────
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || null;
+const PRICE_IDS = {
+  basic_weekly:    'price_1Ta7LcPDjYUYNInHPy2AMqba',
+  basic_monthly:   'price_1Ta7MLPDjYUYNInHYru4vO5M',
+  basic_yearly:    'price_1Ta7MdPDjYUYNInHu5k5kiOU',
+  premium_weekly:  'price_1Ta7PsPDjYUYNInHMvbMiWvV',
+  premium_monthly: 'price_1Ta7QDPDjYUYNInHDQTp70Mt',
+  premium_yearly:  'price_1Ta7QSPDjYUYNInHLG2F4aT3',
+};
+// Map price ID back to plan name
+const PRICE_TO_PLAN = {};
+Object.entries(PRICE_IDS).forEach(([key, priceId]) => {
+  PRICE_TO_PLAN[priceId] = key.startsWith('basic') ? 'basic' : 'premium';
+});
+const PLAN_APPRAISAL_LIMITS = { free: 5, basic: 25, premium: Infinity };
+const PLAN_WATCHLIST_LIMITS = { free: 0, basic: 1, premium: 2 };
+const PLAN_SCAN_INTERVALS   = { free: null, basic: 30 * 60 * 1000, premium: 15 * 60 * 1000 };
 const FROM_EMAIL     = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.com>';
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
@@ -240,6 +261,7 @@ function verificationEmail(name, email, code) {
 
 // ── Scan intervals per plan ───────────────────────────────
 const PLAN_INTERVALS = {
+  free:    null,
   basic:   30 * 60 * 1000,
   premium: 15 * 60 * 1000,
 };
@@ -602,8 +624,7 @@ app.post('/auth/signup', async (req, res) => {
     await redisSet(K.emailIdx(user.email), user.id);
     const token = makeToken(user.id);
     console.log(`[Auth] Signup: ${user.email}`);
-    // Send both emails in background — don't block the response
-    welcomeEmail(user.name, user.email).catch(e => console.error('[Email] Welcome failed:', e.message));
+    // Send verification email only — welcome email fires after they verify
     verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Verify failed:', e.message));
     res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan, emailVerified: false } });
   } catch (e) { console.error('[Signup]', e.message); res.status(500).json({ error: 'Server error' }); }
@@ -625,6 +646,8 @@ app.post('/auth/verify-email', authMiddleware, async (req, res) => {
     delete user.verifyExpiry;
     await saveUser(user);
     console.log(`[Auth] Email verified: ${user.email}`);
+    // Send welcome email now that they've verified
+    welcomeEmail(user.name, user.email).catch(e => console.error('[Email] Welcome failed:', e.message));
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
@@ -700,6 +723,12 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     const { keyword, maxPrice, minPrice, pushoverToken, pushoverUser, plan, name, speed } = req.body;
     if (!keyword || keyword.trim().length < 2)
       return res.status(400).json({ error: 'Keyword required' });
+    // Enforce watchlist limit per plan
+    const user = await getUser(req.userId);
+    const planLimit = PLAN_WATCHLIST_LIMITS[user?.plan || 'free'];
+    const existingWatches = await getUserWatches(req.userId);
+    if (existingWatches.length >= planLimit)
+      return res.status(403).json({ error: 'Watchlist limit reached for your plan', plan: user?.plan, limit: planLimit });
     const watchPlan = plan || (speed === 'premium' ? 'premium' : 'basic');
     const item = {
       id: uuidv4(),
@@ -805,6 +834,117 @@ app.post('/scan/test', async (req, res) => {
     const found = await scrapeKeyword(keyword, {});
     res.json({ keyword, count: found.length, listings: found });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// ── Stripe routes ─────────────────────────────────────────
+app.post('/stripe/create-checkout', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const { priceId } = req.body;
+    if (!priceId || !Object.values(PRICE_IDS).includes(priceId))
+      return res.status(400).json({ error: 'Invalid price' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: 'https://flip-radar.app?upgraded=1',
+      cancel_url:  'https://flip-radar.app?cancelled=1',
+      customer_email: user.email,
+      metadata: { userId: user.id, priceId },
+      subscription_data: { metadata: { userId: user.id, priceId } },
+    });
+    res.json({ url: session.url });
+  } catch (e) { console.error('[Stripe] Checkout error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/stripe/portal', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const user = await getUser(req.userId);
+    if (!user || !user.stripeCustomerId) return res.status(400).json({ error: 'No subscription found' });
+    const session = await stripe.billingPortal.sessions.create({
+      customer: user.stripeCustomerId,
+      return_url: 'https://flip-radar.app',
+    });
+    res.json({ url: session.url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Stripe webhook — must use raw body
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.json({ ok: true });
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (e) { console.error('[Stripe] Webhook sig failed:', e.message); return res.status(400).send('Webhook Error'); }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const userId = session.metadata?.userId;
+      const priceId = session.metadata?.priceId;
+      if (userId && priceId) {
+        const user = await getUser(userId);
+        if (user) {
+          user.plan = PRICE_TO_PLAN[priceId] || 'basic';
+          user.stripeCustomerId = session.customer;
+          user.stripeSubscriptionId = session.subscription;
+          await saveUser(user);
+          console.log(`[Stripe] Upgraded ${user.email} to ${user.plan}`);
+        }
+      }
+    }
+    if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.paused') {
+      const sub = event.data.object;
+      const userId = sub.metadata?.userId;
+      if (userId) {
+        const user = await getUser(userId);
+        if (user) {
+          user.plan = 'free';
+          user.stripeSubscriptionId = null;
+          await saveUser(user);
+          console.log(`[Stripe] Downgraded ${user.email} to free`);
+        }
+      }
+    }
+  } catch (e) { console.error('[Stripe] Webhook handler error:', e.message); }
+  res.json({ received: true });
+});
+
+app.get('/auth/plan', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const appraisalsToday = user.appraisalsToday || 0;
+    const appraisalDate = user.appraisalDate || '';
+    const today = new Date().toISOString().slice(0, 10);
+    const appraised = appraisalDate === today ? appraisalsToday : 0;
+    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    res.json({
+      plan: user.plan || 'free',
+      appraisalsUsedToday: appraised,
+      appraisalsLimit: limit === Infinity ? -1 : limit,
+      watchlistLimit: PLAN_WATCHLIST_LIMITS[user.plan || 'free'],
+    });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/appraisal', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today = new Date().toISOString().slice(0, 10);
+    if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
+    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    if (limit !== Infinity && user.appraisalsToday >= limit)
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
+    user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+    await saveUser(user);
+    res.json({ ok: true, used: user.appraisalsToday, limit: limit === Infinity ? -1 : limit });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 // ── Start ─────────────────────────────────────────────────
