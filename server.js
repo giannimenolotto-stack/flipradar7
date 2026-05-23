@@ -650,6 +650,7 @@ const SHARED_SCAN_TTL_MS = 25 * 60 * 1000; // 25 mins — slightly under the 30m
 
 // ── Distribute raw listings to a single user ─────────────
 async function distributeListingsToUser(watcher, raw, opts = {}) {
+  if (!Array.isArray(raw)) raw = []; // safety net
   const keyword      = watcher.keyword.toLowerCase();
   const userId       = watcher.userId;
   const seen         = await getUserSeen(userId);
@@ -767,6 +768,8 @@ async function scanWatchItem(watcher, opts = {}) {
   }
 
   // ── Distribute to this user ───────────────────────────────
+  // Safety net — ensure raw is always an array
+  if (!Array.isArray(raw)) raw = [];
   const { newCount, userListings } = await distributeListingsToUser(watcher, raw, opts);
 
   // ── Vehicle detail fallback ───────────────────────────────
