@@ -649,23 +649,29 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
   const userListings = await getUserListings(userId);
   let newCount       = 0;
 
-  // Filter: exclude banned words from title AND description only
-  // We do NOT filter by keyword — Apify + exact phrase search already handles relevance
   const excludeWords = Array.isArray(watcher.excludeWords) ? watcher.excludeWords : [];
+
+  // Split keyword into individual words for matching
+  // All words must appear somewhere in the title (case-insensitive)
+  const kwWords = keyword.replace(/['"]/g, '').toLowerCase().split(/\s+/).filter(w => w.length > 0);
 
   const relevant = raw.filter(l => {
     const title = (l.title || '').toLowerCase();
     const desc  = (l.description || '').toLowerCase();
     const full  = title + ' ' + desc;
-    // Must NOT contain any excluded words in title or description
+
+    // All keyword words must appear in the title
+    // e.g. "electric moped" → title must contain both "electric" AND "moped"
+    if (!kwWords.every(w => title.includes(w))) return false;
+
+    // Must NOT contain any user-defined excluded words
     if (excludeWords.length && excludeWords.some(w => w && full.includes(w))) return false;
+
     return true;
   });
 
-  if (excludeWords.length) {
-    const dropped = raw.length - relevant.length;
-    if (dropped > 0) console.log(`[Filter] "${keyword}" — dropped ${dropped} listing(s) matching exclude words: ${excludeWords.join(', ')}`);
-  }
+  const dropped = raw.length - relevant.length;
+  if (dropped > 0) console.log(`[Filter] "${keyword}" — dropped ${dropped} listing(s) (keyword mismatch or excluded words)`);
 
   let seenSkipped = 0;
   for (const listing of relevant) {
