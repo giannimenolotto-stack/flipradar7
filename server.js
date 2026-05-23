@@ -58,8 +58,9 @@ const K = {
   watch:       id  => `fr:watch:${id}`,
   listings:    uid => `fr:listings:${uid}`,
   seen:        uid => `fr:seen:${uid}`,
-  ebay:        kw  => `fr:ebay:${kw.toLowerCase().trim()}`,       // eBay sold price cache
-  prices:      kw  => `fr:prices:${kw.toLowerCase().trim()}`,     // Our own scan price history
+  ebay:        kw  => `fr:ebay:${kw.toLowerCase().trim()}`,
+  prices:      kw  => `fr:prices:${kw.toLowerCase().trim()}`,
+  sharedScan:  kw  => `fr:scan:${kw.toLowerCase().trim()}`,  // shared scan cache across all users
 };
 
 // ── Auth ──────────────────────────────────────────────────
@@ -633,14 +634,12 @@ function parsePrice(raw) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Per-watch scan ────────────────────────────────────────
-async function scanWatchItem(watcher, opts = {}) {
-  const keyword = watcher.keyword.toLowerCase();
-  const raw = await scrapeKeyword(keyword, {
-    city: watcher.location, lat: watcher.lat, lng: watcher.lng,
-    radius: watcher.radius, initialScan: opts.initialScan || false
-  });
+// ── Shared scan cache TTL ────────────────────────────────
+const SHARED_SCAN_TTL_MS = 25 * 60 * 1000; // 25 mins — slightly under the 30min scan interval
 
+// ── Distribute raw listings to a single user ─────────────
+async function distributeListingsToUser(watcher, raw, opts = {}) {
+  const keyword      = watcher.keyword.toLowerCase();
   const userId       = watcher.userId;
   const seen         = await getUserSeen(userId);
   const userListings = await getUserListings(userId);
@@ -654,7 +653,6 @@ async function scanWatchItem(watcher, opts = {}) {
     if (watcher.minPrice && listing.price < watcher.minPrice) continue;
     seen[key] = Date.now();
 
-    // Store price in our own history — builds up the price database over time
     storeScanPrice(keyword, listing).catch(() => {});
 
     if (!userListings.find(l => l.id === listing.id)) {
@@ -675,10 +673,50 @@ async function scanWatchItem(watcher, opts = {}) {
     await saveUserSeen(userId, seen);
   }
 
-  // Vehicle detail fallback — only runs if:
-  // 1. Keyword is NOT a vehicle keyword (includeDetails was false so no details in main scan)
-  // 2. A listing under that keyword looks like a vehicle AND mileage is missing
-  // Uses isVehicleKeyword (keyword only) so "callaway golf clubs" never triggers this
+  return { newCount, userListings };
+}
+
+// ── Per-watch scan — shared cache across all users ────────
+// If two users watch "mercedes benz", only ONE Apify call is made per 25 mins
+// Both users get results from the shared cache — huge cost saving
+async function scanWatchItem(watcher, opts = {}) {
+  const keyword = watcher.keyword.toLowerCase();
+
+  // ── Check shared scan cache first ────────────────────────
+  let raw;
+  const cached = await redisGet(K.sharedScan(keyword));
+  if (!opts.initialScan && cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
+    raw = cached.listings;
+    console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no Apify call)`);
+  } else {
+    // ── No cache — run Apify scan and cache results ───────
+    raw = await scrapeKeyword(keyword, {
+      city: watcher.location, lat: watcher.lat, lng: watcher.lng,
+      radius: watcher.radius, initialScan: opts.initialScan || false
+    });
+    // Save to shared cache so other users watching same keyword skip Apify
+    await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
+    console.log(`[SharedCache] "${keyword}" → cached ${raw.length} listings`);
+
+    // ── Also distribute to ALL other users watching this keyword ──
+    // So when user 2's timer fires, they already have the results without an Apify call
+    const otherWatchers = watchlist.filter(w =>
+      w.keyword.toLowerCase() === keyword &&
+      w.userId !== watcher.userId &&
+      !w.paused
+    );
+    for (const other of otherWatchers) {
+      await distributeListingsToUser(other, raw).catch(e =>
+        console.error(`[SharedCache] Error distributing to user ${other.userId}:`, e.message)
+      );
+    }
+  }
+
+  // ── Distribute to this user ───────────────────────────────
+  const { newCount, userListings } = await distributeListingsToUser(watcher, raw, opts);
+
+  // ── Vehicle detail fallback ───────────────────────────────
+  // Only for non-vehicle keywords where includeDetails was false
   const kwIsVehicle = isVehicleKeyword(keyword);
   const needsDetail = !kwIsVehicle ? userListings.filter(l =>
     l.keyword === keyword &&
@@ -689,7 +727,7 @@ async function scanWatchItem(watcher, opts = {}) {
   ) : [];
 
   if (needsDetail.length > 0) {
-    console.log(`[DetailScrape] ${needsDetail.length} vehicle listing(s) found under non-vehicle keyword "${keyword}" — fetching details`);
+    console.log(`[DetailScrape] ${needsDetail.length} vehicle listing(s) under non-vehicle keyword "${keyword}"`);
     const chunks = [];
     for (let i = 0; i < needsDetail.length; i += 5) chunks.push(needsDetail.slice(i, i + 5));
     let detailUpdated = false;
@@ -708,7 +746,8 @@ async function scanWatchItem(watcher, opts = {}) {
       await sleep(500);
     }
     if (detailUpdated) {
-      await saveUserListings(userId, userListings);
+      const uid = watcher.userId;
+      await saveUserListings(uid, userListings);
       console.log(`[DetailScrape] Updated ${needsDetail.length} listing(s) with vehicle details`);
     }
   }
