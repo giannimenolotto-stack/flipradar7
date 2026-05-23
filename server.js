@@ -465,11 +465,9 @@ async function scrapeKeyword(keyword, opts = {}) {
       { urls: [fbUrl], maxItems, includeDetails, maxRequestRetries: 1, maxPagesPerUrl: 1 },
       { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
-    // Slice to maxItems ourselves — the actor ignores the cap when includeDetails:true
+    // Slice to maxItems — actor ignores cap when includeDetails:true
     const allItems = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
-    const sliced   = allItems.slice(0, maxItems);
-
-    const items = sliced;
+    const items    = allItems.slice(0, maxItems);
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
@@ -822,7 +820,8 @@ async function scanWatchItem(watcher, opts = {}) {
   let raw;
   const cached = await redisGet(K.sharedScan(keyword));
   if (!opts.initialScan && cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
-    raw = cached.listings;
+    // Serve from cache — slice to regular scan limit
+    raw = (cached.listings || []).slice(0, 25);
     console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no Apify call)`);
   } else {
     // ── No cache — run Apify scan and cache results ───────
