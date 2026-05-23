@@ -750,17 +750,30 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
   // Split keyword into words — all must appear in title OR a synonym matches
   const kwWords = keyword.replace(/['"]/g, '').toLowerCase().split(/\s+/).filter(w => w.length > 0);
 
+  // ── Category mismatch blocklist ──────────────────────────
+  // Only block listings where the title clearly belongs to a DIFFERENT category
+  // e.g. searching "electric scooter" but title says "helmet" or "parts" only
+  const CATEGORY_BLOCKS = {
+    'scooter':         ['helmet only', 'parts only', 'spare parts', 'kids push', 'stunt scooter', 'pro scooter', 'park scooter', 'trick scooter'],
+    'electric scooter':['helmet only', 'parts only', 'spare parts', 'kids push', 'stunt scooter', 'pro scooter', 'park scooter', 'trick scooter'],
+    'iphone':          ['case only', 'charger only', 'cable only', 'screen protector'],
+    'golf clubs':      ['shoes only', 'golf cart', 'buggy only', 'trolley only'],
+    'electric bike':   ['parts only', 'helmet only'],
+  };
+  const categoryBlocks = CATEGORY_BLOCKS[keyword] || [];
+
   const relevant = raw.filter(l => {
     const title = (l.title || '').toLowerCase();
     const desc  = (l.description || '').toLowerCase();
     const full  = title + ' ' + desc;
 
-    // Always block user-defined excluded words
+    // Block user-defined excluded words
     if (excludeWords.length && excludeWords.some(w => w && full.includes(w))) return false;
 
-    // Everything else passes through to AI + synonym map for filtering
-    // The keyword was already used by Apify to search — don't double-filter here
-    // AI relevance check will remove anything truly off-topic
+    // Block obvious category mismatches
+    if (categoryBlocks.length && categoryBlocks.some(w => title.includes(w))) return false;
+
+    // Everything else passes through — Apify search already filters broadly
     return true;
   });
 
