@@ -637,6 +637,7 @@ app.post('/auth/verify-email', authMiddleware, async (req, res) => {
     const user = await getUser(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    console.log('[Verify] user.verifyCode:', user.verifyCode, 'submitted:', String(code).trim(), 'expiry:', user.verifyExpiry);
     if (!user.verifyCode || user.verifyCode !== String(code).trim())
       return res.status(400).json({ error: 'Incorrect code. Please check your email and try again.' });
     if (new Date(user.verifyExpiry) < new Date())
