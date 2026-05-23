@@ -440,8 +440,9 @@ const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
-  const days      = opts.initialScan ? 7 : 1;
-  const maxItems  = opts.initialScan ? 50 : 25; // more on initial scan, less on regular scans
+  // If we need backfill (less than 20 results expected), look back further
+  const days      = opts.backfill ? 14 : (opts.initialScan ? 7 : 1);
+  const maxItems  = opts.initialScan ? 50 : 25;
   // Use isVehicleKeyword (keyword only) — not isVehicleListing which checks descriptions
   // This prevents "callaway golf clubs" triggering vehicle mode
   const vehicleMode    = isVehicleKeyword(keyword);
@@ -905,6 +906,22 @@ async function scanWatchItem(watcher, opts = {}) {
       const uid = watcher.userId;
       await saveUserListings(uid, userListings);
       console.log(`[DetailScrape] Updated ${needsDetail.length} listing(s) with vehicle details`);
+    }
+  }
+
+  // ── Backfill if not enough listings ─────────────────────
+  // If less than 20 new listings found, run a second scan looking back 14 days
+  const totalUserListings = (await getUserListings(watcher.userId)).filter(l => l.keyword === keyword).length;
+  if (totalUserListings < 20) {
+    console.log(`[Backfill] "${keyword}" only has ${totalUserListings} listings — fetching older ones`);
+    const backfillRaw = await scrapeKeyword(keyword, {
+      city: watcher.location, lat: watcher.lat, lng: watcher.lng,
+      radius: watcher.radius, backfill: true
+    });
+    if (backfillRaw.length > 0) {
+      await redisSet(K.sharedScan(keyword), { listings: backfillRaw, scannedAt: new Date().toISOString() });
+      const { newCount: backfillCount } = await distributeListingsToUser(watcher, backfillRaw);
+      console.log(`[Backfill] "${keyword}" → ${backfillCount} older listings added`);
     }
   }
 
