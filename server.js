@@ -1183,7 +1183,7 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${GEMINI_API_KEY}`;
     const geminiRes = await axios.post(url, { contents: [{ parts }] }, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 60000,
@@ -1271,7 +1271,7 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
       }
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${GEMINI_API_KEY}`;
     const geminiRes = await axios.post(url, { contents: [{ parts }] }, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 60000,
