@@ -752,19 +752,25 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     const desc  = (l.description || '').toLowerCase();
     const full  = title + ' ' + desc;
 
-    // Always block excluded words regardless of scan type
+    // Always block excluded words
     if (excludeWords.length && excludeWords.some(w => w && full.includes(w))) return false;
-
-    // On initial scan — let everything through, AI relevance check will clean up after
-    if (opts && opts.initialScan) return true;
 
     // Pass if a known synonym/brand appears in the title
     if (kwSynonyms.length && kwSynonyms.some(s => title.includes(s))) return true;
 
-    // Otherwise all keyword words must appear in the title
-    if (!kwWords.every(w => title.includes(w))) return false;
+    // Multi-word keyword — try exact phrase first
+    if (kwWords.length > 1) {
+      // Exact phrase match in title (e.g. "electric scooter" must appear together)
+      if (title.includes(keyword)) return true;
+      // Or all words present — but ONLY if no conflicting modifier
+      // e.g. "electric scooter" blocks plain "scooter" or "petrol scooter"
+      const hasAllWords = kwWords.every(w => title.includes(w));
+      if (!hasAllWords) return false;
+      return true;
+    }
 
-    return true;
+    // Single word — must appear in title
+    return title.includes(keyword);
   });
 
   const dropped = raw.length - relevant.length;
