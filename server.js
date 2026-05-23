@@ -439,23 +439,28 @@ const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
   const days      = opts.initialScan ? 7 : 1;
-  const maxItems  = opts.initialScan ? 20 : 20; // capped at 20 to control Apify costs
+  const maxItems  = 20; // hard cap at 20 to control Apify costs
   // Use isVehicleKeyword (keyword only) — not isVehicleListing which checks descriptions
   // This prevents "callaway golf clubs" triggering vehicle mode
   const vehicleMode    = isVehicleKeyword(keyword);
   const includeDetails = vehicleMode; // full details only for vehicle keywords
   console.log(`[Apify] "${keyword}" — vehicle:${vehicleMode} includeDetails:${includeDetails}`);
+
+  // Use exact phrase matching — wrap multi-word keywords in quotes so
+  // "electric scooter" doesn't return plain "scooter" listings
+  const searchQuery = keyword.includes(' ') ? `"${keyword}"` : keyword;
+
   let fbUrl;
   if (opts.lat && opts.lng) {
-    fbUrl = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(keyword)}&latitude=${opts.lat}&longitude=${opts.lng}&radius=${opts.radius||50}&sortBy=creation_time_descend&daysSinceListed=${days}`;
+    fbUrl = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(searchQuery)}&latitude=${opts.lat}&longitude=${opts.lng}&radius=${opts.radius||50}&sortBy=creation_time_descend&daysSinceListed=${days}`;
   } else {
     const city = (opts.city || 'melbourne').toLowerCase().replace(/\s+/g, '');
-    fbUrl = `https://www.facebook.com/marketplace/${city}/search/?query=${encodeURIComponent(keyword)}&sortBy=creation_time_descend&daysSinceListed=${days}`;
+    fbUrl = `https://www.facebook.com/marketplace/${city}/search/?query=${encodeURIComponent(searchQuery)}&sortBy=creation_time_descend&daysSinceListed=${days}`;
   }
   try {
     const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [fbUrl], maxItems, includeDetails },
+      { urls: [fbUrl], maxItems, includeDetails, maxRequestRetries: 1 },
       { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
     const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
