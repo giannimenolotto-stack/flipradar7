@@ -294,23 +294,89 @@ async function scrapeKeyword(keyword, opts = {}) {
             ? new Date(rawListedAt * 1000).toISOString()
             : new Date(rawListedAt).toISOString())
         : new Date().toISOString();
+      const title       = item.marketplace_listing_title || item.title || keyword;
+      const description = item.redacted_description?.text || item.description || null;
+      const isVehicle   = isVehicleListing(keyword, title, description);
       return {
         id,
-        title:       item.marketplace_listing_title || item.title || keyword,
+        title,
         price:       parsePrice(item.listing_price?.amount || item.listing_price?.formatted_amount || item.price),
         url:         item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
         image:       item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
         location:    typeof item.location === 'string' ? item.location : (item.location?.reverse_geocode?.city || null),
-        description: item.redacted_description?.text || item.description || null,
+        description,
         keyword,
         listedAt,
-        foundAt: new Date().toISOString(),
+        foundAt:  new Date().toISOString(),
+        // Vehicle fields — null for non-vehicle listings
+        mileage:  isVehicle ? extractMileage(title, description) : null,
+        year:     isVehicle ? extractYear(title, description)    : null,
+        make:     isVehicle ? extractMake(keyword, title)        : null,
       };
     }).filter(l => l.id);
   } catch (e) {
     console.error(`[Apify] Error for "${keyword}":`, e.response ? JSON.stringify(e.response.data).slice(0,200) : e.message);
     return [];
   }
+}
+
+
+// ── Vehicle data extraction ───────────────────────────────
+const VEHICLE_KEYWORDS = ['car','ute','van','truck','bike','motorcycle','suv','4wd','wagon',
+  'sedan','hatch','coupe','convertible','tractor','forklift','boat','jet ski','caravan',
+  'camper','trailer','scooter','moped','excavator','loader','hilux','landcruiser','patrol',
+  'ranger','triton','navara','colorado','dmax','bt50','pajero','prado','defender','discovery',
+  'transit','sprinter','vito','ducato','daily','commodore','falcon','camry','corolla',
+  'civic','accord','mazda','subaru','toyota','ford','holden','honda','nissan','mitsubishi',
+  'hyundai','kia','bmw','mercedes','audi','volkswagen','vw','jeep','ram','dodge'];
+
+function isVehicleListing(keyword, title, description) {
+  const text = (keyword + ' ' + title + ' ' + (description || '')).toLowerCase();
+  return VEHICLE_KEYWORDS.some(kw => text.includes(kw));
+}
+
+function extractMileage(title, description) {
+  const text = (title + ' ' + (description || '')).toLowerCase();
+  // Each entry: [pattern, multiplyBy1000]
+  const patterns = [
+    [/(\d{1,3}(?:,\d{3})+)\s*k(?:m|ms|ilometres?|ilometers?)/, false],
+    [/(\d{2,6})\s*k(?:m|ms|ilometres?|ilometers?)/, false],
+    [/(\d{1,4})\s*k\s*k(?:m|ms|ilometres?|ilometers?|s)/, true],
+    [/(\d{1,4})\s*k(?=\s|$)/, true],
+  ];
+  for (const [pattern, multiply] of patterns) {
+    const m = text.match(pattern);
+    if (m) {
+      let val = parseInt(m[1].replace(/,/g, ''));
+      if (multiply) val *= 1000;
+      if (val > 0 && val < 1000000) return val;
+    }
+  }
+  return null;
+}
+function extractYear(title, description) {
+  const text = title + ' ' + (description || '');
+  // Match 4-digit years between 1970 and next year
+  const nextYear = new Date().getFullYear() + 1;
+  const m = text.match(/(19[7-9]\d|20[0-2]\d)/);
+  if (m) {
+    const yr = parseInt(m[1]);
+    if (yr >= 1970 && yr <= nextYear) return yr;
+  }
+  return null;
+}
+
+function extractMake(keyword, title) {
+  const MAKES = ['toyota','ford','holden','honda','nissan','mitsubishi','mazda','subaru',
+    'hyundai','kia','bmw','mercedes','audi','volkswagen','vw','jeep','ram','dodge',
+    'isuzu','ldv','great wall','gwm','chery','mg','skoda','volvo','peugeot','renault',
+    'citroen','fiat','alfa','land rover','range rover','lexus','infiniti','acura',
+    'cadillac','chevrolet','buick','pontiac','chrysler','suzuki','daihatsu','ssangyong'];
+  const text = (keyword + ' ' + title).toLowerCase();
+  for (const make of MAKES) {
+    if (text.includes(make)) return make.charAt(0).toUpperCase() + make.slice(1);
+  }
+  return null;
 }
 
 function parsePrice(raw) {
