@@ -1,6 +1,6 @@
 const express = require('express');
+const crypto  = require('crypto');
 const cors    = require('cors');
-const cron    = require('node-cron');
 const axios   = require('axios');
 const { v4: uuidv4 } = require('uuid');
 
@@ -32,6 +32,47 @@ async function redisSet(key, value) {
   } catch (e) { console.error('[Redis] SET error:', e.message); }
 }
 
+// ── Auth ──────────────────────────────────────────────────
+const AUTH_SECRET = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
+const INACTIVE_DAYS = 7;
+
+function hashPassword(pw) {
+  return crypto.createHmac('sha256', AUTH_SECRET).update(pw).digest('hex');
+}
+function makeToken(userId) {
+  const payload = userId + ':' + Date.now();
+  const sig = crypto.createHmac('sha256', AUTH_SECRET).update(payload).digest('hex');
+  return Buffer.from(payload + ':' + sig).toString('base64');
+}
+function verifyToken(token) {
+  try {
+    const decoded = Buffer.from(token, 'base64').toString('utf8');
+    const parts = decoded.split(':');
+    if (parts.length < 3) return null;
+    const sig = parts.pop();
+    const payload = parts.join(':');
+    const expected = crypto.createHmac('sha256', AUTH_SECRET).update(payload).digest('hex');
+    if (sig !== expected) return null;
+    return parts[0]; // userId
+  } catch { return null; }
+}
+function authMiddleware(req, res, next) {
+  const header = req.headers['authorization'] || '';
+  const token = header.replace('Bearer ', '').trim();
+  const userId = verifyToken(token);
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+  req.userId = userId;
+  next();
+}
+
+async function getUser(userId) { return await redisGet('flipradar:user:' + userId); }
+async function saveUser(user)  { await redisSet('flipradar:user:' + user.id, user); }
+async function getUserByEmail(email) {
+  const idx = await redisGet('flipradar:email:' + email.toLowerCase());
+  if (!idx) return null;
+  return await getUser(idx);
+}
+
 // ── Scan intervals per plan (ms) ─────────────────────────
 const PLAN_INTERVALS = {
   basic:   30 * 60 * 1000,  // 30 mins
@@ -60,6 +101,28 @@ function pruneSeen() {
     if (seenListings[key] < cutoff) delete seenListings[key];
   }
 }
+
+// ── Auto-pause inactive users (daily check) ───────────────
+async function pauseInactiveUsers() {
+  const CUTOFF = Date.now() - INACTIVE_DAYS * 24 * 60 * 60 * 1000;
+  let paused = 0;
+  for (const w of watchlist) {
+    if (w.paused) continue;
+    const user = await getUser(w.userId);
+    if (!user) continue;
+    if (user.lastSeen && new Date(user.lastSeen).getTime() < CUTOFF) {
+      w.paused = true;
+      stopWatchTimer(w.id);
+      paused++;
+      console.log(`[AutoPause] "${w.keyword}" (user ${w.userId}) paused — inactive ${INACTIVE_DAYS}+ days`);
+    }
+  }
+  if (paused > 0) await saveWatchlist();
+  console.log(`[AutoPause] Check done — ${paused} watch(es) paused`);
+}
+// Run daily at 03:00
+const cron = require('node-cron');
+cron.schedule('0 3 * * *', () => { pauseInactiveUsers().catch(e => console.error('[AutoPause]', e.message)); });
 
 async function loadFromRedis() {
   console.log('[Redis] Loading state...');
@@ -260,13 +323,12 @@ app.get('/', (req, res) => res.json({
   seenTotal: Object.keys(seenListings).length,
 }));
 
-app.get('/watchlist', (req, res) => {
-  const userId = req.query.userId;
-  res.json(userId ? watchlist.filter(w => w.userId === userId) : watchlist);
+app.get('/watchlist', authMiddleware, (req, res) => {
+  res.json(watchlist.filter(w => w.userId === req.userId));
 });
 
-app.post('/watchlist', async (req, res) => {
-  const { keyword, maxPrice, minPrice, userId, pushoverToken, pushoverUser, plan, name, speed } = req.body;
+app.post('/watchlist', authMiddleware, async (req, res) => {
+  const { keyword, maxPrice, minPrice, pushoverToken, pushoverUser, plan, name, speed } = req.body;
   if (!keyword || keyword.trim().length < 2)
     return res.status(400).json({ error: 'keyword required' });
 
@@ -275,7 +337,7 @@ app.post('/watchlist', async (req, res) => {
 
   const item = {
     id: uuidv4(),
-    userId: userId || 'default',
+    userId: req.userId,
     keyword: keyword.trim().toLowerCase(),
     name: name || keyword.trim(),
     maxPrice: maxPrice ? parseInt(maxPrice) : null,
@@ -305,9 +367,9 @@ app.post('/watchlist', async (req, res) => {
     .catch(e => console.error(`[InitialScan] Error for "${item.keyword}":`, e.message));
 });
 
-app.delete('/watchlist/:id', async (req, res) => {
+app.delete('/watchlist/:id', authMiddleware, async (req, res) => {
   const before = watchlist.length;
-  watchlist = watchlist.filter(w => w.id !== req.params.id);
+  watchlist = watchlist.filter(w => w.id !== req.params.id || w.userId !== req.userId);
   if (watchlist.length === before) return res.status(404).json({ error: 'not found' });
   stopWatchTimer(req.params.id);
   await saveWatchlist();
@@ -368,6 +430,66 @@ app.post('/scan/test', async (req, res) => {
     const found = await scrapeKeyword(keyword, {});
     res.json({ keyword, count: found.length, listings: found });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Auth routes ──────────────────────────────────────────
+app.post('/auth/signup', async (req, res) => {
+  const { email, password, name } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const existing = await getUserByEmail(email);
+  if (existing) return res.status(409).json({ error: 'Account already exists for this email' });
+  const user = {
+    id: uuidv4(),
+    email: email.toLowerCase().trim(),
+    name: (name || email.split('@')[0]).trim(),
+    passwordHash: hashPassword(password),
+    createdAt: new Date().toISOString(),
+    lastSeen: new Date().toISOString(),
+    plan: 'basic',
+  };
+  await saveUser(user);
+  await redisSet('flipradar:email:' + user.email, user.id);
+  const token = makeToken(user.id);
+  console.log(`[Auth] Signup: ${user.email}`);
+  res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan } });
+});
+
+app.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  const user = await getUserByEmail(email);
+  if (!user || user.passwordHash !== hashPassword(password))
+    return res.status(401).json({ error: 'Invalid email or password' });
+  user.lastSeen = new Date().toISOString();
+  await saveUser(user);
+  const token = makeToken(user.id);
+  console.log(`[Auth] Login: ${user.email}`);
+  res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan } });
+});
+
+app.post('/auth/ping', authMiddleware, async (req, res) => {
+  const user = await getUser(req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.lastSeen = new Date().toISOString();
+  await saveUser(user);
+  // If user has paused watches, resume them
+  let resumed = 0;
+  for (const w of watchlist) {
+    if (w.userId === req.userId && w.paused) {
+      w.paused = false;
+      startWatchTimer(w);
+      resumed++;
+    }
+  }
+  if (resumed > 0) { await saveWatchlist(); console.log(`[Ping] Resumed ${resumed} watch(es) for user ${req.userId}`); }
+  res.json({ ok: true, lastSeen: user.lastSeen, resumed });
+});
+
+app.get('/auth/me', authMiddleware, async (req, res) => {
+  const user = await getUser(req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json({ id: user.id, email: user.email, name: user.name, plan: user.plan, lastSeen: user.lastSeen });
 });
 
 // ── Start ─────────────────────────────────────────────────
