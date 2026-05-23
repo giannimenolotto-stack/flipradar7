@@ -1,4 +1,5 @@
-const express = require('express');
+const express  = require('express');
+const webpush  = require('web-push');
 const crypto  = require('crypto');
 const cors    = require('cors');
 const axios   = require('axios');
@@ -1322,7 +1323,6 @@ async function sendWebPush(userId, payload) {
   try {
     const subs = await redisGet(K_push(userId));
     if (!subs || !subs.length) return;
-    const webpush = require('web-push');
     webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
     const msg = JSON.stringify(payload);
     const results = await Promise.allSettled(
