@@ -469,16 +469,8 @@ async function scrapeKeyword(keyword, opts = {}) {
     const allItems = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
     const sliced   = allItems.slice(0, maxItems);
 
-    // Keyword relevance filter — drop listings where keyword words don't appear in title
-    // Prevents "moped" returning car listings just because description mentions moped accessories
-    const kwWords = keyword.replace(/['"]/g, '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
-    const items = sliced.filter(item => {
-      const title = (item.marketplace_listing_title || item.title || '').toLowerCase();
-      // All keyword words must appear in the title
-      return kwWords.every(word => title.includes(word));
-    });
-
-    console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned, ${sliced.length - items.length} filtered out)`);
+    const items = sliced;
+    console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
       const rawListedAt = item.creation_time || item.listed_at || item.listingCreationTime
@@ -657,20 +649,16 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
   const userListings = await getUserListings(userId);
   let newCount       = 0;
 
-  // Filter 1: all keyword words must appear in listing title
-  const kwWords = keyword.replace(/['"]/g, '').split(/\s+/).filter(w => w.length > 2);
-
-  // Filter 2: exclude banned words from title AND description
+  // Filter: exclude banned words from title AND description only
+  // We do NOT filter by keyword — Apify + exact phrase search already handles relevance
   const excludeWords = Array.isArray(watcher.excludeWords) ? watcher.excludeWords : [];
 
   const relevant = raw.filter(l => {
     const title = (l.title || '').toLowerCase();
     const desc  = (l.description || '').toLowerCase();
     const full  = title + ' ' + desc;
-    // Must contain all keyword words in title
-    if (!kwWords.every(w => title.includes(w))) return false;
     // Must NOT contain any excluded words in title or description
-    if (excludeWords.length && excludeWords.some(w => full.includes(w))) return false;
+    if (excludeWords.length && excludeWords.some(w => w && full.includes(w))) return false;
     return true;
   });
 
