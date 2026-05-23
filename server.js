@@ -808,7 +808,7 @@ async function scanWatchItem(watcher, opts = {}) {
 
   watcher.lastScanned = new Date().toISOString();
   await saveWatch(watcher);
-  console.log(`[Scan] "${keyword}" (${watcher.plan||'basic'}) → ${newCount} new | relevant:${relevant?.length||0} seenSkipped:${seenSkipped||0}`);
+  console.log(`[Scan] "${keyword}" (${watcher.plan||'basic'}) → ${newCount} new`);
   return newCount;
 }
 
