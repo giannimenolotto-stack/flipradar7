@@ -641,7 +641,6 @@ app.post('/auth/verify-email', authMiddleware, async (req, res) => {
     const user = await getUser(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
-    console.log('[Verify] user.verifyCode:', user.verifyCode, 'submitted:', String(code).trim(), 'expiry:', user.verifyExpiry);
     if (!user.verifyCode || user.verifyCode !== String(code).trim())
       return res.status(400).json({ error: 'Incorrect code. Please check your email and try again.' });
     if (new Date(user.verifyExpiry) < new Date())
@@ -863,6 +862,40 @@ app.post('/stripe/create-checkout', authMiddleware, async (req, res) => {
     });
     res.json({ url: session.url });
   } catch (e) { console.error('[Stripe] Checkout error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
+
+app.post('/stripe/create-intent', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const { priceId } = req.body;
+    if (!priceId || !Object.values(PRICE_IDS).includes(priceId))
+      return res.status(400).json({ error: 'Invalid price' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Create or retrieve Stripe customer
+    let customerId = user.stripeCustomerId;
+    if (!customerId) {
+      const customer = await stripe.customers.create({ email: user.email, name: user.name, metadata: { userId: user.id } });
+      customerId = customer.id;
+      user.stripeCustomerId = customerId;
+      await saveUser(user);
+    }
+
+    // Create subscription with payment intent
+    const subscription = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [{ price: priceId }],
+      payment_behavior: 'default_incomplete',
+      payment_settings: { save_default_payment_method: 'on_subscription' },
+      expand: ['latest_invoice.payment_intent'],
+      metadata: { userId: user.id, priceId },
+    });
+
+    const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
+    res.json({ clientSecret, subscriptionId: subscription.id });
+  } catch (e) { console.error('[Stripe] Intent error:', e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post('/stripe/portal', authMiddleware, async (req, res) => {
