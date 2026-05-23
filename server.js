@@ -23,7 +23,11 @@ async function redisGet(key) {
     const res = await axios.get(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
     });
-    return res.data.result ? JSON.parse(res.data.result) : null;
+    if (!res.data.result) return null;
+    let parsed = JSON.parse(res.data.result);
+    // Handle legacy double-serialized values
+    if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed); } catch(e) {} }
+    return parsed;
   } catch (e) { console.error('[Redis] GET error:', e.message); return null; }
 }
 
@@ -32,7 +36,7 @@ async function redisSet(key, value) {
   try {
     await axios.post(
       `${REDIS_URL}/set/${encodeURIComponent(key)}`,
-      JSON.stringify(JSON.stringify(value)),
+      JSON.stringify(value),
       { headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' } }
     );
   } catch (e) { console.error('[Redis] SET error:', e.message); }
@@ -956,4 +960,5 @@ app.listen(PORT, async () => {
   console.log(`Redis:  ${REDIS_URL   ? 'connected' : 'NOT SET'}`);
   await loadAllWatches();
   console.log('[Ready] Server fully loaded');
-});
+});com
+[Verify] user.verifyCode: undefined submitted: 284555 expiry: undefined
