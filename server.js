@@ -1160,13 +1160,139 @@ app.post('/auth/appraisal', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ── AI proxy routes — keys live on server, never in browser ──
+const GEMINI_API_KEY    = process.env.GEMINI_API_KEY    || null;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
+
+// POST /ai/image — image scan via Gemini Flash
+// Body: { parts: [ { inline_data: { mime_type, data } }, { text: prompt } ] }
+app.post('/ai/image', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
+    const { parts } = req.body;
+    if (!parts || !Array.isArray(parts)) return res.status(400).json({ error: 'parts array required' });
+
+    // Check appraisal limit
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today = new Date().toISOString().slice(0, 10);
+    if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
+    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    if (limit !== Infinity && user.appraisalsToday >= limit)
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
+    user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+    await saveUser(user);
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const geminiRes = await axios.post(url, { contents: [{ parts }] }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 60000,
+    });
+    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    res.json({ text });
+  } catch (e) {
+    console.error('[AI/image]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/text — text-only calls via Claude Haiku
+// Body: { prompt: string }
+app.post('/ai/text', authMiddleware, async (req, res) => {
+  try {
+    if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Anthropic not configured on server' });
+    const { prompt, max_tokens } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // Check appraisal limit
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today = new Date().toISOString().slice(0, 10);
+    if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
+    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    if (limit !== Infinity && user.appraisalsToday >= limit)
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
+    user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+    await saveUser(user);
+
+    const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: max_tokens || 1500,
+      messages: [{ role: 'user', content: prompt }],
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      timeout: 60000,
+    });
+    const text = claudeRes.data?.content?.[0]?.text || '';
+    res.json({ text });
+  } catch (e) {
+    console.error('[AI/text]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/text-image — text scan with an image fetched via URL (listing image)
+// Body: { prompt: string, imageUrl: string }
+app.post('/ai/text-image', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
+    const { prompt, imageUrl } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // Check appraisal limit
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today = new Date().toISOString().slice(0, 10);
+    if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
+    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    if (limit !== Infinity && user.appraisalsToday >= limit)
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
+    user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+    await saveUser(user);
+
+    var parts = [{ text: prompt }];
+
+    // If there's an image URL, fetch and include it
+    if (imageUrl) {
+      try {
+        const imgRes = await axios.get(imageUrl, {
+          responseType: 'arraybuffer', timeout: 10000,
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' }
+        });
+        const b64 = Buffer.from(imgRes.data).toString('base64');
+        const mime = imgRes.headers['content-type'] || 'image/jpeg';
+        parts = [{ inline_data: { mime_type: mime, data: b64 } }, { text: prompt }];
+      } catch(e) {
+        console.log('[AI/text-image] Could not fetch image, proceeding text-only');
+      }
+    }
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const geminiRes = await axios.post(url, { contents: [{ parts }] }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 60000,
+    });
+    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    res.json({ text });
+  } catch (e) {
+    console.error('[AI/text-image]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`FlipRadar backend on port ${PORT}`);
-  console.log(`Apify:  ${APIFY_TOKEN ? 'set' : 'NO TOKEN'}`);
-  console.log(`Redis:  ${REDIS_URL   ? 'connected' : 'NOT SET'}`);
-  console.log(`eBay:   ${EBAY_APP_ID ? 'connected' : 'NOT SET — add EBAY_APP_ID env var (free at developer.ebay.com)'}`);
+  console.log(`Apify:      ${APIFY_TOKEN     ? 'set' : 'NO TOKEN'}`);
+  console.log(`Redis:      ${REDIS_URL        ? 'connected' : 'NOT SET'}`);
+  console.log(`eBay:       ${EBAY_APP_ID      ? 'connected' : 'NOT SET — add EBAY_APP_ID env var (free at developer.ebay.com)'}`);
+  console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
+  console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
   await loadAllWatches();
   console.log('[Ready] Server fully loaded');
 });
