@@ -280,7 +280,7 @@ async function scrapeKeyword(keyword, opts = {}) {
   try {
     const res = await axios.post(
       `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [fbUrl], maxItems, includeDetails: true },
+      { urls: [fbUrl], maxItems, includeDetails: false },
       { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
     const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
@@ -317,6 +317,39 @@ async function scrapeKeyword(keyword, opts = {}) {
   } catch (e) {
     console.error(`[Apify] Error for "${keyword}":`, e.response ? JSON.stringify(e.response.data).slice(0,200) : e.message);
     return [];
+  }
+}
+
+// ── Detail scrape for a single listing URL (vehicle mileage fallback) ──
+async function scrapeListingDetail(listingUrl) {
+  if (!APIFY_TOKEN) return null;
+  try {
+    const res = await axios.post(
+      `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
+      { urls: [listingUrl], maxItems: 1, includeDetails: true },
+      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
+    );
+    const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
+    if (!items.length) return null;
+    const item = items[0];
+    const desc = item.redacted_description?.text || item.description || null;
+    const title = item.marketplace_listing_title || item.title || '';
+    // Pull out vehicle fields from full detail response
+    // The detail page exposes vehicle_info or similar structured fields
+    const vehicleInfo = item.vehicle_info || item.vehicleInfo || item.listing_vehicle_data || {};
+    const mileageRaw = vehicleInfo.odometer || vehicleInfo.mileage || vehicleInfo.kilometers
+      || item.odometer || item.mileage || null;
+    const mileage = mileageRaw
+      ? (typeof mileageRaw === 'number' ? mileageRaw : parsePrice(String(mileageRaw)))
+      : extractMileage(title, desc);
+    const year = vehicleInfo.year || vehicleInfo.model_year || extractYear(title, desc);
+    const make = vehicleInfo.make || vehicleInfo.brand || extractMake('', title);
+    const model = vehicleInfo.model || null;
+    console.log(`[DetailScrape] ${listingUrl} → mileage:${mileage} year:${year} make:${make}`);
+    return { mileage, year, make, model };
+  } catch (e) {
+    console.error('[DetailScrape] Error:', e.message);
+    return null;
   }
 }
 
@@ -424,6 +457,41 @@ async function scanWatchItem(watcher, opts = {}) {
   if (newCount > 0) {
     await saveUserListings(userId, userListings);
     await saveUserSeen(userId, seen);
+  }
+
+  // ── Vehicle detail fallback — fire for vehicle listings missing mileage ──
+  const needsDetail = userListings.filter(l =>
+    l.keyword === keyword &&
+    isVehicleListing(keyword, l.title, l.description) &&
+    l.mileage === null &&
+    l.url &&
+    // Only retry listings found in this scan (within last 2 mins)
+    (Date.now() - new Date(l.foundAt).getTime()) < 2 * 60 * 1000
+  );
+  if (needsDetail.length > 0) {
+    console.log(`[DetailScrape] Fetching details for ${needsDetail.length} vehicle listing(s) without mileage`);
+    // Run up to 5 detail scrapes in parallel to keep it snappy
+    const chunks = [];
+    for (let i = 0; i < needsDetail.length; i += 5) chunks.push(needsDetail.slice(i, i + 5));
+    let detailUpdated = false;
+    for (const chunk of chunks) {
+      const results = await Promise.all(chunk.map(l => scrapeListingDetail(l.url)));
+      results.forEach((detail, idx) => {
+        if (!detail) return;
+        const listing = chunk[idx];
+        const idx2 = userListings.findIndex(l => l.id === listing.id);
+        if (idx2 === -1) return;
+        if (detail.mileage) { userListings[idx2].mileage = detail.mileage; detailUpdated = true; }
+        if (detail.year)    { userListings[idx2].year    = detail.year;    detailUpdated = true; }
+        if (detail.make)    { userListings[idx2].make    = detail.make;    detailUpdated = true; }
+        if (detail.model)   { userListings[idx2].model   = detail.model;   detailUpdated = true; }
+      });
+      await sleep(500);
+    }
+    if (detailUpdated) {
+      await saveUserListings(userId, userListings);
+      console.log(`[DetailScrape] Updated ${needsDetail.length} listing(s) with vehicle details`);
+    }
   }
 
   // Update lastScanned on the watch
