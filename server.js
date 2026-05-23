@@ -58,11 +58,14 @@ const K = {
   watch:       id  => `fr:watch:${id}`,
   listings:    uid => `fr:listings:${uid}`,
   seen:        uid => `fr:seen:${uid}`,
+  ebay:        kw  => `fr:ebay:${kw.toLowerCase().trim()}`,       // eBay sold price cache
+  prices:      kw  => `fr:prices:${kw.toLowerCase().trim()}`,     // Our own scan price history
 };
 
 // ── Auth ──────────────────────────────────────────────────
 const JWT_SECRET     = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
+const EBAY_APP_ID    = process.env.EBAY_APP_ID || null;   // free at developer.ebay.com
 
 // ── Stripe ────────────────────────────────────────────────
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || null;
@@ -80,10 +83,14 @@ Object.entries(PRICE_IDS).forEach(([key, priceId]) => {
 });
 const PLAN_APPRAISAL_LIMITS = { free: 5, basic: 25, premium: Infinity };
 const PLAN_WATCHLIST_LIMITS = { free: 0, basic: 1, premium: 2 };
-const PLAN_SCAN_INTERVALS   = { free: null, basic: 30 * 60 * 1000, premium: 15 * 60 * 1000 };
 const FROM_EMAIL    = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.com>';
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
+
+// ── eBay price cache settings ─────────────────────────────
+const EBAY_CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours — 1 eBay call per keyword per day max
+const EBAY_MIN_RESULTS    = 5;                     // need at least 5 sold prices to skip AI
+const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
 
 function makeToken(userId) {
   return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '90d' });
@@ -153,6 +160,162 @@ async function saveUserSeen(userId, seen) {
       .slice(0, 2000)
   );
   await redisSet(K.seen(userId), pruned);
+}
+
+// ── eBay sold price cache (FREE — official eBay API) ──────
+// Sign up free at developer.ebay.com, grab your App ID
+// One call per keyword per 24h max — shared across ALL users
+async function getEbaySoldPrices(keyword) {
+  if (!EBAY_APP_ID) return null;
+
+  // Serve from cache if fresh
+  const cached = await redisGet(K.ebay(keyword));
+  if (cached && (Date.now() - new Date(cached.fetchedAt).getTime()) < EBAY_CACHE_TTL_MS) {
+    console.log(`[eBay] "${keyword}" → cache hit (${cached.count} prices)`);
+    return cached;
+  }
+
+  // Fetch from eBay Finding API (free, no cost per call)
+  try {
+    const url = `https://svcs.ebay.com/services/search/FindingService/v1` +
+      `?OPERATION-NAME=findCompletedItems` +
+      `&SERVICE-VERSION=1.0.0` +
+      `&SECURITY-APPNAME=${EBAY_APP_ID}` +
+      `&RESPONSE-DATA-FORMAT=JSON` +
+      `&keywords=${encodeURIComponent(keyword)}` +
+      `&itemFilter(0).name=SoldItemsOnly&itemFilter(0).value=true` +
+      `&itemFilter(1).name=ListingType&itemFilter(1).value=AuctionWithBIN` +
+      `&sortOrder=EndTimeSoonest` +
+      `&paginationInput.entriesPerPage=50`;
+
+    const res   = await axios.get(url, { timeout: 10000 });
+    const items = res.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+
+    const prices = items
+      .map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0))
+      .filter(p => p > 0)
+      .sort((a, b) => a - b);
+
+    if (!prices.length) {
+      console.log(`[eBay] "${keyword}" → 0 sold results`);
+      return null;
+    }
+
+    const result = {
+      prices,
+      low:       prices[0],
+      high:      prices[prices.length - 1],
+      median:    prices[Math.floor(prices.length / 2)],
+      avg:       Math.round(prices.reduce((a, b) => a + b, 0) / prices.length),
+      count:     prices.length,
+      fetchedAt: new Date().toISOString(),
+      source:    'ebay_sold',
+    };
+
+    await redisSet(K.ebay(keyword), result);
+    console.log(`[eBay] "${keyword}" → ${prices.length} sold prices, median $${result.median}`);
+    return result;
+  } catch (e) {
+    console.error(`[eBay] Error for "${keyword}":`, e.message);
+    return null;
+  }
+}
+
+// ── Our own scan price history ────────────────────────────
+// Every time we see a listing for a keyword, store its price
+// Builds up over time — eventually replaces eBay for popular keywords
+async function storeScanPrice(keyword, listing) {
+  if (!listing.price || listing.price <= 0) return;
+  try {
+    const existing = await redisGet(K.prices(keyword)) || [];
+    // Don't duplicate — check if this listing ID already stored
+    if (existing.find(r => r.id === listing.id)) return;
+    existing.unshift({
+      id:    listing.id,
+      price: listing.price,
+      title: listing.title,
+      date:  new Date().toISOString(),
+    });
+    // Keep last 200 per keyword
+    await redisSet(K.prices(keyword), existing.slice(0, 200));
+  } catch (e) {
+    console.error(`[PriceStore] Error for "${keyword}":`, e.message);
+  }
+}
+
+async function getOwnPriceRange(keyword) {
+  const records = await redisGet(K.prices(keyword)) || [];
+  if (records.length < OWN_PRICE_MIN) return null;
+  const prices = records.map(r => r.price).filter(Boolean).sort((a, b) => a - b);
+  return {
+    prices,
+    low:    prices[0],
+    high:   prices[prices.length - 1],
+    median: prices[Math.floor(prices.length / 2)],
+    avg:    Math.round(prices.reduce((a, b) => a + b, 0) / prices.length),
+    count:  prices.length,
+    source: 'own_history',
+  };
+}
+
+// ── Master price lookup — call this before AI ─────────────
+// Returns price data if we have enough to skip AI, null if AI needed
+async function getPriceCacheForKeyword(keyword) {
+  // 1. Check our own scan history first (most relevant — AU marketplace prices)
+  const own = await getOwnPriceRange(keyword);
+  if (own) {
+    console.log(`[PriceCache] "${keyword}" → own history (${own.count} records), skipping AI`);
+    return own;
+  }
+
+  // 2. Fall back to eBay sold prices (free API)
+  const ebay = await getEbaySoldPrices(keyword);
+  if (ebay && ebay.count >= EBAY_MIN_RESULTS) {
+    console.log(`[PriceCache] "${keyword}" → eBay cache (${ebay.count} records), skipping AI`);
+    return ebay;
+  }
+
+  // 3. Not enough data — caller should use AI
+  console.log(`[PriceCache] "${keyword}" → no cache, AI needed`);
+  return null;
+}
+
+// Build a verdict from price data alone (no AI)
+function buildCacheVerdict(listingPrice, priceData) {
+  const { low, median, high, count, source } = priceData;
+
+  // How does listing price compare to median sold price?
+  const roi = median > 0 ? Math.round(((median - listingPrice) / listingPrice) * 100) : 0;
+  const estimatedProfit = Math.round(median - listingPrice);
+
+  let verdict, oneLiner;
+  if (roi >= 30) {
+    verdict  = 'GREAT DEAL';
+    oneLiner = `Listed ${roi}% below median sold price — strong flip potential`;
+  } else if (roi >= 15) {
+    verdict  = 'GOOD DEAL';
+    oneLiner = `Priced below market — room to profit`;
+  } else if (roi >= 0) {
+    verdict  = 'FAIR PRICE';
+    oneLiner = `Around market rate — slim margin`;
+  } else {
+    verdict  = 'OVERPRICED';
+    oneLiner = `Listed above typical sold prices — negotiate hard or pass`;
+  }
+
+  return {
+    verdict,
+    oneLiner,
+    estimatedResellLow:  low,
+    estimatedResellHigh: high,
+    recommendedOffer:    Math.round(listingPrice * 0.85),
+    walkAwayPrice:       Math.round(median * 1.05),
+    estimatedProfit:     Math.max(0, estimatedProfit),
+    roiPercent:          roi,
+    dataPoints:          count,
+    source,              // 'own_history' or 'ebay_sold' — frontend can show this
+    negotiationScript:   `This is going for around $${median} sold — would you take $${Math.round(listingPrice * 0.85)}?`,
+  };
 }
 
 // ── Email (Resend) ────────────────────────────────────────
@@ -439,14 +602,18 @@ async function scanWatchItem(watcher, opts = {}) {
     if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
     if (watcher.minPrice && listing.price < watcher.minPrice) continue;
     seen[key] = Date.now();
+
+    // Store price in our own history — builds up the price database over time
+    storeScanPrice(keyword, listing).catch(() => {});
+
     if (!userListings.find(l => l.id === listing.id)) {
       userListings.unshift(listing);
       userListings.sort((a, b) => new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt));
       if (userListings.length > 500) userListings.length = 500;
     }
     newCount++;
-    const pToken  = watcher.pushoverToken || process.env.PUSHOVER_TOKEN;
-    const pUser   = watcher.pushoverUser  || process.env.PUSHOVER_USER;
+    const pToken   = watcher.pushoverToken || process.env.PUSHOVER_TOKEN;
+    const pUser    = watcher.pushoverUser  || process.env.PUSHOVER_USER;
     const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
     await sendPushover(pToken, pUser, `FlipRadar: ${keyword}`, `${listing.title}\n${priceStr}`, listing.url);
     await sleep(300);
@@ -562,6 +729,7 @@ app.get('/', (req, res) => res.json({
   status: 'ok',
   apify:  APIFY_TOKEN ? 'connected' : 'NO APIFY_TOKEN SET',
   redis:  REDIS_URL   ? 'connected' : 'not set',
+  ebay:   EBAY_APP_ID ? 'connected' : 'NO EBAY_APP_ID SET',
   watches: watchlist.length,
   timers:  Object.keys(watchTimers).length,
   lastScan: lastScanTime,
@@ -764,6 +932,63 @@ app.delete('/listings', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ── Price cache route — lets frontend check before triggering AI ──
+// GET /prices?keyword=ps5
+app.get('/prices', authMiddleware, async (req, res) => {
+  try {
+    const { keyword } = req.query;
+    if (!keyword) return res.status(400).json({ error: 'keyword required' });
+    const priceData = await getPriceCacheForKeyword(keyword);
+    if (!priceData) return res.json({ found: false, keyword });
+    res.json({ found: true, keyword, ...priceData });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Appraisal route — cache-first, AI fallback ────────────
+// POST /appraise  { keyword, price, title, description }
+// Returns verdict without using AI if we have enough price data
+app.post('/appraise', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, price, title, description } = req.body;
+    if (!keyword || !price) return res.status(400).json({ error: 'keyword and price required' });
+
+    const listingPrice = parsePrice(price);
+
+    // 1. Check appraisal limit
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today = new Date().toISOString().slice(0, 10);
+    if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
+    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    if (limit !== Infinity && user.appraisalsToday >= limit)
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
+
+    // 2. Try price cache first — free, no AI needed
+    const priceData = await getPriceCacheForKeyword(keyword);
+    if (priceData) {
+      const verdict = buildCacheVerdict(listingPrice, priceData);
+      // Still count as an appraisal but no AI cost incurred
+      user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+      await saveUser(user);
+      console.log(`[Appraise] "${keyword}" → served from ${verdict.source} cache (no AI used)`);
+      return res.json({ ...verdict, usedCache: true });
+    }
+
+    // 3. Not enough price data — caller (frontend) must use AI directly
+    // We just increment the counter and tell frontend to proceed with AI
+    user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+    await saveUser(user);
+    console.log(`[Appraise] "${keyword}" → no cache, AI required`);
+    res.json({
+      found:      false,
+      usedCache:  false,
+      message:    'No price data yet — use AI appraisal',
+      used:       user.appraisalsToday,
+      limit:      limit === Infinity ? -1 : limit,
+    });
+  } catch (e) { console.error('[Appraise]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
 // ── Misc routes ───────────────────────────────────────────
 app.get('/proxy-image', async (req, res) => {
   const url = req.query.url;
@@ -941,6 +1166,7 @@ app.listen(PORT, async () => {
   console.log(`FlipRadar backend on port ${PORT}`);
   console.log(`Apify:  ${APIFY_TOKEN ? 'set' : 'NO TOKEN'}`);
   console.log(`Redis:  ${REDIS_URL   ? 'connected' : 'NOT SET'}`);
+  console.log(`eBay:   ${EBAY_APP_ID ? 'connected' : 'NOT SET — add EBAY_APP_ID env var (free at developer.ebay.com)'}`);
   await loadAllWatches();
   console.log('[Ready] Server fully loaded');
 });
