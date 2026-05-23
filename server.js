@@ -81,8 +81,8 @@ const PRICE_TO_PLAN = {};
 Object.entries(PRICE_IDS).forEach(([key, priceId]) => {
   PRICE_TO_PLAN[priceId] = key.startsWith('basic') ? 'basic' : 'premium';
 });
-const PLAN_APPRAISAL_LIMITS = { free: 5, basic: 25, premium: Infinity };
-const PLAN_WATCHLIST_LIMITS = { free: 0, basic: 1, premium: 2 };
+const PLAN_APPRAISAL_LIMITS = { free: 999, basic: 999, premium: 999 }; // TEMP — reset before launch
+const PLAN_WATCHLIST_LIMITS = { free: 5, basic: 5, premium: 5 }; // TEMP — reset before launch
 const FROM_EMAIL    = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.com>';
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
@@ -960,7 +960,7 @@ app.post('/appraise', authMiddleware, async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
-    if (limit !== Infinity && user.appraisalsToday >= limit)
+    if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
 
     // 2. Try price cache first — free, no AI needed
@@ -1152,7 +1152,7 @@ app.post('/auth/appraisal', authMiddleware, async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
-    if (limit !== Infinity && user.appraisalsToday >= limit)
+    if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
@@ -1178,7 +1178,7 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
-    if (limit !== Infinity && user.appraisalsToday >= limit)
+    if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
@@ -1210,7 +1210,7 @@ app.post('/ai/text', authMiddleware, async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
-    if (limit !== Infinity && user.appraisalsToday >= limit)
+    if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
@@ -1249,7 +1249,7 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
-    if (limit !== Infinity && user.appraisalsToday >= limit)
+    if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
