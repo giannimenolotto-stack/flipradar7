@@ -1088,10 +1088,7 @@ app.post('/listings/remove', authMiddleware, async (req, res) => {
     const listings = await getUserListings(req.userId);
     const filtered = listings.filter(l => !ids.includes(l.id));
     await saveUserListings(req.userId, filtered);
-    // Also mark as seen so they don't come back next scan
-    const seen = await getUserSeen(req.userId);
-    ids.forEach(id => { seen[id] = Date.now(); });
-    await saveUserSeen(req.userId, seen);
+    // Don't mark as permanently seen — if user re-adds the keyword they should see fresh listings
     console.log(`[Filter] Removed ${ids.length} irrelevant listing(s) for user ${req.userId}`);
     res.json({ ok: true, removed: ids.length });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
