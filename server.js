@@ -754,8 +754,11 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     const desc  = (l.description || '').toLowerCase();
     const full  = title + ' ' + desc;
 
-    // Must NOT contain any user-defined excluded words
+    // Always block excluded words regardless of scan type
     if (excludeWords.length && excludeWords.some(w => w && full.includes(w))) return false;
+
+    // On initial scan — let everything through, AI relevance check will clean up after
+    if (opts && opts.initialScan) return true;
 
     // Pass if a known synonym/brand appears in the title
     if (kwSynonyms.length && kwSynonyms.some(s => title.includes(s))) return true;
