@@ -25,7 +25,6 @@ async function redisGet(key) {
     });
     if (!res.data.result) return null;
     let parsed = JSON.parse(res.data.result);
-    // Handle legacy double-serialized values
     if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed); } catch(e) {} }
     return parsed;
   } catch (e) { console.error('[Redis] GET error:', e.message); return null; }
@@ -45,24 +44,24 @@ async function redisSet(key, value) {
 async function redisDel(key) {
   if (!REDIS_URL) return;
   try {
-    await axios.delete(`${REDIS_URL}/del/${encodeURIComponent(key)}`, {
+    await axios.post(`${REDIS_URL}/del/${encodeURIComponent(key)}`, null, {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
     });
   } catch (e) { console.error('[Redis] DEL error:', e.message); }
 }
 
-// Redis key helpers — everything scoped per-user or per-watch
+// Redis key helpers
 const K = {
   user:        id  => `fr:user:${id}`,
   emailIdx:    em  => `fr:email:${em.toLowerCase()}`,
-  userWatches: uid => `fr:user-watches:${uid}`,   // Set of watch IDs for a user
-  watch:       id  => `fr:watch:${id}`,            // Individual watch object
-  listings:    uid => `fr:listings:${uid}`,         // Per-user listings array
-  seen:        uid => `fr:seen:${uid}`,             // Per-user seen map
+  userWatches: uid => `fr:user-watches:${uid}`,
+  watch:       id  => `fr:watch:${id}`,
+  listings:    uid => `fr:listings:${uid}`,
+  seen:        uid => `fr:seen:${uid}`,
 };
 
 // ── Auth ──────────────────────────────────────────────────
-const JWT_SECRET    = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
+const JWT_SECRET     = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
 
 // ── Stripe ────────────────────────────────────────────────
@@ -75,7 +74,6 @@ const PRICE_IDS = {
   premium_monthly: 'price_1Ta7QDPDjYUYNInHDQTp70Mt',
   premium_yearly:  'price_1Ta7QSPDjYUYNInHLG2F4aT3',
 };
-// Map price ID back to plan name
 const PRICE_TO_PLAN = {};
 Object.entries(PRICE_IDS).forEach(([key, priceId]) => {
   PRICE_TO_PLAN[priceId] = key.startsWith('basic') ? 'basic' : 'premium';
@@ -83,7 +81,7 @@ Object.entries(PRICE_IDS).forEach(([key, priceId]) => {
 const PLAN_APPRAISAL_LIMITS = { free: 5, basic: 25, premium: Infinity };
 const PLAN_WATCHLIST_LIMITS = { free: 0, basic: 1, premium: 2 };
 const PLAN_SCAN_INTERVALS   = { free: null, basic: 30 * 60 * 1000, premium: 15 * 60 * 1000 };
-const FROM_EMAIL     = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.com>';
+const FROM_EMAIL    = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.com>';
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
 
@@ -157,16 +155,12 @@ async function saveUserSeen(userId, seen) {
   await redisSet(K.seen(userId), pruned);
 }
 
-
 // ── Email (Resend) ────────────────────────────────────────
 async function sendEmail(to, subject, html) {
   if (!RESEND_API_KEY) { console.log(`[Email] No RESEND_API_KEY — skipping email to ${to}`); return; }
   try {
     const res = await axios.post('https://api.resend.com/emails', {
-      from: FROM_EMAIL,
-      to,
-      subject,
-      html,
+      from: FROM_EMAIL, to, subject, html,
     }, {
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
       timeout: 10000,
@@ -185,12 +179,9 @@ function welcomeEmail(name, email) {
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#07070e;font-family:'Helvetica Neue',Arial,sans-serif">
   <div style="max-width:520px;margin:0 auto;padding:40px 24px">
-    <!-- Logo -->
     <div style="font-size:32px;font-weight:900;letter-spacing:2px;color:#fff;margin-bottom:32px">
       Flip<span style="color:#00ff88">Radar</span>
     </div>
-
-    <!-- Hero -->
     <div style="background:linear-gradient(135deg,rgba(0,255,136,.12),rgba(0,255,136,.04));border:1px solid rgba(0,255,136,.25);border-radius:20px;padding:32px;margin-bottom:24px">
       <div style="font-size:40px;margin-bottom:12px">👋</div>
       <h1 style="color:#fff;font-size:24px;font-weight:800;margin:0 0 8px">Hey ${name}, you're in!</h1>
@@ -198,8 +189,6 @@ function welcomeEmail(name, email) {
         FlipRadar is now scanning Facebook Marketplace for you. Add your first watchlist keyword and we'll notify you the moment something worth flipping shows up.
       </p>
     </div>
-
-    <!-- Steps -->
     <div style="margin-bottom:24px">
       <div style="color:#555;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px">Get started in 3 steps</div>
       ${[
@@ -215,15 +204,11 @@ function welcomeEmail(name, email) {
         </div>
       </div>`).join('')}
     </div>
-
-    <!-- CTA -->
     <div style="text-align:center;margin-bottom:32px">
       <a href="https://flip-radar.app" style="display:inline-block;background:#00ff88;color:#000;font-weight:800;font-size:16px;padding:16px 40px;border-radius:14px;text-decoration:none;letter-spacing:.5px">
         Open FlipRadar →
       </a>
     </div>
-
-    <!-- Footer -->
     <div style="border-top:1px solid #1a1a2e;padding-top:20px;color:#444;font-size:12px;line-height:1.6">
       You're receiving this because you signed up at FlipRadar.<br>
       Questions? Just reply to this email.
@@ -244,7 +229,6 @@ function verificationEmail(name, email, code) {
     <div style="font-size:32px;font-weight:900;letter-spacing:2px;color:#fff;margin-bottom:32px">
       Flip<span style="color:#00ff88">Radar</span>
     </div>
-
     <div style="background:#0d0d1a;border:1px solid #1a1a2e;border-radius:20px;padding:32px;margin-bottom:24px;text-align:center">
       <div style="font-size:40px;margin-bottom:16px">✉️</div>
       <h2 style="color:#fff;font-size:20px;font-weight:800;margin:0 0 8px">Verify your email</h2>
@@ -253,7 +237,6 @@ function verificationEmail(name, email, code) {
         ${code}
       </div>
     </div>
-
     <div style="color:#444;font-size:12px;text-align:center">
       If you didn't sign up for FlipRadar, you can safely ignore this email.
     </div>
@@ -271,10 +254,8 @@ const PLAN_INTERVALS = {
 };
 const SEEN_TTL_MS = 48 * 60 * 60 * 1000;
 
-// ── In-memory state (indexes only — source of truth is Redis) ──
-// watchlist: array of watch objects loaded at boot, updated on mutations
-// seenListings / listings: kept per-user in Redis; small in-memory cache for active scans
-let watchlist = [];         // all watches across all users (for timer management)
+// ── In-memory state ───────────────────────────────────────
+let watchlist     = [];
 let lastScanTime  = null;
 let lastScanCount = 0;
 
@@ -334,7 +315,6 @@ async function scrapeKeyword(keyword, opts = {}) {
         keyword,
         listedAt,
         foundAt:  new Date().toISOString(),
-        // Vehicle fields — null for non-vehicle listings
         mileage:  isVehicle ? extractMileage(title, description) : null,
         year:     isVehicle ? extractYear(title, description)    : null,
         make:     isVehicle ? extractMake(keyword, title)        : null,
@@ -346,7 +326,6 @@ async function scrapeKeyword(keyword, opts = {}) {
   }
 }
 
-// ── Detail scrape for a single listing URL (vehicle mileage fallback) ──
 async function scrapeListingDetail(listingUrl) {
   if (!APIFY_TOKEN) return null;
   try {
@@ -358,18 +337,16 @@ async function scrapeListingDetail(listingUrl) {
     const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
     if (!items.length) return null;
     const item = items[0];
-    const desc = item.redacted_description?.text || item.description || null;
+    const desc  = item.redacted_description?.text || item.description || null;
     const title = item.marketplace_listing_title || item.title || '';
-    // Pull out vehicle fields from full detail response
-    // The detail page exposes vehicle_info or similar structured fields
     const vehicleInfo = item.vehicle_info || item.vehicleInfo || item.listing_vehicle_data || {};
     const mileageRaw = vehicleInfo.odometer || vehicleInfo.mileage || vehicleInfo.kilometers
       || item.odometer || item.mileage || null;
     const mileage = mileageRaw
       ? (typeof mileageRaw === 'number' ? mileageRaw : parsePrice(String(mileageRaw)))
       : extractMileage(title, desc);
-    const year = vehicleInfo.year || vehicleInfo.model_year || extractYear(title, desc);
-    const make = vehicleInfo.make || vehicleInfo.brand || extractMake('', title);
+    const year  = vehicleInfo.year || vehicleInfo.model_year || extractYear(title, desc);
+    const make  = vehicleInfo.make || vehicleInfo.brand || extractMake('', title);
     const model = vehicleInfo.model || null;
     console.log(`[DetailScrape] ${listingUrl} → mileage:${mileage} year:${year} make:${make}`);
     return { mileage, year, make, model };
@@ -379,8 +356,7 @@ async function scrapeListingDetail(listingUrl) {
   }
 }
 
-
-// ── Vehicle data extraction ───────────────────────────────
+// ── Vehicle helpers ───────────────────────────────────────
 const VEHICLE_KEYWORDS = ['car','ute','van','truck','bike','motorcycle','suv','4wd','wagon',
   'sedan','hatch','coupe','convertible','tractor','forklift','boat','jet ski','caravan',
   'camper','trailer','scooter','moped','excavator','loader','hilux','landcruiser','patrol',
@@ -396,7 +372,6 @@ function isVehicleListing(keyword, title, description) {
 
 function extractMileage(title, description) {
   const text = (title + ' ' + (description || '')).toLowerCase();
-  // Each entry: [pattern, multiplyBy1000]
   const patterns = [
     [/(\d{1,3}(?:,\d{3})+)\s*k(?:m|ms|ilometres?|ilometers?)/, false],
     [/(\d{2,6})\s*k(?:m|ms|ilometres?|ilometers?)/, false],
@@ -413,14 +388,13 @@ function extractMileage(title, description) {
   }
   return null;
 }
+
 function extractYear(title, description) {
   const text = title + ' ' + (description || '');
-  // Match 4-digit years between 1970 and next year
-  const nextYear = new Date().getFullYear() + 1;
-  const m = text.match(/(19[7-9]\d|20[0-2]\d)/);
+  const m = text.match(/(19[7-9]\d|20[0-2]\d)/);
   if (m) {
     const yr = parseInt(m[1]);
-    if (yr >= 1970 && yr <= nextYear) return yr;
+    if (yr >= 1970 && yr <= new Date().getFullYear() + 1) return yr;
   }
   return null;
 }
@@ -453,17 +427,15 @@ async function scanWatchItem(watcher, opts = {}) {
     radius: watcher.radius, initialScan: opts.initialScan || false
   });
 
-  const userId  = watcher.userId;
-  const seen    = await getUserSeen(userId);
+  const userId       = watcher.userId;
+  const seen         = await getUserSeen(userId);
   const userListings = await getUserListings(userId);
-  let newCount  = 0;
+  let newCount       = 0;
 
   for (const listing of raw) {
-    const key = `${keyword}:${listing.id}`;
-    // Check seen
+    const key    = `${keyword}:${listing.id}`;
     const seenTs = seen[key];
     if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS) continue;
-    // Price filter
     if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
     if (watcher.minPrice && listing.price < watcher.minPrice) continue;
     seen[key] = Date.now();
@@ -473,8 +445,8 @@ async function scanWatchItem(watcher, opts = {}) {
       if (userListings.length > 500) userListings.length = 500;
     }
     newCount++;
-    const pToken = watcher.pushoverToken || process.env.PUSHOVER_TOKEN;
-    const pUser  = watcher.pushoverUser  || process.env.PUSHOVER_USER;
+    const pToken  = watcher.pushoverToken || process.env.PUSHOVER_TOKEN;
+    const pUser   = watcher.pushoverUser  || process.env.PUSHOVER_USER;
     const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
     await sendPushover(pToken, pUser, `FlipRadar: ${keyword}`, `${listing.title}\n${priceStr}`, listing.url);
     await sleep(300);
@@ -485,18 +457,16 @@ async function scanWatchItem(watcher, opts = {}) {
     await saveUserSeen(userId, seen);
   }
 
-  // ── Vehicle detail fallback — fire for vehicle listings missing mileage ──
+  // Vehicle detail fallback
   const needsDetail = userListings.filter(l =>
     l.keyword === keyword &&
     isVehicleListing(keyword, l.title, l.description) &&
     l.mileage === null &&
     l.url &&
-    // Only retry listings found in this scan (within last 2 mins)
     (Date.now() - new Date(l.foundAt).getTime()) < 2 * 60 * 1000
   );
   if (needsDetail.length > 0) {
     console.log(`[DetailScrape] Fetching details for ${needsDetail.length} vehicle listing(s) without mileage`);
-    // Run up to 5 detail scrapes in parallel to keep it snappy
     const chunks = [];
     for (let i = 0; i < needsDetail.length; i += 5) chunks.push(needsDetail.slice(i, i + 5));
     let detailUpdated = false;
@@ -520,10 +490,8 @@ async function scanWatchItem(watcher, opts = {}) {
     }
   }
 
-  // Update lastScanned on the watch
   watcher.lastScanned = new Date().toISOString();
   await saveWatch(watcher);
-
   console.log(`[Scan] "${keyword}" (${watcher.plan||'basic'}) → ${newCount} new`);
   return newCount;
 }
@@ -564,9 +532,8 @@ async function pauseInactiveUsers() {
 }
 cron.schedule('0 3 * * *', () => pauseInactiveUsers().catch(e => console.error('[AutoPause]', e.message)));
 
-// ── Boot: load all watches from Redis into memory ─────────
+// ── Boot: load all watches from Redis ─────────────────────
 async function loadAllWatches() {
-  // We store a global index of all watch IDs for timer management at boot
   const allIds = await redisGet('fr:all-watch-ids') || [];
   const watches = await Promise.all(allIds.map(getWatch));
   watchlist = watches.filter(Boolean);
@@ -610,8 +577,7 @@ app.post('/auth/signup', async (req, res) => {
     const existing = await getUserByEmail(email);
     if (existing) return res.status(409).json({ error: 'An account already exists for this email' });
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    // Generate 6-digit verification code
-    const verifyCode = String(Math.floor(100000 + Math.random() * 900000));
+    const verifyCode   = String(Math.floor(100000 + Math.random() * 900000));
     const user = {
       id: uuidv4(),
       email: email.toLowerCase().trim(),
@@ -622,13 +588,12 @@ app.post('/auth/signup', async (req, res) => {
       plan:          'basic',
       emailVerified: false,
       verifyCode,
-      verifyExpiry:  new Date(Date.now() + 15 * 60 * 1000).toISOString(), // 15 mins
+      verifyExpiry:  new Date(Date.now() + 15 * 60 * 1000).toISOString(),
     };
     await saveUser(user);
     await redisSet(K.emailIdx(user.email), user.id);
     const token = makeToken(user.id);
     console.log(`[Auth] Signup: ${user.email}`);
-    // Send verification email only — welcome email fires after they verify
     verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Verify failed:', e.message));
     res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan, emailVerified: false } });
   } catch (e) { console.error('[Signup]', e.message); res.status(500).json({ error: 'Server error' }); }
@@ -650,7 +615,6 @@ app.post('/auth/verify-email', authMiddleware, async (req, res) => {
     delete user.verifyExpiry;
     await saveUser(user);
     console.log(`[Auth] Email verified: ${user.email}`);
-    // Send welcome email now that they've verified
     welcomeEmail(user.name, user.email).catch(e => console.error('[Email] Welcome failed:', e.message));
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
@@ -661,7 +625,7 @@ app.post('/auth/resend-verify', authMiddleware, async (req, res) => {
     const user = await getUser(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
-    const verifyCode = String(Math.floor(100000 + Math.random() * 900000));
+    const verifyCode  = String(Math.floor(100000 + Math.random() * 900000));
     user.verifyCode   = verifyCode;
     user.verifyExpiry = new Date(Date.now() + 15 * 60 * 1000).toISOString();
     await saveUser(user);
@@ -692,7 +656,6 @@ app.post('/auth/ping', authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     user.lastSeen = new Date().toISOString();
     await saveUser(user);
-    // Resume any paused watches for this user
     let resumed = 0;
     const userWatches = watchlist.filter(w => w.userId === req.userId && w.paused);
     for (const w of userWatches) {
@@ -727,7 +690,6 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     const { keyword, maxPrice, minPrice, pushoverToken, pushoverUser, plan, name, speed } = req.body;
     if (!keyword || keyword.trim().length < 2)
       return res.status(400).json({ error: 'Keyword required' });
-    // Enforce watchlist limit per plan
     const user = await getUser(req.userId);
     const planLimit = PLAN_WATCHLIST_LIMITS[user?.plan || 'free'];
     const existingWatches = await getUserWatches(req.userId);
@@ -759,7 +721,6 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     startWatchTimer(item);
     console.log(`[Watch] Added "${item.keyword}" for user ${req.userId}`);
     res.json(item);
-    // Background initial backfill
     scanWatchItem(item, { initialScan: true })
       .then(n => console.log(`[InitialScan] "${item.keyword}" → ${n} listing(s)`))
       .catch(e => console.error(`[InitialScan] Error:`, e.message));
@@ -840,7 +801,6 @@ app.post('/scan/test', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
 // ── Stripe routes ─────────────────────────────────────────
 app.post('/stripe/create-checkout', authMiddleware, async (req, res) => {
   try {
@@ -864,7 +824,6 @@ app.post('/stripe/create-checkout', authMiddleware, async (req, res) => {
   } catch (e) { console.error('[Stripe] Checkout error:', e.message); res.status(500).json({ error: e.message }); }
 });
 
-
 app.post('/stripe/create-intent', authMiddleware, async (req, res) => {
   try {
     if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
@@ -873,8 +832,6 @@ app.post('/stripe/create-intent', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Invalid price' });
     const user = await getUser(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-
-    // Create or retrieve Stripe customer
     let customerId = user.stripeCustomerId;
     if (!customerId) {
       const customer = await stripe.customers.create({ email: user.email, name: user.name, metadata: { userId: user.id } });
@@ -882,8 +839,6 @@ app.post('/stripe/create-intent', authMiddleware, async (req, res) => {
       user.stripeCustomerId = customerId;
       await saveUser(user);
     }
-
-    // Create subscription with payment intent
     const subscription = await stripe.subscriptions.create({
       customer: customerId,
       items: [{ price: priceId }],
@@ -892,7 +847,6 @@ app.post('/stripe/create-intent', authMiddleware, async (req, res) => {
       expand: ['latest_invoice.payment_intent'],
       metadata: { userId: user.id, priceId },
     });
-
     const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
     res.json({ clientSecret, subscriptionId: subscription.id });
   } catch (e) { console.error('[Stripe] Intent error:', e.message); res.status(500).json({ error: e.message }); }
@@ -911,24 +865,22 @@ app.post('/stripe/portal', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Stripe webhook — must use raw body
 app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.json({ ok: true });
   let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
   } catch (e) { console.error('[Stripe] Webhook sig failed:', e.message); return res.status(400).send('Webhook Error'); }
-
   try {
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
-      const userId = session.metadata?.userId;
+      const userId  = session.metadata?.userId;
       const priceId = session.metadata?.priceId;
       if (userId && priceId) {
         const user = await getUser(userId);
         if (user) {
           user.plan = PRICE_TO_PLAN[priceId] || 'basic';
-          user.stripeCustomerId = session.customer;
+          user.stripeCustomerId     = session.customer;
           user.stripeSubscriptionId = session.subscription;
           await saveUser(user);
           console.log(`[Stripe] Upgraded ${user.email} to ${user.plan}`);
@@ -936,7 +888,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
       }
     }
     if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.paused') {
-      const sub = event.data.object;
+      const sub    = event.data.object;
       const userId = sub.metadata?.userId;
       if (userId) {
         const user = await getUser(userId);
@@ -956,16 +908,14 @@ app.get('/auth/plan', authMiddleware, async (req, res) => {
   try {
     const user = await getUser(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    const appraisalsToday = user.appraisalsToday || 0;
-    const appraisalDate = user.appraisalDate || '';
-    const today = new Date().toISOString().slice(0, 10);
-    const appraised = appraisalDate === today ? appraisalsToday : 0;
-    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    const today    = new Date().toISOString().slice(0, 10);
+    const appraised = user.appraisalDate === today ? (user.appraisalsToday || 0) : 0;
+    const limit     = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
     res.json({
       plan: user.plan || 'free',
       appraisalsUsedToday: appraised,
-      appraisalsLimit: limit === Infinity ? -1 : limit,
-      watchlistLimit: PLAN_WATCHLIST_LIMITS[user.plan || 'free'],
+      appraisalsLimit:     limit === Infinity ? -1 : limit,
+      watchlistLimit:      PLAN_WATCHLIST_LIMITS[user.plan || 'free'],
     });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
