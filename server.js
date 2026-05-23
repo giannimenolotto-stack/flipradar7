@@ -62,6 +62,7 @@ const K = {
   ebay:        kw  => `fr:ebay:${kw.toLowerCase().trim()}`,
   prices:      kw  => `fr:prices:${kw.toLowerCase().trim()}`,
   sharedScan:  kw  => `fr:scan:${kw.toLowerCase().trim()}`,  // shared scan cache across all users
+  blocked:     uid => `fr:blocked:${uid}`,                     // listings blocked by filter — user can review
 };
 
 // ── Auth ──────────────────────────────────────────────────
@@ -776,7 +777,19 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
   });
 
   const dropped = raw.length - relevant.length;
-  if (dropped > 0) console.log(`[Filter] "${keyword}" — dropped ${dropped} listing(s) (keyword mismatch or excluded words)`);
+  if (dropped > 0) {
+    console.log(`[Filter] "${keyword}" — dropped ${dropped} listing(s) (keyword mismatch or excluded words)`);
+    // Save blocked listings so user can review them
+    const blockedListings = raw.filter(l => !relevant.includes(l)).map(l => ({
+      id: l.id, title: l.title, price: l.price, url: l.url,
+      image: l.image, keyword, blockedAt: new Date().toISOString()
+    }));
+    redisGet(K.blocked(watcher.userId)).then(existing => {
+      const all = Array.isArray(existing) ? existing : [];
+      const merged = [...blockedListings, ...all.filter(e => !blockedListings.find(b => b.id === e.id))];
+      redisSet(K.blocked(watcher.userId), merged.slice(0, 100)); // keep last 100
+    }).catch(() => {});
+  }
 
   let seenSkipped = 0;
   for (const listing of relevant) {
@@ -1204,6 +1217,35 @@ app.delete('/listings', authMiddleware, async (req, res) => {
   try {
     await saveUserListings(req.userId, []);
     await saveUserSeen(req.userId, {});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /listings/blocked — get listings that were filtered out
+app.get('/listings/blocked', authMiddleware, async (req, res) => {
+  try {
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    res.json(blocked);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /listings/unblock — move a blocked listing back into the feed
+app.post('/listings/unblock', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ error: 'id required' });
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    const listing = blocked.find(l => l.id === id);
+    if (!listing) return res.status(404).json({ error: 'Not found' });
+    // Remove from blocked
+    await redisSet(K.blocked(req.userId), blocked.filter(l => l.id !== id));
+    // Add to user listings
+    const listings = await getUserListings(req.userId);
+    if (!listings.find(l => l.id === id)) {
+      listings.unshift({ ...listing, foundAt: new Date().toISOString() });
+      listings.sort((a, b) => new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt));
+      await saveUserListings(req.userId, listings);
+    }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
