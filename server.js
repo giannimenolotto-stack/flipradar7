@@ -178,7 +178,7 @@ function welcomeEmail(name, email) {
     <div style="margin-bottom:24px">
       <div style="color:#555;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px">Get started in 3 steps</div>
       ${[
-        ['👁️', 'Add a watchlist', 'Type in what you're hunting — e.g. "ps5", "bmw e30", "vintage levi's"'],
+        ['👁️', 'Add a watchlist', 'Type in what you\'re hunting — e.g. "ps5", "bmw e30", "vintage levis"'],
         ['📡', 'We scan for you', 'FlipRadar checks Marketplace every 30 minutes and sends you new listings instantly'],
         ['💸', 'Flip for profit', 'Use the Sell Scanner to appraise anything and generate a listing description'],
       ].map(([icon, title, desc]) => `
@@ -193,7 +193,7 @@ function welcomeEmail(name, email) {
 
     <!-- CTA -->
     <div style="text-align:center;margin-bottom:32px">
-      <a href="https://flipradar7.onrender.com" style="display:inline-block;background:#00ff88;color:#000;font-weight:800;font-size:16px;padding:16px 40px;border-radius:14px;text-decoration:none;letter-spacing:.5px">
+      <a href="https://flip-radar.app" style="display:inline-block;background:#00ff88;color:#000;font-weight:800;font-size:16px;padding:16px 40px;border-radius:14px;text-decoration:none;letter-spacing:.5px">
         Open FlipRadar →
       </a>
     </div>
