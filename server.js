@@ -960,5 +960,4 @@ app.listen(PORT, async () => {
   console.log(`Redis:  ${REDIS_URL   ? 'connected' : 'NOT SET'}`);
   await loadAllWatches();
   console.log('[Ready] Server fully loaded');
-});com
-[Verify] user.verifyCode: undefined submitted: 284555 expiry: undefined
+});
