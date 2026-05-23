@@ -56,7 +56,9 @@ const K = {
 };
 
 // ── Auth ──────────────────────────────────────────────────
-const JWT_SECRET   = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
+const JWT_SECRET    = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
+const FROM_EMAIL     = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.com>';
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
 
@@ -130,6 +132,112 @@ async function saveUserSeen(userId, seen) {
   await redisSet(K.seen(userId), pruned);
 }
 
+
+// ── Email (Resend) ────────────────────────────────────────
+async function sendEmail(to, subject, html) {
+  if (!RESEND_API_KEY) { console.log(`[Email] No RESEND_API_KEY — skipping email to ${to}`); return; }
+  try {
+    const res = await axios.post('https://api.resend.com/emails', {
+      from: FROM_EMAIL,
+      to,
+      subject,
+      html,
+    }, {
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      timeout: 10000,
+    });
+    console.log(`[Email] Sent "${subject}" to ${to}`);
+    return res.data;
+  } catch (e) {
+    console.error(`[Email] Failed to send to ${to}:`, e.response?.data || e.message);
+  }
+}
+
+function welcomeEmail(name, email) {
+  return sendEmail(email, 'Welcome to FlipRadar 👀', `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#07070e;font-family:'Helvetica Neue',Arial,sans-serif">
+  <div style="max-width:520px;margin:0 auto;padding:40px 24px">
+    <!-- Logo -->
+    <div style="font-size:32px;font-weight:900;letter-spacing:2px;color:#fff;margin-bottom:32px">
+      Flip<span style="color:#00ff88">Radar</span>
+    </div>
+
+    <!-- Hero -->
+    <div style="background:linear-gradient(135deg,rgba(0,255,136,.12),rgba(0,255,136,.04));border:1px solid rgba(0,255,136,.25);border-radius:20px;padding:32px;margin-bottom:24px">
+      <div style="font-size:40px;margin-bottom:12px">👋</div>
+      <h1 style="color:#fff;font-size:24px;font-weight:800;margin:0 0 8px">Hey ${name}, you're in!</h1>
+      <p style="color:#888;font-size:15px;line-height:1.6;margin:0">
+        FlipRadar is now scanning Facebook Marketplace for you. Add your first watchlist keyword and we'll notify you the moment something worth flipping shows up.
+      </p>
+    </div>
+
+    <!-- Steps -->
+    <div style="margin-bottom:24px">
+      <div style="color:#555;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px">Get started in 3 steps</div>
+      ${[
+        ['👁️', 'Add a watchlist', 'Type in what you're hunting — e.g. "ps5", "bmw e30", "vintage levi's"'],
+        ['📡', 'We scan for you', 'FlipRadar checks Marketplace every 30 minutes and sends you new listings instantly'],
+        ['💸', 'Flip for profit', 'Use the Sell Scanner to appraise anything and generate a listing description'],
+      ].map(([icon, title, desc]) => `
+      <div style="display:flex;gap:14px;margin-bottom:16px">
+        <div style="font-size:24px;flex-shrink:0;width:36px;text-align:center">${icon}</div>
+        <div>
+          <div style="color:#fff;font-weight:700;font-size:14px;margin-bottom:3px">${title}</div>
+          <div style="color:#666;font-size:13px;line-height:1.5">${desc}</div>
+        </div>
+      </div>`).join('')}
+    </div>
+
+    <!-- CTA -->
+    <div style="text-align:center;margin-bottom:32px">
+      <a href="https://flipradar7.onrender.com" style="display:inline-block;background:#00ff88;color:#000;font-weight:800;font-size:16px;padding:16px 40px;border-radius:14px;text-decoration:none;letter-spacing:.5px">
+        Open FlipRadar →
+      </a>
+    </div>
+
+    <!-- Footer -->
+    <div style="border-top:1px solid #1a1a2e;padding-top:20px;color:#444;font-size:12px;line-height:1.6">
+      You're receiving this because you signed up at FlipRadar.<br>
+      Questions? Just reply to this email.
+    </div>
+  </div>
+</body>
+</html>
+`);
+}
+
+function verificationEmail(name, email, code) {
+  return sendEmail(email, `${code} — Verify your FlipRadar email`, `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#07070e;font-family:'Helvetica Neue',Arial,sans-serif">
+  <div style="max-width:520px;margin:0 auto;padding:40px 24px">
+    <div style="font-size:32px;font-weight:900;letter-spacing:2px;color:#fff;margin-bottom:32px">
+      Flip<span style="color:#00ff88">Radar</span>
+    </div>
+
+    <div style="background:#0d0d1a;border:1px solid #1a1a2e;border-radius:20px;padding:32px;margin-bottom:24px;text-align:center">
+      <div style="font-size:40px;margin-bottom:16px">✉️</div>
+      <h2 style="color:#fff;font-size:20px;font-weight:800;margin:0 0 8px">Verify your email</h2>
+      <p style="color:#666;font-size:14px;margin:0 0 28px">Enter this code in the app to verify your email address. It expires in 15 minutes.</p>
+      <div style="background:#00ff88;color:#000;font-size:36px;font-weight:900;letter-spacing:10px;border-radius:14px;padding:20px 24px;display:inline-block;font-family:'Courier New',monospace">
+        ${code}
+      </div>
+    </div>
+
+    <div style="color:#444;font-size:12px;text-align:center">
+      If you didn't sign up for FlipRadar, you can safely ignore this email.
+    </div>
+  </div>
+</body>
+</html>
+`);
+}
+
 // ── Scan intervals per plan ───────────────────────────────
 const PLAN_INTERVALS = {
   basic:   30 * 60 * 1000,
@@ -161,7 +269,7 @@ const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
   const days     = opts.initialScan ? 7 : 1;
-  const maxItems = opts.initialScan ? 100 : 50;
+  const maxItems = opts.initialScan ? 25 : 50;
   let fbUrl;
   if (opts.lat && opts.lng) {
     fbUrl = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(keyword)}&latitude=${opts.lat}&longitude=${opts.lng}&radius=${opts.radius||50}&sortBy=creation_time_descend&daysSinceListed=${days}`;
@@ -342,21 +450,63 @@ app.post('/auth/signup', async (req, res) => {
     const existing = await getUserByEmail(email);
     if (existing) return res.status(409).json({ error: 'An account already exists for this email' });
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    // Generate 6-digit verification code
+    const verifyCode = String(Math.floor(100000 + Math.random() * 900000));
     const user = {
       id: uuidv4(),
       email: email.toLowerCase().trim(),
       name:  (name || email.split('@')[0]).trim(),
       passwordHash,
-      createdAt: new Date().toISOString(),
-      lastSeen:  new Date().toISOString(),
-      plan: 'basic',
+      createdAt:     new Date().toISOString(),
+      lastSeen:      new Date().toISOString(),
+      plan:          'basic',
+      emailVerified: false,
+      verifyCode,
+      verifyExpiry:  new Date(Date.now() + 15 * 60 * 1000).toISOString(), // 15 mins
     };
     await saveUser(user);
     await redisSet(K.emailIdx(user.email), user.id);
     const token = makeToken(user.id);
     console.log(`[Auth] Signup: ${user.email}`);
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan } });
+    // Send both emails in background — don't block the response
+    welcomeEmail(user.name, user.email).catch(e => console.error('[Email] Welcome failed:', e.message));
+    verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Verify failed:', e.message));
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan, emailVerified: false } });
   } catch (e) { console.error('[Signup]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/verify-email', authMiddleware, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Verification code required' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    if (!user.verifyCode || user.verifyCode !== String(code).trim())
+      return res.status(400).json({ error: 'Incorrect code. Please check your email and try again.' });
+    if (new Date(user.verifyExpiry) < new Date())
+      return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    user.emailVerified = true;
+    delete user.verifyCode;
+    delete user.verifyExpiry;
+    await saveUser(user);
+    console.log(`[Auth] Email verified: ${user.email}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/resend-verify', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    const verifyCode = String(Math.floor(100000 + Math.random() * 900000));
+    user.verifyCode   = verifyCode;
+    user.verifyExpiry = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    await saveUser(user);
+    verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Resend verify failed:', e.message));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/auth/login', async (req, res) => {
