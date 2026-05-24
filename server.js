@@ -1,10 +1,3 @@
-
-
-
-server (24).js
-JavaScript
-can u display this so i can copy and paste it
-
 const express  = require('express');
 const webpush  = require('web-push');
 const crypto  = require('crypto');
@@ -33,14 +26,9 @@ async function redisGet(key) {
     });
     if (!res.data.result) return null;
     let parsed = JSON.parse(res.data.result);
-    if (typeof parsed === 'string') {
-      try { parsed = JSON.parse(parsed); } catch(e) {}
-    }
+    if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed); } catch(e) {} }
     return parsed;
-  } catch (e) {
-    console.error('[Redis] GET error:', e.message);
-    return null;
-  }
+  } catch (e) { console.error('[Redis] GET error:', e.message); return null; }
 }
 
 async function redisSet(key, value) {
@@ -49,33 +37,18 @@ async function redisSet(key, value) {
     await axios.post(
       `${REDIS_URL}/set/${encodeURIComponent(key)}`,
       JSON.stringify(value),
-      {
-        headers: {
-          Authorization: `Bearer ${REDIS_TOKEN}`,
-          'Content-Type': 'application/json'
-        }
-      }
+      { headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' } }
     );
-  } catch (e) {
-    console.error('[Redis] SET error:', e.message);
-  }
+  } catch (e) { console.error('[Redis] SET error:', e.message); }
 }
 
 async function redisDel(key) {
   if (!REDIS_URL) return;
   try {
-    await axios.post(
-      `${REDIS_URL}/del/${encodeURIComponent(key)}`,
-      null,
-      {
-        headers: {
-          Authorization: `Bearer ${REDIS_TOKEN}`
-        }
-      }
-    );
-  } catch (e) {
-    console.error('[Redis] DEL error:', e.message);
-  }
+    await axios.post(`${REDIS_URL}/del/${encodeURIComponent(key)}`, null, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
+    });
+  } catch (e) { console.error('[Redis] DEL error:', e.message); }
 }
 
 // Redis key helpers
@@ -99,7 +72,6 @@ const EBAY_APP_ID    = process.env.EBAY_APP_ID || null;
 
 // ── Stripe ────────────────────────────────────────────────
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || null;
-
 const PRICE_IDS = {
   basic_weekly:    'price_1Ta7LcPDjYUYNInHPy2AMqba',
   basic_monthly:   'price_1Ta7MLPDjYUYNInHYru4vO5M',
@@ -108,88 +80,3 @@ const PRICE_IDS = {
   premium_monthly: 'price_1Ta7QDPDjYUYNInHDQTp70Mt',
   premium_yearly:  'price_1Ta7QSPDjYUYNInHLG2F4aT3',
 };
-
-const PRICE_TO_PLAN = {};
-
-Object.entries(PRICE_IDS).forEach(([key, priceId]) => {
-  PRICE_TO_PLAN[priceId] =
-    key.startsWith('basic') ? 'basic' : 'premium';
-});
-
-const PLAN_APPRAISAL_LIMITS = {
-  free: 999,
-  basic: 999,
-  premium: 999
-};
-
-const PLAN_WATCHLIST_LIMITS = {
-  free: 5,
-  basic: 5,
-  premium: 5
-};
-
-const FROM_EMAIL    =
-  process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.com>';
-
-const INACTIVE_DAYS = 7;
-const BCRYPT_ROUNDS = 10;
-
-// ── eBay price cache settings ─────────────────────────────
-const EBAY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const EBAY_MIN_RESULTS  = 5;
-const OWN_PRICE_MIN     = 10;
-
-// ── Appraisal credit helper ───────────────────────────────
-async function consumeAppraisal(userId) {
-  const user = await getUser(userId);
-
-  if (!user) {
-    return {
-      ok: false,
-      status: 404,
-      error: 'User not found'
-    };
-  }
-
-  const today = new Date().toISOString().slice(0, 10);
-
-  if (user.appraisalDate !== today) {
-    user.appraisalsToday = 0;
-    user.appraisalDate = today;
-  }
-
-  const limit =
-    PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
-
-  if (
-    limit !== Infinity &&
-    limit < 999 &&
-    user.appraisalsToday >= limit
-  ) {
-    return {
-      ok: false,
-      status: 429,
-      error: 'Daily appraisal limit reached',
-      limit,
-      plan: getEffectivePlan(user)
-    };
-  }
-
-  user.appraisalsToday =
-    (user.appraisalsToday || 0) + 1;
-
-  await saveUser(user);
-
-  return {
-    ok: true,
-    user,
-    used: user.appraisalsToday,
-    limit: limit === Infinity ? -1 : limit
-  };
-}
-Your uploaded file: 
-
-
-
-
-
