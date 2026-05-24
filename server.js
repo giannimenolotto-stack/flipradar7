@@ -1544,11 +1544,13 @@ app.get('/prices', authMiddleware, async (req, res) => {
   try {
     const { keyword, refresh } = req.query;
     if (!keyword) return res.status(400).json({ error: 'keyword required' });
+    console.log('[Prices] Request for keyword:', keyword, '| EBAY_APP_ID set:', !!EBAY_APP_ID);
     if (refresh === '1') await redisDel(K.ebay(keyword.toLowerCase().trim()));
     const priceData = await getPriceCacheForKeyword(keyword);
+    console.log('[Prices] Result for', keyword, ':', priceData ? 'found (' + priceData.count + ' prices, median $' + priceData.median + ')' : 'not found');
     if (!priceData) return res.json({ found: false, keyword });
     res.json({ found: true, keyword, ...priceData });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { console.error('[Prices] Error:', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ── Appraisal route — cache-first, AI fallback ────────────
