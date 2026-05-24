@@ -92,8 +92,8 @@ const BCRYPT_ROUNDS = 10;
 
 // ── eBay price cache settings ─────────────────────────────
 const EBAY_CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours — 1 eBay call per keyword per day max
-const EBAY_MIN_RESULTS    = 5;                     // need at least 5 sold prices to skip AI
-const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
+const EBAY_MIN_RESULTS    = 3;                     // need at least 3 sold prices to use data
+const OWN_PRICE_MIN       = 5;                     // need 5 of our own records to use
 
 // ── Owner account — always premium, no payment required ──
 const OWNER_EMAIL = 'giannimenolotto@gmail.com';
@@ -194,7 +194,7 @@ async function getEbaySoldPrices(keyword) {
 
   // Fetch from eBay AU Finding API — no cost per call
   try {
-    const url = `https://svcs.ebay.com.au/services/search/FindingService/v1` +
+    const buildUrl = (page) => `https://svcs.ebay.com.au/services/search/FindingService/v1` +
       `?OPERATION-NAME=findCompletedItems` +
       `&SERVICE-VERSION=1.0.0` +
       `&SECURITY-APPNAME=${EBAY_APP_ID}` +
@@ -203,12 +203,19 @@ async function getEbaySoldPrices(keyword) {
       `&keywords=${encodeURIComponent(keyword)}` +
       `&itemFilter(0).name=SoldItemsOnly&itemFilter(0).value=true` +
       `&sortOrder=EndTimeSoonest` +
-      `&paginationInput.entriesPerPage=100`;
+      `&paginationInput.entriesPerPage=100` +
+      `&paginationInput.pageNumber=${page}`;
 
     console.log(`[eBay] Fetching AU sold prices for "${keyword}"...`);
-    const res   = await axios.get(url, { timeout: 15000 });
-    const items = res.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
-    console.log(`[eBay] "${keyword}" → ${items.length} raw results from API`);
+    // Fetch 2 pages in parallel for up to 200 results
+    const [res1, res2] = await Promise.all([
+      axios.get(buildUrl(1), { timeout: 15000 }),
+      axios.get(buildUrl(2), { timeout: 15000 }).catch(() => null),
+    ]);
+    const items1 = res1.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+    const items2 = res2?.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+    const items  = [...items1, ...items2];
+    console.log(`[eBay] "${keyword}" → ${items.length} raw results (${items1.length} + ${items2.length})`);
 
     const prices = items
       .map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0))
