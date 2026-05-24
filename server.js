@@ -686,6 +686,44 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // ── Shared scan cache TTL ────────────────────────────────
 const SHARED_SCAN_TTL_MS = 25 * 60 * 1000; // 25 mins — slightly under the 30min scan interval
 
+// ── Backend relevance filter using Gemini ────────────────
+// Runs once at scan time — much faster than frontend AI call on every load
+// Filters out obviously wrong listings before saving to Redis
+async function filterIrrelevantListings(keyword, listings) {
+  if (!GEMINI_API_KEY || !listings.length) return listings;
+  try {
+    const lines = listings.slice(0, 25).map((l, i) =>
+      `${i}. "${l.title}" $${l.price||'?'}`
+    ).join(' | ');
+
+    const prompt = `You are filtering Facebook Marketplace listings for someone searching "${keyword}". 
+Mark ONLY the obviously wrong listings as irrelevant — different product category entirely.
+VEHICLES: parts/wrecking/manuals/toys/books about the car = irrelevant. Actual vehicles = relevant.
+NON-VEHICLES: accessories-only (case, charger, helmet alone) = irrelevant. Main item = relevant.
+When in doubt: relevant. Reply ONLY as JSON array of irrelevant indexes: [0,3,7] or [] if all relevant.
+Listings: ${lines}`;
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const res = await axios.post(url, {
+      contents: [{ parts: [{ text: prompt }] }]
+    }, { headers: { 'Content-Type': 'application/json' }, timeout: 15000 });
+
+    const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const match = text.match(/\[[\d,\s]*\]/);
+    if (!match) return listings;
+
+    const irrelevantIdxs = JSON.parse(match[0]);
+    if (!irrelevantIdxs.length) return listings;
+
+    const filtered = listings.filter((_, i) => !irrelevantIdxs.includes(i));
+    console.log(`[BackendFilter] "${keyword}" — removed ${irrelevantIdxs.length} irrelevant listing(s) of ${listings.length}`);
+    return filtered;
+  } catch (e) {
+    console.error('[BackendFilter] Error:', e.message);
+    return listings; // on error keep all listings
+  }
+}
+
 // ── Distribute raw listings to a single user ─────────────
 async function distributeListingsToUser(watcher, raw, opts = {}) {
   if (!Array.isArray(raw)) raw = []; // safety net
@@ -880,6 +918,9 @@ async function scanWatchItem(watcher, opts = {}) {
       city: watcher.location, lat: watcher.lat, lng: watcher.lng,
       radius: watcher.radius, initialScan: opts.initialScan || false
     });
+    // Filter irrelevant listings before caching — runs once, saves to all users
+    raw = await filterIrrelevantListings(keyword, raw);
+
     // Save to shared cache so other users watching same keyword skip Apify
     await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
     console.log(`[SharedCache] "${keyword}" → cached ${raw.length} listings`);
