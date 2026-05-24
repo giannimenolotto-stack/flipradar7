@@ -303,27 +303,35 @@ async function getPriceCacheForKeyword(keyword) {
 function buildCacheVerdict(listingPrice, priceData) {
   const { low, median, high, count, source } = priceData;
 
-  // How does listing price compare to median sold price?
   const roi = median > 0 ? Math.round(((median - listingPrice) / listingPrice) * 100) : 0;
   const estimatedProfit = Math.round(median - listingPrice);
 
-  let verdict, oneLiner;
-  if (roi >= 30) {
-    verdict  = 'GREAT DEAL';
-    oneLiner = `Listed ${roi}% below median sold price — strong flip potential`;
-  } else if (roi >= 15) {
-    verdict  = 'GOOD DEAL';
-    oneLiner = `Priced below market — room to profit`;
+  let verdict, oneLiner, dealScore;
+  if (roi >= 50) {
+    verdict   = 'STEAL';
+    oneLiner  = `Listed ${roi}% below median sold — incredible flip potential`;
+    dealScore = 95;
+  } else if (roi >= 30) {
+    verdict   = 'GOOD DEAL';
+    oneLiner  = `Listed ${roi}% below median sold price — strong flip potential`;
+    dealScore = 80;
+  } else if (roi >= 10) {
+    verdict   = 'GOOD DEAL';
+    oneLiner  = `Priced below market — room to profit`;
+    dealScore = 65;
   } else if (roi >= 0) {
-    verdict  = 'FAIR PRICE';
-    oneLiner = `Around market rate — slim margin`;
+    verdict   = 'FAIR';
+    oneLiner  = `Around market rate — slim margin`;
+    dealScore = 45;
   } else {
-    verdict  = 'OVERPRICED';
-    oneLiner = `Listed above typical sold prices — negotiate hard or pass`;
+    verdict   = 'PASS';
+    oneLiner  = `Listed ${Math.abs(roi)}% above typical sold prices — negotiate hard or pass`;
+    dealScore = 20;
   }
 
   return {
     verdict,
+    dealScore,
     oneLiner,
     estimatedResellLow:  low,
     estimatedResellHigh: high,
@@ -332,8 +340,9 @@ function buildCacheVerdict(listingPrice, priceData) {
     estimatedProfit:     Math.max(0, estimatedProfit),
     roiPercent:          roi,
     dataPoints:          count,
-    source,              // 'own_history' or 'ebay_sold' — frontend can show this
-    negotiationScript:   `This is going for around $${median} sold — would you take $${Math.round(listingPrice * 0.85)}?`,
+    source,
+    low, median, high,
+    negotiationScript:   `This is going for around $${median} sold on eBay AU — would you take $${Math.round(listingPrice * 0.85)}?`,
   };
 }
 
