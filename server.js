@@ -490,29 +490,47 @@ async function scrapeKeyword(keyword, opts = {}) {
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
 
     // ── Vehicle detail fallback ───────────────────────────
-    // If this is a vehicle keyword and the cheap actor returned no odometer data,
-    // re-run with the expensive detail actor to get full vehicle specs
+    // For vehicle keywords: always use the detail actor on initial scan.
+    // On recurring scans: only use it if cheap actor returned no odometer data.
     if (vehicleMode && items.length > 0) {
       const hasOdo = items.some(i => {
         const vi = i.vehicle_info || i.listing_vehicle_data || i.vehicleInfo || {};
-        return vi.odometer || vi.mileage || vi.kilometers || i.odometer || i.mileage;
+        return i.vehicle_odometer_data || vi.odometer || vi.mileage || vi.kilometers || i.odometer || i.mileage;
       });
-      if (!hasOdo) {
-        console.log(`[Apify] "${keyword}" — no odometer data from cheap actor, retrying with detail actor`);
+      const shouldUseDetailActor = !hasOdo; // always retry if no odo data found
+      if (shouldUseDetailActor) {
+        console.log(`[Apify] "${keyword}" — no odometer data from cheap actor, fetching details via data-slayer`);
         try {
-          const detailRes = await axios.post(
-            `https://api.apify.com/v2/acts/${APIFY_ACTOR_DETAIL}/run-sync-get-dataset-items`,
-            { urls: [fbUrl], maxItems, maxRequestRetries: 1, maxPagesPerUrl: 1 },
-            { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-          );
-          const detailItems = Array.isArray(detailRes.data) ? detailRes.data.filter(i => !i.error) : [];
-          if (detailItems.length > 0) {
-            items = detailItems.slice(0, maxItems);
-            console.log(`[Apify] "${keyword}" — detail actor returned ${items.length} item(s)`);
+          // data-slayer takes individual listingId — run in parallel batches of 5
+          const ids = items.map(i => i.id || i.listingId || String(i.marketplace_listing_id || '')).filter(Boolean);
+          const batchSize = 5;
+          const detailResults = [];
+          for (let i = 0; i < ids.length; i += batchSize) {
+            const batch = ids.slice(i, i + batchSize);
+            const batchRes = await Promise.all(batch.map(listingId =>
+              axios.post(
+                `https://api.apify.com/v2/acts/${APIFY_ACTOR_DETAIL}/run-sync-get-dataset-items`,
+                { listingId },
+                { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
+              ).then(r => Array.isArray(r.data) ? r.data[0] : null).catch(() => null)
+            ));
+            detailResults.push(...batchRes.filter(Boolean));
+            if (i + batchSize < ids.length) await sleep(500);
+          }
+          if (detailResults.length > 0) {
+            // Merge detail fields back onto cheap actor items (cheap actor has better search results/images)
+            items = items.map(item => {
+              const itemId = item.id || item.listingId || String(item.marketplace_listing_id || '');
+              const detail = detailResults.find(d => d.id === itemId || d.listing_id === itemId);
+              return detail ? { ...item, ...detail } : item;
+            });
+            console.log(`[Apify] "${keyword}" — merged details for ${detailResults.length}/${items.length} listings`);
+            const s = detailResults[0];
+            console.log('[DetailActorRaw] ALL KEYS:', Object.keys(s).join(', '));
+            console.log('[DetailActorRaw] FULL ITEM:', JSON.stringify(s).slice(0, 2000));
           }
         } catch (detailErr) {
           console.error(`[Apify] Detail actor fallback failed for "${keyword}":`, detailErr.message);
-          // Keep cheap actor results — better than nothing
         }
       } else {
         console.log(`[Apify] "${keyword}" — odometer found in cheap actor results, skipping detail actor`);
@@ -530,6 +548,11 @@ async function scrapeKeyword(keyword, opts = {}) {
         custom_sub_titles:   s.custom_sub_titles,
         subtitle:            s.subtitle,
       }));
+      // For vehicle keywords, dump the full item so we can see all field names
+      if (vehicleMode) {
+        console.log('[ApifyRaw] Vehicle item ALL KEYS:', Object.keys(s).join(', '));
+        console.log('[ApifyRaw] Vehicle item FULL:', JSON.stringify(s).slice(0, 3000));
+      }
     }
     // TEMP: log raw first vehicle item so we can see what fields Apify returns
     if (items.length > 0 && isVehicleKeyword(keyword)) {
@@ -611,13 +634,48 @@ async function scrapeKeyword(keyword, opts = {}) {
         listedAtUnknown, // true when we couldn't determine the actual listed date
         foundAt:  new Date().toISOString(),
         mileage:       isVehicle ? (extractMileageFromVehicleInfo(item) || extractMileage(title, description)) : null,
-        year:          isVehicle ? (item.vehicle_info?.year || item.listing_vehicle_data?.year || extractYear(title, description)) : null,
-        make:          isVehicle ? (item.vehicle_info?.make || item.listing_vehicle_data?.make || extractMake(keyword, title)) : null,
-        transmission:  isVehicle ? (item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission || null) : null,
-        fuelType:      isVehicle ? (item.vehicle_info?.fuel_type || item.listing_vehicle_data?.fuel_type || item.vehicle_info?.fuelType || null) : null,
-        exteriorColor: isVehicle ? (item.vehicle_info?.exterior_color || item.listing_vehicle_data?.exterior_color || null) : null,
-        interiorColor: isVehicle ? (item.vehicle_info?.interior_color || item.listing_vehicle_data?.interior_color || null) : null,
-        bodyStyle:     isVehicle ? (item.vehicle_info?.body_style || item.listing_vehicle_data?.body_style || null) : null,
+        year:          isVehicle ? (
+                         item.vehicle_info?.year || item.listing_vehicle_data?.year ||
+                         item.vehicleInfo?.year || item.year ||
+                         extractYear(title, description)
+                       ) : null,
+        make:          isVehicle ? (
+                         item.vehicle_make_display_name ||
+                         item.vehicle_info?.make || item.listing_vehicle_data?.make ||
+                         item.vehicleInfo?.make || item.make ||
+                         extractMake(keyword, title)
+                       ) : null,
+        model:         isVehicle ? (
+                         item.vehicle_model_display_name ||
+                         item.vehicle_info?.model || item.listing_vehicle_data?.model ||
+                         item.vehicleInfo?.model || item.model || null
+                       ) : null,
+        transmission:  isVehicle ? (
+                         item.vehicle_transmission_type ||
+                         item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission ||
+                         item.vehicleInfo?.transmission || item.transmission || null
+                       ) : null,
+        fuelType:      isVehicle ? (
+                         item.vehicle_fuel_type ||
+                         item.vehicle_info?.fuel_type || item.listing_vehicle_data?.fuel_type ||
+                         item.vehicle_info?.fuelType || item.vehicleInfo?.fuel_type ||
+                         item.fuel_type || item.fuelType || null
+                       ) : null,
+        exteriorColor: isVehicle ? (
+                         item.vehicle_exterior_color ||
+                         item.vehicle_info?.exterior_color || item.listing_vehicle_data?.exterior_color ||
+                         item.vehicleInfo?.exterior_color || item.exterior_color || item.color || null
+                       ) : null,
+        interiorColor: isVehicle ? (
+                         item.vehicle_info?.interior_color || item.listing_vehicle_data?.interior_color ||
+                         item.vehicleInfo?.interior_color || item.interior_color || null
+                       ) : null,
+        bodyStyle:     isVehicle ? (
+                         item.vehicle_info?.body_style || item.listing_vehicle_data?.body_style ||
+                         item.vehicleInfo?.body_style || item.body_style || item.bodyStyle || null
+                       ) : null,
+        sellerType:    isVehicle ? (item.vehicle_seller_type || null) : null,
+        condition:     item.condition || null,
       };
     }).filter(l => l.id);
   } catch (e) {
@@ -681,11 +739,17 @@ function isVehicleListing(keyword, title, description) {
 
 // Extract mileage from Apify's structured vehicle_info block (more accurate than regex)
 function extractMileageFromVehicleInfo(item) {
+  // data-slayer uses vehicle_odometer_data which is a string like "250,000 km"
+  const odoData = item.vehicle_odometer_data;
+  if (odoData) {
+    const parsed = parseInt(String(odoData).replace(/[^0-9]/g, ''));
+    if (parsed > 0 && parsed < 2000000) return parsed;
+  }
   const vi = item.vehicle_info || item.listing_vehicle_data || item.vehicleInfo || {};
-  const raw = vi.odometer || vi.mileage || vi.kilometers || vi.driven_km || vi.driven || null;
+  const raw = vi.odometer || vi.mileage || vi.kilometers || vi.driven_km || vi.driven
+    || item.odometer || item.mileage || item.kilometers || null;
   if (!raw) return null;
-  if (typeof raw === 'number') return raw;
-  // Parse strings like "250,000 km" or "250000"
+  if (typeof raw === 'number') return raw > 0 && raw < 2000000 ? raw : null;
   const parsed = parseInt(String(raw).replace(/[^0-9]/g, ''));
   return parsed > 0 && parsed < 2000000 ? parsed : null;
 }
