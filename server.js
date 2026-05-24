@@ -1596,7 +1596,11 @@ app.get('/prices', authMiddleware, async (req, res) => {
     const { keyword, refresh } = req.query;
     if (!keyword) return res.status(400).json({ error: 'keyword required' });
     console.log('[Prices] Request for keyword:', keyword, '| EBAY_APP_ID set:', !!EBAY_APP_ID);
-    if (refresh === '1') await redisDel(K.ebay(keyword.toLowerCase().trim()));
+    if (refresh === '1') {
+      await redisDel(K.ebay(keyword.toLowerCase().trim()));
+      await redisDel(K.prices(keyword.toLowerCase().trim()));
+      console.log(`[Prices] Cache busted for "${keyword}"`);
+    }
     const priceData = await getPriceCacheForKeyword(keyword);
     console.log('[Prices] Result for', keyword, ':', priceData ? 'found (' + priceData.count + ' prices, median $' + priceData.median + ')' : 'not found');
     if (!priceData) return res.json({ found: false, keyword });
