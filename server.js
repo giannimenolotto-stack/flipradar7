@@ -206,15 +206,19 @@ async function getEbaySoldPrices(keyword) {
       `&paginationInput.pageNumber=${page}`;
 
     console.log(`[eBay] Fetching AU sold prices for "${keyword}"...`);
-    // Fetch 2 pages in parallel for up to 200 results
-    const [res1, res2] = await Promise.all([
+    // Fetch 4 pages in parallel for up to 400 results
+    const [res1, res2, res3, res4] = await Promise.all([
       axios.get(buildUrl(1), { timeout: 15000 }),
       axios.get(buildUrl(2), { timeout: 15000 }).catch(() => null),
+      axios.get(buildUrl(3), { timeout: 15000 }).catch(() => null),
+      axios.get(buildUrl(4), { timeout: 15000 }).catch(() => null),
     ]);
     const items1 = res1.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
     const items2 = res2?.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
-    const items  = [...items1, ...items2];
-    console.log(`[eBay] "${keyword}" → ${items.length} raw results (${items1.length} + ${items2.length})`);
+    const items3 = res3?.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+    const items4 = res4?.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+    const items  = [...items1, ...items2, ...items3, ...items4];
+    console.log(`[eBay] "${keyword}" → ${items.length} raw results (${items1.length}+${items2.length}+${items3.length}+${items4.length})`);
 
     // Fetch live USD→AUD rate (cache for 6 hours)
     let usdToAud = 1.55; // fallback if API fails
@@ -233,16 +237,21 @@ async function getEbaySoldPrices(keyword) {
       console.log(`[eBay] FX fetch failed, using fallback rate ${usdToAud}`);
     }
 
-    const prices = items
+    const allPrices = items
       .map(i => {
         const rawPrice  = parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0);
         const currency  = i.sellingStatus?.[0]?.currentPrice?.[0]?.['@currencyId'] || 'USD';
-        // Convert to AUD — most eBay prices are USD, some are already AUD
         const priceAUD  = currency === 'AUD' ? rawPrice : Math.round(rawPrice * usdToAud);
         return priceAUD;
       })
       .filter(p => p > 0)
       .sort((a, b) => a - b);
+
+    // Remove outliers — bottom 10% and top 5% to cut accessories/parts (too cheap) and bundles (too expensive)
+    const trimLow  = Math.floor(allPrices.length * 0.10);
+    const trimHigh = Math.floor(allPrices.length * 0.05);
+    const prices   = allPrices.slice(trimLow, allPrices.length - trimHigh || undefined);
+    console.log(`[eBay] "${keyword}" → ${allPrices.length} prices, ${prices.length} after trimming outliers`);
 
     if (!prices.length) {
       console.log(`[eBay] "${keyword}" → 0 sold prices after filtering`);
