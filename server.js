@@ -518,6 +518,19 @@ async function scrapeKeyword(keyword, opts = {}) {
         console.log(`[Apify] "${keyword}" — odometer found in cheap actor results, skipping detail actor`);
       }
     }
+    // Log date fields from first item so we can see what Apify actually returns
+    if (items.length > 0) {
+      const s = items[0];
+      console.log('[ApifyRaw] Date fields sample:', JSON.stringify({
+        creation_time:       s.creation_time,
+        listed_at:           s.listed_at,
+        listingCreationTime: s.listingCreationTime,
+        created_time:        s.created_time,
+        date:                s.date,
+        custom_sub_titles:   s.custom_sub_titles,
+        subtitle:            s.subtitle,
+      }));
+    }
     // TEMP: log raw first vehicle item so we can see what fields Apify returns
     if (items.length > 0 && isVehicleKeyword(keyword)) {
       const sample = items[0];
@@ -539,13 +552,47 @@ async function scrapeKeyword(keyword, opts = {}) {
     }
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
-      const rawListedAt = item.creation_time || item.listed_at || item.listingCreationTime
-        || item.listing_creation_time || item.created_time || item.date || null;
-      const listedAt = rawListedAt
-        ? (typeof rawListedAt === 'number'
-            ? new Date(rawListedAt * 1000).toISOString()
-            : new Date(rawListedAt).toISOString())
-        : new Date().toISOString();
+
+      // ── Robust listedAt parsing ───────────────────────────
+      // Apify returns dates in multiple formats; we try each in order of reliability
+      let listedAt = null;
+
+      // 1. Numeric unix timestamp — check if seconds or milliseconds
+      const tsRaw = item.creation_time || item.listed_at || item.listingCreationTime
+        || item.listing_creation_time || item.created_time || null;
+      if (tsRaw && typeof tsRaw === 'number') {
+        // Timestamps < 1e10 are seconds, >= 1e10 are milliseconds
+        const ms = tsRaw < 1e10 ? tsRaw * 1000 : tsRaw;
+        const d = new Date(ms);
+        if (d.getFullYear() >= 2020 && d <= new Date()) listedAt = d.toISOString();
+      }
+
+      // 2. String date field
+      if (!listedAt) {
+        const strRaw = item.date || item.listed_at_text || null;
+        if (strRaw && typeof strRaw === 'string') {
+          const d = new Date(strRaw);
+          if (!isNaN(d.getTime()) && d.getFullYear() >= 2020) listedAt = d.toISOString();
+        }
+      }
+
+      // 3. Parse relative time string from custom_sub_titles e.g. "Listed 3 hours ago", "Listed 2 days ago"
+      if (!listedAt) {
+        const subtitles = item.custom_sub_titles || item.subtitle || item.listing_subtitle || '';
+        const subText = Array.isArray(subtitles) ? subtitles.join(' ') : String(subtitles || '');
+        const relMatch = subText.match(/(\d+)\s*(second|minute|hour|day|week|month)s?\s*ago/i);
+        if (relMatch) {
+          const amt  = parseInt(relMatch[1]);
+          const unit = relMatch[2].toLowerCase();
+          const msMap = { second: 1000, minute: 60000, hour: 3600000, day: 86400000, week: 604800000, month: 2592000000 };
+          listedAt = new Date(Date.now() - amt * (msMap[unit] || 86400000)).toISOString();
+        }
+      }
+
+      // 4. Last resort — use foundAt (now). Flag it so we know it's unreliable.
+      const listedAtUnknown = !listedAt;
+      if (!listedAt) listedAt = new Date().toISOString();
+
       const title       = item.marketplace_listing_title || item.title || keyword;
       const description = item.redacted_description?.text || item.description || null;
       const isVehicle   = isVehicleListing(keyword, title, description);
@@ -561,6 +608,7 @@ async function scrapeKeyword(keyword, opts = {}) {
         description,
         keyword,
         listedAt,
+        listedAtUnknown, // true when we couldn't determine the actual listed date
         foundAt:  new Date().toISOString(),
         mileage:       isVehicle ? (extractMileageFromVehicleInfo(item) || extractMileage(title, description)) : null,
         year:          isVehicle ? (item.vehicle_info?.year || item.listing_vehicle_data?.year || extractYear(title, description)) : null,
@@ -906,7 +954,12 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
 
     if (!userListings.find(l => l.id === listing.id)) {
       userListings.unshift(listing);
-      userListings.sort((a, b) => new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt));
+      userListings.sort((a, b) => {
+        // Push listings with unknown dates to the bottom
+        if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
+        if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
+        return new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt);
+      });
       if (userListings.length > 500) userListings.length = 500;
     }
     newCount++;
@@ -980,9 +1033,11 @@ async function scanWatchItem(watcher, opts = {}) {
   // On initial scan: sort by listedAt and keep only the 20 most recent.
   // Everything older gets marked seen so it never surfaces on future scans.
   if (opts.initialScan && raw.length > 20) {
-    const sorted = [...raw].sort((a, b) =>
-      new Date(b.listedAt || b.foundAt || 0) - new Date(a.listedAt || a.foundAt || 0)
-    );
+    const sorted = [...raw].sort((a, b) => {
+      if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
+      if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
+      return new Date(b.listedAt || b.foundAt || 0) - new Date(a.listedAt || a.foundAt || 0);
+    });
     const keep   = sorted.slice(0, 20);
     const discard = sorted.slice(20);
     // Pre-mark discarded listings as seen so they never come back
@@ -1337,7 +1392,12 @@ app.get('/listings', authMiddleware, async (req, res) => {
       const sinceMs = new Date(since).getTime();
       if (!isNaN(sinceMs)) result = result.filter(l => new Date(l.foundAt).getTime() > sinceMs);
     }
-    result = [...result].sort((a, b) => new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt));
+    result = [...result].sort((a, b) => {
+        // Push listings with unknown dates to the bottom
+        if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
+        if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
+        return new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt);
+      });
     res.json(result);
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
@@ -1372,7 +1432,12 @@ app.post('/listings/unblock', authMiddleware, async (req, res) => {
     const listings = await getUserListings(req.userId);
     if (!listings.find(l => l.id === id)) {
       listings.unshift({ ...listing, foundAt: new Date().toISOString() });
-      listings.sort((a, b) => new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt));
+      listings.sort((a, b) => {
+        // Push listings with unknown dates to the bottom
+        if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
+        if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
+        return new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt);
+      });
       await saveUserListings(req.userId, listings);
     }
     res.json({ ok: true });
