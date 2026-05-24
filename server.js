@@ -91,9 +91,12 @@ const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
 
 // ── eBay price cache settings ─────────────────────────────
-const EBAY_CACHE_TTL_MS   = 48 * 60 * 60 * 1000; // 48 hours — minimise eBay API calls
-const EBAY_MIN_RESULTS    = 3;                     // need at least 3 sold prices to use data
-const OWN_PRICE_MIN       = 50;                    // need 50 of our own records before trusting it
+const EBAY_CACHE_TTL_MS      = 48 * 60 * 60 * 1000; // 48 hours — minimise eBay API calls
+const EBAY_MIN_RESULTS       = 3;                    // need at least 3 sold prices to use data
+const OWN_PRICE_MIN          = 50;                   // need 50 of our own records before trusting it
+const EBAY_RATE_LIMIT_KEY    = 'fr:ebay:rate-limited';
+const EBAY_RATE_LIMIT_TTL_MS = 60 * 60 * 1000;      // back off for 1 hour after a rate limit hit
+const EBAY_CONCURRENT_KEY    = 'fr:ebay:inflight';   // prevent concurrent fetches for same keyword
 
 // ── Owner account — always premium, no payment required ──
 const OWNER_EMAIL = 'giannimenolotto@gmail.com';
@@ -192,6 +195,24 @@ async function getEbaySoldPrices(keyword) {
     return cached;
   }
 
+  // Check server-wide rate limit cooldown — if we got a 10001 recently, don't retry yet
+  const rateLimited = await redisGet(EBAY_RATE_LIMIT_KEY);
+  if (rateLimited) {
+    const elapsed = Date.now() - new Date(rateLimited.since).getTime();
+    const remaining = Math.ceil((EBAY_RATE_LIMIT_TTL_MS - elapsed) / 60000);
+    console.warn(`[eBay] Server-wide rate limit cooldown active — ${remaining}m remaining, skipping fetch for "${keyword}"`);
+    return null;
+  }
+
+  // Prevent concurrent fetches for the same keyword (stampede protection)
+  const inflightKey = `${EBAY_CONCURRENT_KEY}:${keyword.toLowerCase().trim()}`;
+  const inflight = await redisGet(inflightKey);
+  if (inflight) {
+    console.log(`[eBay] Fetch already in flight for "${keyword}", skipping duplicate`);
+    return null;
+  }
+  await redisSet(inflightKey, { since: new Date().toISOString() });
+
   // Fetch from eBay AU Finding API — no cost per call
   try {
     const buildUrl = (page) => `https://svcs.ebay.com/services/search/FindingService/v1` +
@@ -216,7 +237,10 @@ async function getEbaySoldPrices(keyword) {
     if (ack === 'Failure') {
       const errId = res1.data?.findCompletedItemsResponse?.[0]?.errorMessage?.[0]?.error?.[0]?.errorId?.[0];
       if (errId === '10001') {
-        console.error(`[eBay] Rate limited — backing off for this keyword`);
+        // Set server-wide cooldown so ALL keywords back off for 1 hour
+        await redisSet(EBAY_RATE_LIMIT_KEY, { since: new Date().toISOString() });
+        await redisDel(inflightKey);
+        console.error(`[eBay] Rate limited (10001) — server-wide cooldown set for 1 hour`);
         return null;
       }
     }
@@ -276,9 +300,11 @@ async function getEbaySoldPrices(keyword) {
     };
 
     await redisSet(K.ebay(keyword), result);
+    await redisDel(inflightKey); // release inflight lock
     console.log(`[eBay] "${keyword}" → ${prices.length} sold prices in AUD, median $${result.median} (rate: ${usdToAud})`);
     return result;
   } catch (e) {
+    await redisDel(inflightKey).catch(() => {}); // always release inflight lock on error
     console.error(`[eBay] Error for "${keyword}":`, e.response?.status, e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : e.message);
     return null;
   }
