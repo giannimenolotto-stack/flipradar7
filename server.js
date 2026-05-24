@@ -442,8 +442,9 @@ const APIFY_ACTOR_DETAIL = 'data-slayer~facebook-marketplace-details';  // expen
 
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
-  // If we need backfill (less than 20 results expected), look back further
-  const days      = opts.backfillDays || (opts.backfill ? 14 : (opts.initialScan ? 7 : 1));
+  // Initial scan looks back 30 days, fetches up to 50, then we trim to the 20 most recent.
+  // Regular scans only look back 1 day and fetch 25.
+  const days      = opts.backfillDays || (opts.backfill ? 30 : (opts.initialScan ? 30 : 1));
   const maxItems  = opts.initialScan ? 50 : 25;
   // Use isVehicleKeyword (keyword only) — not isVehicleListing which checks descriptions
   // This prevents "callaway golf clubs" triggering vehicle mode
@@ -858,12 +859,32 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
   }
 
   let seenSkipped = 0;
+  // On regular scans (after initial scan completed), drop any listing that was
+  // posted before the initial scan finished — those should have been caught then.
+  // This stops old listings trickling in on every 30-min scan.
+  const initialScanCutoff = watcher.initialScanCompletedAt
+    ? new Date(watcher.initialScanCompletedAt).getTime()
+    : null;
+
   for (const listing of relevant) {
     const key    = `${keyword}:${listing.id}`;
     const seenTs = seen[key];
     if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS) { seenSkipped++; continue; }
     if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
     if (watcher.minPrice && listing.price < watcher.minPrice) continue;
+
+    // On regular scans: drop listings posted before the initial scan completed.
+    // Backfill already covered everything older — this blocks old listings
+    // from trickling in on subsequent 30-min scans.
+    if (initialScanCutoff && !opts.initialScan && !opts.backfill) {
+      const listedTs = listing.listedAt ? new Date(listing.listedAt).getTime() : null;
+      if (listedTs && listedTs < initialScanCutoff) {
+        // Still mark as seen so it doesn't keep being evaluated
+        seen[key] = Date.now();
+        continue;
+      }
+    }
+
     seen[key] = Date.now();
 
     storeScanPrice(keyword, listing).catch(() => {});
@@ -940,6 +961,23 @@ async function scanWatchItem(watcher, opts = {}) {
   // ── Distribute to this user ───────────────────────────────
   // Safety net — ensure raw is always an array
   if (!Array.isArray(raw)) raw = [];
+
+  // On initial scan: sort by listedAt and keep only the 20 most recent.
+  // Everything older gets marked seen so it never surfaces on future scans.
+  if (opts.initialScan && raw.length > 20) {
+    const sorted = [...raw].sort((a, b) =>
+      new Date(b.listedAt || b.foundAt || 0) - new Date(a.listedAt || a.foundAt || 0)
+    );
+    const keep   = sorted.slice(0, 20);
+    const discard = sorted.slice(20);
+    // Pre-mark discarded listings as seen so they never come back
+    const seen = await getUserSeen(watcher.userId);
+    for (const l of discard) seen[`${keyword}:${l.id}`] = Date.now();
+    await saveUserSeen(watcher.userId, seen);
+    raw = keep;
+    console.log(`[InitialScan] "${keyword}" → kept 20 most recent, pre-marked ${discard.length} older listings as seen`);
+  }
+
   const { newCount, userListings } = await distributeListingsToUser(watcher, raw, opts);
 
   // ── Vehicle detail fallback ───────────────────────────────
@@ -979,27 +1017,9 @@ async function scanWatchItem(watcher, opts = {}) {
     }
   }
 
-  // ── Backfill if not enough listings ─────────────────────
-  // Keep looking back further until we have at least 20 listings in the feed
-  const BACKFILL_TARGET = 20;
-  const BACKFILL_WINDOWS = [14, 30, 60]; // days to look back on each attempt
-
-  let totalUserListings = (await getUserListings(watcher.userId)).filter(l => l.keyword === keyword).length;
-
-  for (const days of BACKFILL_WINDOWS) {
-    if (totalUserListings >= BACKFILL_TARGET) break;
-    console.log(`[Backfill] "${keyword}" has ${totalUserListings} listings — fetching up to ${days} days old`);
-    const backfillRaw = await scrapeKeyword(keyword, {
-      city: watcher.location, lat: watcher.lat, lng: watcher.lng,
-      radius: watcher.radius, backfill: true, backfillDays: days
-    });
-    if (backfillRaw.length > 0) {
-      await redisSet(K.sharedScan(keyword), { listings: backfillRaw, scannedAt: new Date().toISOString() });
-      const { newCount: backfillCount } = await distributeListingsToUser(watcher, backfillRaw);
-      console.log(`[Backfill] "${keyword}" → ${backfillCount} listings added (${days} day window)`);
-      totalUserListings = (await getUserListings(watcher.userId)).filter(l => l.keyword === keyword).length;
-    }
-    await sleep(1000); // small delay between backfill attempts
+  // Mark initial scan complete — regular scans will filter by listedAt after this timestamp
+  if (opts.initialScan) {
+    watcher.initialScanCompletedAt = new Date().toISOString();
   }
 
   watcher.lastScanned = new Date().toISOString();
