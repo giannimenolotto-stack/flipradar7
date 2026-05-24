@@ -1786,6 +1786,22 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
   }
 });
 
+// ── DEV: force-set plan (secret-gated, remove before public launch) ──
+// POST /dev/set-plan  { secret: "...", plan: "premium" }
+const DEV_SECRET = process.env.DEV_SECRET || 'flipradar-dev';
+app.post('/dev/set-plan', authMiddleware, async (req, res) => {
+  const { secret, plan } = req.body;
+  if (secret !== DEV_SECRET) return res.status(403).json({ error: 'Forbidden' });
+  const validPlans = ['free', 'basic', 'premium'];
+  if (!validPlans.includes(plan)) return res.status(400).json({ error: 'plan must be free, basic, or premium' });
+  const user = await getUser(req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.plan = plan;
+  await saveUser(user);
+  console.log(`[Dev] Set plan for ${user.email} → ${plan}`);
+  res.json({ ok: true, plan });
+});
+
 // ── Start ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
