@@ -199,6 +199,8 @@ async function getEbaySoldPrices(keyword) {
       `&SERVICE-VERSION=1.0.0` +
       `&SECURITY-APPNAME=${EBAY_APP_ID}` +
       `&RESPONSE-DATA-FORMAT=JSON` +
+      `&GLOBAL-ID=EBAY-AU` +
+      `&siteid=15` +
       `&keywords=${encodeURIComponent(keyword)}` +
       `&itemFilter(0).name=SoldItemsOnly&itemFilter(0).value=true` +
       `&sortOrder=EndTimeSoonest` +
@@ -1815,6 +1817,14 @@ app.post('/auth/appraisal', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ── Web Push (VAPID) ──────────────────────────────────────
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
+const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
+
+// Redis key for push subscriptions
+const K_push = userId => `fr:push:${userId}`;
+
 // ── Web Push notification sender ─────────────────────────
 async function sendWebPush(userId, payload) {
   if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
@@ -1870,14 +1880,6 @@ app.get('/push/vapid-key', (req, res) => {
 // ── AI proxy routes — keys live on server, never in browser ──
 const GEMINI_API_KEY    = process.env.GEMINI_API_KEY    || null;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
-
-// ── Web Push (VAPID) ──────────────────────────────────────
-const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
-const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
-
-// Redis key for push subscriptions
-const K_push = userId => `fr:push:${userId}`;
 
 // POST /ai/image — image scan via Gemini Flash
 // Body: { parts: [ { inline_data: { mime_type, data } }, { text: prompt } ] }
