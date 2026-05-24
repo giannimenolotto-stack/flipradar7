@@ -489,51 +489,74 @@ async function scrapeKeyword(keyword, opts = {}) {
     let items      = allItems.slice(0, maxItems);
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
 
-    // ── Vehicle detail fallback ───────────────────────────
-    // For vehicle keywords: always use the detail actor on initial scan.
-    // On recurring scans: only use it if cheap actor returned no odometer data.
+    // For initial scans, pre-sort and trim to 20 BEFORE enrichment so we don't
+    // waste data-slayer calls on listings we'll discard anyway
+    if (opts.initialScan && items.length > 20) {
+      items = [...items].sort((a, b) => {
+        const ta = a.creation_time ? (a.creation_time < 1e10 ? a.creation_time * 1000 : a.creation_time) : 0;
+        const tb = b.creation_time ? (b.creation_time < 1e10 ? b.creation_time * 1000 : b.creation_time) : 0;
+        return tb - ta;
+      }).slice(0, 20);
+      console.log(`[Apify] "${keyword}" — pre-trimmed to ${items.length} most recent for enrichment`);
+    }
+
+    // ── Vehicle keywords: enrich with data-slayer ─────────
+    // data-slayer takes a single listingId and returns full vehicle specs.
+    // We call it for each listing in parallel batches after the cheap actor search.
     if (vehicleMode && items.length > 0) {
-      const hasOdo = items.some(i => {
-        const vi = i.vehicle_info || i.listing_vehicle_data || i.vehicleInfo || {};
-        return i.vehicle_odometer_data || vi.odometer || vi.mileage || vi.kilometers || i.odometer || i.mileage;
-      });
-      const shouldUseDetailActor = !hasOdo; // always retry if no odo data found
-      if (shouldUseDetailActor) {
-        console.log(`[Apify] "${keyword}" — no odometer data from cheap actor, fetching details via data-slayer`);
+      const hasOdo = items.some(i => i.vehicle_odometer_data || i.odometer || i.mileage);
+      if (!hasOdo) {
+        console.log(`[Apify] "${keyword}" — enriching ${items.length} listings via data-slayer`);
         try {
-          // data-slayer takes individual listingId — run in parallel batches of 5
-          const ids = items.map(i => i.id || i.listingId || String(i.marketplace_listing_id || '')).filter(Boolean);
           const batchSize = 5;
-          const detailResults = [];
-          for (let i = 0; i < ids.length; i += batchSize) {
-            const batch = ids.slice(i, i + batchSize);
-            const batchRes = await Promise.all(batch.map(listingId =>
-              axios.post(
-                `https://api.apify.com/v2/acts/${APIFY_ACTOR_DETAIL}/run-sync-get-dataset-items`,
-                { listingId },
-                { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
-              ).then(r => Array.isArray(r.data) ? r.data[0] : null).catch(() => null)
-            ));
-            detailResults.push(...batchRes.filter(Boolean));
-            if (i + batchSize < ids.length) await sleep(500);
+          const detailMap = {};
+          for (let b = 0; b < items.length; b += batchSize) {
+            const batch = items.slice(b, b + batchSize);
+            await Promise.all(batch.map(async item => {
+              const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
+              if (!listingId) return;
+              try {
+                const r = await axios.post(
+                  `https://api.apify.com/v2/acts/${APIFY_ACTOR_DETAIL}/run-sync-get-dataset-items`,
+                  { listingId },
+                  { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 90000 }
+                );
+                const rows = Array.isArray(r.data) ? r.data.filter(x => !x.error) : [];
+                if (rows[0]) detailMap[listingId] = rows[0];
+              } catch (e) {
+                console.error(`[DataSlayer] Failed for listingId ${listingId}:`, e.message);
+              }
+            }));
+            if (b + batchSize < items.length) await sleep(500);
           }
-          if (detailResults.length > 0) {
-            // Merge detail fields back onto cheap actor items (cheap actor has better search results/images)
+          const enriched = Object.keys(detailMap).length;
+          console.log(`[DataSlayer] Enriched ${enriched}/${items.length} listings`);
+          if (enriched > 0) {
+            // Log first result so we can verify field names
+            const sample = Object.values(detailMap)[0];
+            console.log('[DataSlayer] KEYS:', Object.keys(sample).join(', '));
+            console.log('[DataSlayer] VEHICLE FIELDS:', JSON.stringify({
+              vehicle_make_display_name:  sample.vehicle_make_display_name,
+              vehicle_model_display_name: sample.vehicle_model_display_name,
+              vehicle_odometer_data:      sample.vehicle_odometer_data,
+              vehicle_transmission_type:  sample.vehicle_transmission_type,
+              vehicle_fuel_type:          sample.vehicle_fuel_type,
+              vehicle_exterior_color:     sample.vehicle_exterior_color,
+              vehicle_seller_type:        sample.vehicle_seller_type,
+              condition:                  sample.condition,
+            }));
+            // Merge detail fields onto each item
             items = items.map(item => {
-              const itemId = item.id || item.listingId || String(item.marketplace_listing_id || '');
-              const detail = detailResults.find(d => d.id === itemId || d.listing_id === itemId);
+              const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
+              const detail = detailMap[listingId];
               return detail ? { ...item, ...detail } : item;
             });
-            console.log(`[Apify] "${keyword}" — merged details for ${detailResults.length}/${items.length} listings`);
-            const s = detailResults[0];
-            console.log('[DetailActorRaw] ALL KEYS:', Object.keys(s).join(', '));
-            console.log('[DetailActorRaw] FULL ITEM:', JSON.stringify(s).slice(0, 2000));
           }
         } catch (detailErr) {
-          console.error(`[Apify] Detail actor fallback failed for "${keyword}":`, detailErr.message);
+          console.error(`[DataSlayer] Batch error for "${keyword}":`, detailErr.message);
         }
       } else {
-        console.log(`[Apify] "${keyword}" — odometer found in cheap actor results, skipping detail actor`);
+        console.log(`[Apify] "${keyword}" — odometer already present, skipping data-slayer`);
       }
     }
     // Log date fields from first item so we can see what Apify actually returns
@@ -616,18 +639,21 @@ async function scrapeKeyword(keyword, opts = {}) {
       const listedAtUnknown = !listedAt;
       if (!listedAt) listedAt = new Date().toISOString();
 
-      const title       = item.marketplace_listing_title || item.title || keyword;
+      const title       = item.marketplace_listing_title || item.custom_title || item.title || keyword;
       const description = item.redacted_description?.text || item.description || null;
       const isVehicle   = isVehicleListing(keyword, title, description);
-      const rawPrice = parsePrice(item.listing_price?.amount || item.listing_price?.formatted_amount || item.price);
+      const rawPrice = parsePrice(
+        item.listing_price?.amount || item.listing_price?.formatted_amount ||
+        item.formatted_price || item.price
+      );
       return {
         id,
         title,
         price:       rawPrice,
         isOfferPrice: isOfferPrice(rawPrice),
-        url:         item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
+        url:         item.share_uri || item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
         image:       item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
-        location:    typeof item.location === 'string' ? item.location : (item.location?.reverse_geocode?.city || null),
+        location:    item.location_text || (typeof item.location === 'string' ? item.location : (item.location?.reverse_geocode?.city || null)),
         description,
         keyword,
         listedAt,
