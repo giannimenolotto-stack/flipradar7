@@ -111,6 +111,7 @@ function getEffectivePlan(userOrWatcher) {
 }
 
 
+function makeToken(userId) {
   return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '90d' });
 }
 function verifyToken(token) {
