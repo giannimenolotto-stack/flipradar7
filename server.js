@@ -455,11 +455,14 @@ async function scrapeKeyword(keyword, opts = {}) {
   const searchQuery = keyword.includes(' ') ? `"${keyword}"` : keyword;
 
   let fbUrl;
+  // Add vehicle category for vehicle keywords — this makes FB return structured vehicle data
+  const vehicleCategory = vehicleMode ? '&categoryID=vehicles' : '';
+
   if (opts.lat && opts.lng) {
-    fbUrl = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(searchQuery)}&latitude=${opts.lat}&longitude=${opts.lng}&radius=${opts.radius||50}&sortBy=creation_time_descend&daysSinceListed=${days}`;
+    fbUrl = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(searchQuery)}&latitude=${opts.lat}&longitude=${opts.lng}&radius=${opts.radius||50}&sortBy=creation_time_descend&daysSinceListed=${days}${vehicleCategory}`;
   } else {
     const city = (opts.city || 'melbourne').toLowerCase().replace(/\s+/g, '');
-    fbUrl = `https://www.facebook.com/marketplace/${city}/search/?query=${encodeURIComponent(searchQuery)}&sortBy=creation_time_descend&daysSinceListed=${days}`;
+    fbUrl = `https://www.facebook.com/marketplace/${city}/search/?query=${encodeURIComponent(searchQuery)}&sortBy=creation_time_descend&daysSinceListed=${days}${vehicleCategory}`;
   }
   try {
     const res = await axios.post(
@@ -474,21 +477,28 @@ async function scrapeKeyword(keyword, opts = {}) {
     // TEMP: log raw first vehicle item so we can see what fields Apify returns
     if (items.length > 0 && isVehicleKeyword(keyword)) {
       const sample = items[0];
-      console.log('[ApifyRaw] Sample vehicle listing fields:', JSON.stringify({
+      // Log ALL keys so we can see exactly what the actor returns
+      const allKeys = Object.keys(sample);
+      console.log('[ApifyRaw] All keys returned:', allKeys.join(', '));
+      console.log('[ApifyRaw] Vehicle fields:', JSON.stringify({
         vehicle_info:         sample.vehicle_info,
         vehicleInfo:          sample.vehicleInfo,
         listing_vehicle_data: sample.listing_vehicle_data,
         custom_sub_titles:    sample.custom_sub_titles,
         additional_info:      sample.additional_info,
         attributes:           sample.attributes,
+        specs:                sample.specs,
+        details:              sample.details,
         odometer:             sample.odometer,
         mileage:              sample.mileage,
         year:                 sample.year,
         make:                 sample.make,
+        model:                sample.model,
         transmission:         sample.transmission,
         fuel_type:            sample.fuel_type,
         exterior_color:       sample.exterior_color,
-      }).slice(0, 1000));
+        listing_details:      sample.listing_details,
+      }).slice(0, 2000));
     }
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
