@@ -95,7 +95,22 @@ const EBAY_CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours — 1 eBay call per
 const EBAY_MIN_RESULTS    = 5;                     // need at least 5 sold prices to skip AI
 const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
 
-function makeToken(userId) {
+// ── Owner account — always premium, no payment required ──
+const OWNER_EMAIL = 'giannimenolotto@gmail.com';
+let ownerUserId = null; // resolved at boot
+function isOwner(userOrWatcher) {
+  if (!userOrWatcher) return false;
+  if (userOrWatcher.email && userOrWatcher.email.toLowerCase() === OWNER_EMAIL) return true;
+  if (ownerUserId && userOrWatcher.userId === ownerUserId) return true;
+  return false;
+}
+// Use this everywhere instead of user.plan — owner always gets premium
+function getEffectivePlan(userOrWatcher) {
+  if (isOwner(userOrWatcher)) return 'premium';
+  return userOrWatcher?.plan || 'free';
+}
+
+
   return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '90d' });
 }
 function verifyToken(token) {
@@ -1033,7 +1048,7 @@ const watchTimers = {};
 
 function startWatchTimer(watcher) {
   if (watchTimers[watcher.id]) clearInterval(watchTimers[watcher.id]);
-  const interval = PLAN_INTERVALS[watcher.plan] || PLAN_INTERVALS.basic;
+  const interval = PLAN_INTERVALS[getEffectivePlan(watcher)] || PLAN_INTERVALS.basic;
   console.log(`[Timer] "${watcher.keyword}" every ${interval/60000}m (${watcher.plan||'basic'})`);
   watchTimers[watcher.id] = setInterval(() => {
     scanWatchItem(watcher).catch(e => console.error(`[Timer] Error for "${watcher.keyword}":`, e.message));
@@ -1066,6 +1081,10 @@ cron.schedule('0 3 * * *', () => pauseInactiveUsers().catch(e => console.error('
 
 // ── Boot: load all watches from Redis ─────────────────────
 async function loadAllWatches() {
+  // Resolve owner userId so watcher-level plan checks work
+  const ownerUid = await redisGet(K.emailIdx(OWNER_EMAIL));
+  if (ownerUid) { ownerUserId = ownerUid; console.log(`[Boot] Owner account resolved: ${ownerUid}`); }
+
   const allIds = await redisGet('fr:all-watch-ids') || [];
   const watches = await Promise.all(allIds.map(getWatch));
   watchlist = watches.filter(Boolean);
@@ -1224,7 +1243,7 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     if (!keyword || keyword.trim().length < 2)
       return res.status(400).json({ error: 'Keyword required' });
     const user = await getUser(req.userId);
-    const planLimit = PLAN_WATCHLIST_LIMITS[user?.plan || 'free'];
+    const planLimit = PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)];
     const existingWatches = await getUserWatches(req.userId);
     if (existingWatches.length >= planLimit)
       return res.status(403).json({ error: 'Watchlist limit reached for your plan', plan: user?.plan, limit: planLimit });
@@ -1401,7 +1420,7 @@ app.post('/appraise', authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today = new Date().toISOString().slice(0, 10);
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
-    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
 
@@ -1577,12 +1596,12 @@ app.get('/auth/plan', authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today    = new Date().toISOString().slice(0, 10);
     const appraised = user.appraisalDate === today ? (user.appraisalsToday || 0) : 0;
-    const limit     = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    const limit     = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     res.json({
       plan: user.plan || 'free',
       appraisalsUsedToday: appraised,
       appraisalsLimit:     limit === Infinity ? -1 : limit,
-      watchlistLimit:      PLAN_WATCHLIST_LIMITS[user.plan || 'free'],
+      watchlistLimit:      PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
     });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
@@ -1593,7 +1612,7 @@ app.post('/auth/appraisal', authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today = new Date().toISOString().slice(0, 10);
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
-    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
@@ -1679,7 +1698,7 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today = new Date().toISOString().slice(0, 10);
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
-    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
@@ -1711,7 +1730,7 @@ app.post('/ai/text', authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today = new Date().toISOString().slice(0, 10);
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
-    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
@@ -1750,7 +1769,7 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today = new Date().toISOString().slice(0, 10);
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
-    const limit = PLAN_APPRAISAL_LIMITS[user.plan || 'free'];
+    const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
