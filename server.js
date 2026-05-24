@@ -93,7 +93,7 @@ const BCRYPT_ROUNDS = 10;
 // ── eBay price cache settings ─────────────────────────────
 const EBAY_CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours — 1 eBay call per keyword per day max
 const EBAY_MIN_RESULTS    = 3;                     // need at least 3 sold prices to use data
-const OWN_PRICE_MIN       = 5;                     // need 5 of our own records to use
+const OWN_PRICE_MIN       = 50;                    // need 50 of our own records before trusting it
 
 // ── Owner account — always premium, no payment required ──
 const OWNER_EMAIL = 'giannimenolotto@gmail.com';
@@ -247,8 +247,8 @@ async function getEbaySoldPrices(keyword) {
       .filter(p => p > 0)
       .sort((a, b) => a - b);
 
-    // Remove outliers — bottom 10% and top 5% to cut accessories/parts (too cheap) and bundles (too expensive)
-    const trimLow  = Math.floor(allPrices.length * 0.10);
+    // Remove outliers — bottom 15% and top 5% to cut accessories/parts and bundles
+    const trimLow  = Math.floor(allPrices.length * 0.15);
     const trimHigh = Math.floor(allPrices.length * 0.05);
     const prices   = allPrices.slice(trimLow, allPrices.length - trimHigh || undefined);
     console.log(`[eBay] "${keyword}" → ${allPrices.length} prices, ${prices.length} after trimming outliers`);
@@ -305,7 +305,9 @@ async function storeScanPrice(keyword, listing) {
 async function getOwnPriceRange(keyword) {
   const records = await redisGet(K.prices(keyword)) || [];
   if (records.length < OWN_PRICE_MIN) return null;
-  const prices = records.map(r => r.price).filter(Boolean).sort((a, b) => a - b);
+  // Filter out obvious junk — anything under $10 is likely an accessory or error
+  const prices = records.map(r => r.price).filter(p => p >= 10).sort((a, b) => a - b);
+  if (prices.length < OWN_PRICE_MIN) return null;
   return {
     prices,
     low:    prices[0],
