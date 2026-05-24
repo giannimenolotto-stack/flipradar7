@@ -1031,21 +1031,29 @@ async function scanWatchItem(watcher, opts = {}) {
   if (!Array.isArray(raw)) raw = [];
 
   // On initial scan: sort by listedAt and keep only the 20 most recent.
-  // Everything older gets marked seen so it never surfaces on future scans.
+  // Only pre-mark the older ones as seen if this keyword has NEVER been scanned before.
+  // If the user deleted and re-added the keyword, show everything fresh — no pre-marking.
   if (opts.initialScan && raw.length > 20) {
     const sorted = [...raw].sort((a, b) => {
       if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
       if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
       return new Date(b.listedAt || b.foundAt || 0) - new Date(a.listedAt || a.foundAt || 0);
     });
-    const keep   = sorted.slice(0, 20);
+    const keep    = sorted.slice(0, 20);
     const discard = sorted.slice(20);
-    // Pre-mark discarded listings as seen so they never come back
-    const seen = await getUserSeen(watcher.userId);
-    for (const l of discard) seen[`${keyword}:${l.id}`] = Date.now();
-    await saveUserSeen(watcher.userId, seen);
+    // Only pre-mark if this is a genuinely fresh keyword (never scanned before).
+    // watcher.lastScanned will be null on first-ever add; re-adds may have stale data
+    // but the seen cache was cleared when the watch was deleted so it's safe not to pre-mark.
+    const isFirstEver = !watcher.lastScanned;
+    if (isFirstEver) {
+      const seen = await getUserSeen(watcher.userId);
+      for (const l of discard) seen[`${keyword}:${l.id}`] = Date.now();
+      await saveUserSeen(watcher.userId, seen);
+      console.log(`[InitialScan] "${keyword}" → kept 20 most recent, pre-marked ${discard.length} older listings as seen`);
+    } else {
+      console.log(`[InitialScan] "${keyword}" → kept 20 most recent, skipped pre-marking (re-add)`);
+    }
     raw = keep;
-    console.log(`[InitialScan] "${keyword}" → kept 20 most recent, pre-marked ${discard.length} older listings as seen`);
   }
 
   const { newCount, userListings } = await distributeListingsToUser(watcher, raw, opts);
@@ -1376,7 +1384,14 @@ app.delete('/watchlist/:id', authMiddleware, async (req, res) => {
     const blocked = await redisGet(K.blocked(req.userId)) || [];
     const remaining = blocked.filter(l => l.keyword !== keyword);
     await redisSet(K.blocked(req.userId), remaining);
-    console.log(`[Watch] Deleted "${keyword}" — cleared ${blocked.length - remaining.length} blocked listings`);
+
+    // Clear seen cache entries for this keyword so re-adding starts truly fresh
+    const seen = await getUserSeen(req.userId);
+    const prefix = `${keyword}:`;
+    const prunedSeen = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
+    await saveUserSeen(req.userId, prunedSeen);
+    const clearedSeen = Object.keys(seen).length - Object.keys(prunedSeen).length;
+    console.log(`[Watch] Deleted "${keyword}" — cleared ${blocked.length - remaining.length} blocked, ${clearedSeen} seen entries`);
 
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
