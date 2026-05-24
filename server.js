@@ -182,33 +182,33 @@ async function saveUserSeen(userId, seen) {
 }
 
 // ── eBay sold price cache (FREE — official eBay API) ──────
-// Sign up free at developer.ebay.com, grab your App ID
-// One call per keyword per 24h max — shared across ALL users
 async function getEbaySoldPrices(keyword) {
   if (!EBAY_APP_ID) return null;
 
   // Serve from cache if fresh
   const cached = await redisGet(K.ebay(keyword));
   if (cached && (Date.now() - new Date(cached.fetchedAt).getTime()) < EBAY_CACHE_TTL_MS) {
-    console.log(`[eBay] "${keyword}" → cache hit (${cached.count} prices)`);
+    console.log(`[eBay] "${keyword}" → cache hit (${cached.count} prices, median $${cached.median})`);
     return cached;
   }
 
-  // Fetch from eBay Finding API (free, no cost per call)
+  // Fetch from eBay AU Finding API — no cost per call
   try {
-    const url = `https://svcs.ebay.com/services/search/FindingService/v1` +
+    const url = `https://svcs.ebay.com.au/services/search/FindingService/v1` +
       `?OPERATION-NAME=findCompletedItems` +
       `&SERVICE-VERSION=1.0.0` +
       `&SECURITY-APPNAME=${EBAY_APP_ID}` +
       `&RESPONSE-DATA-FORMAT=JSON` +
+      `&GLOBAL-ID=EBAY-AU` +
       `&keywords=${encodeURIComponent(keyword)}` +
       `&itemFilter(0).name=SoldItemsOnly&itemFilter(0).value=true` +
-      `&itemFilter(1).name=ListingType&itemFilter(1).value=AuctionWithBIN` +
       `&sortOrder=EndTimeSoonest` +
-      `&paginationInput.entriesPerPage=50`;
+      `&paginationInput.entriesPerPage=100`;
 
-    const res   = await axios.get(url, { timeout: 10000 });
+    console.log(`[eBay] Fetching AU sold prices for "${keyword}"...`);
+    const res   = await axios.get(url, { timeout: 15000 });
     const items = res.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+    console.log(`[eBay] "${keyword}" → ${items.length} raw results from API`);
 
     const prices = items
       .map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0))
@@ -216,7 +216,7 @@ async function getEbaySoldPrices(keyword) {
       .sort((a, b) => a - b);
 
     if (!prices.length) {
-      console.log(`[eBay] "${keyword}" → 0 sold results`);
+      console.log(`[eBay] "${keyword}" → 0 sold prices after filtering`);
       return null;
     }
 
@@ -232,10 +232,10 @@ async function getEbaySoldPrices(keyword) {
     };
 
     await redisSet(K.ebay(keyword), result);
-    console.log(`[eBay] "${keyword}" → ${prices.length} sold prices, median $${result.median}`);
+    console.log(`[eBay] "${keyword}" → ${prices.length} AU sold prices, median $${result.median}`);
     return result;
   } catch (e) {
-    console.error(`[eBay] Error for "${keyword}":`, e.message);
+    console.error(`[eBay] Error for "${keyword}":`, e.response?.status, e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : e.message);
     return null;
   }
 }
@@ -1539,11 +1539,12 @@ app.post('/listings/remove', authMiddleware, async (req, res) => {
 });
 
 // ── Price cache route — lets frontend check before triggering AI ──
-// GET /prices?keyword=ps5
+// GET /prices?keyword=ps5&refresh=1  (refresh=1 busts the eBay cache for testing)
 app.get('/prices', authMiddleware, async (req, res) => {
   try {
-    const { keyword } = req.query;
+    const { keyword, refresh } = req.query;
     if (!keyword) return res.status(400).json({ error: 'keyword required' });
+    if (refresh === '1') await redisDel(K.ebay(keyword.toLowerCase().trim()));
     const priceData = await getPriceCacheForKeyword(keyword);
     if (!priceData) return res.json({ found: false, keyword });
     res.json({ found: true, keyword, ...priceData });
