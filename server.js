@@ -471,6 +471,25 @@ async function scrapeKeyword(keyword, opts = {}) {
     const allItems = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
     const items    = allItems.slice(0, maxItems);
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
+    // TEMP: log raw first vehicle item so we can see what fields Apify returns
+    if (items.length > 0 && isVehicleKeyword(keyword)) {
+      const sample = items[0];
+      console.log('[ApifyRaw] Sample vehicle listing fields:', JSON.stringify({
+        vehicle_info:         sample.vehicle_info,
+        vehicleInfo:          sample.vehicleInfo,
+        listing_vehicle_data: sample.listing_vehicle_data,
+        custom_sub_titles:    sample.custom_sub_titles,
+        additional_info:      sample.additional_info,
+        attributes:           sample.attributes,
+        odometer:             sample.odometer,
+        mileage:              sample.mileage,
+        year:                 sample.year,
+        make:                 sample.make,
+        transmission:         sample.transmission,
+        fuel_type:            sample.fuel_type,
+        exterior_color:       sample.exterior_color,
+      }).slice(0, 1000));
+    }
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
       const rawListedAt = item.creation_time || item.listed_at || item.listingCreationTime
