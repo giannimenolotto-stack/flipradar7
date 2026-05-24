@@ -442,7 +442,7 @@ const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
   // If we need backfill (less than 20 results expected), look back further
-  const days      = opts.backfill ? 14 : (opts.initialScan ? 7 : 1);
+  const days      = opts.backfillDays || (opts.backfill ? 14 : (opts.initialScan ? 7 : 1));
   const maxItems  = opts.initialScan ? 50 : 25;
   // Use isVehicleKeyword (keyword only) — not isVehicleListing which checks descriptions
   // This prevents "callaway golf clubs" triggering vehicle mode
@@ -908,19 +908,26 @@ async function scanWatchItem(watcher, opts = {}) {
   }
 
   // ── Backfill if not enough listings ─────────────────────
-  // If less than 20 new listings found, run a second scan looking back 14 days
-  const totalUserListings = (await getUserListings(watcher.userId)).filter(l => l.keyword === keyword).length;
-  if (totalUserListings < 20) {
-    console.log(`[Backfill] "${keyword}" only has ${totalUserListings} listings — fetching older ones`);
+  // Keep looking back further until we have at least 20 listings in the feed
+  const BACKFILL_TARGET = 20;
+  const BACKFILL_WINDOWS = [14, 30, 60]; // days to look back on each attempt
+
+  let totalUserListings = (await getUserListings(watcher.userId)).filter(l => l.keyword === keyword).length;
+
+  for (const days of BACKFILL_WINDOWS) {
+    if (totalUserListings >= BACKFILL_TARGET) break;
+    console.log(`[Backfill] "${keyword}" has ${totalUserListings} listings — fetching up to ${days} days old`);
     const backfillRaw = await scrapeKeyword(keyword, {
       city: watcher.location, lat: watcher.lat, lng: watcher.lng,
-      radius: watcher.radius, backfill: true
+      radius: watcher.radius, backfill: true, backfillDays: days
     });
     if (backfillRaw.length > 0) {
       await redisSet(K.sharedScan(keyword), { listings: backfillRaw, scannedAt: new Date().toISOString() });
       const { newCount: backfillCount } = await distributeListingsToUser(watcher, backfillRaw);
-      console.log(`[Backfill] "${keyword}" → ${backfillCount} older listings added`);
+      console.log(`[Backfill] "${keyword}" → ${backfillCount} listings added (${days} day window)`);
+      totalUserListings = (await getUserListings(watcher.userId)).filter(l => l.keyword === keyword).length;
     }
+    await sleep(1000); // small delay between backfill attempts
   }
 
   watcher.lastScanned = new Date().toISOString();
