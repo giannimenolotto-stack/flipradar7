@@ -542,27 +542,40 @@ async function scrapeKeyword(keyword, opts = {}) {
 async function scrapeListingDetail(listingUrl) {
   if (!APIFY_TOKEN) return null;
   try {
+    // Extract listing ID from URL — data-slayer needs just the ID
+    const idMatch = listingUrl.match(/\/item\/(\d+)/);
+    const listingId = idMatch ? idMatch[1] : null;
+    if (!listingId) return null;
+
+    // Use data-slayer/facebook-marketplace-details — returns structured vehicle specs
+    // including odometer, transmission, fuel type, colours — unlike curious_coder
     const res = await axios.post(
-      `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [listingUrl], maxItems: 1, includeDetails: true },
-      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
+      `https://api.apify.com/v2/acts/data-slayer~facebook-marketplace-details/run-sync-get-dataset-items`,
+      { listingId },
+      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
     );
+
     const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
     if (!items.length) return null;
     const item = items[0];
-    const desc  = item.redacted_description?.text || item.description || null;
-    const title = item.marketplace_listing_title || item.title || '';
-    const vehicleInfo = item.vehicle_info || item.vehicleInfo || item.listing_vehicle_data || {};
-    const mileageRaw = vehicleInfo.odometer || vehicleInfo.mileage || vehicleInfo.kilometers
-      || item.odometer || item.mileage || null;
+
+    // data-slayer returns structured vehicle specs directly
+    const mileageRaw = item.odometer || item.mileage || item.vehicle_info?.odometer
+      || item.listing_vehicle_data?.odometer || null;
     const mileage = mileageRaw
       ? (typeof mileageRaw === 'number' ? mileageRaw : parsePrice(String(mileageRaw)))
-      : extractMileage(title, desc);
-    const year  = vehicleInfo.year || vehicleInfo.model_year || extractYear(title, desc);
-    const make  = vehicleInfo.make || vehicleInfo.brand || extractMake('', title);
-    const model = vehicleInfo.model || null;
-    console.log(`[DetailScrape] ${listingUrl} → mileage:${mileage} year:${year} make:${make}`);
-    return { mileage, year, make, model };
+      : extractMileage(item.title || '', item.description || '');
+
+    const year         = item.year         || item.vehicle_info?.year         || extractYear(item.title || '', item.description || '');
+    const make         = item.make         || item.vehicle_info?.make         || extractMake('', item.title || '');
+    const model        = item.model        || item.vehicle_info?.model        || null;
+    const transmission = item.transmission || item.vehicle_info?.transmission || null;
+    const fuelType     = item.fuel_type    || item.vehicle_info?.fuel_type    || null;
+    const exteriorColor= item.exterior_color || item.vehicle_info?.exterior_color || null;
+    const interiorColor= item.interior_color || item.vehicle_info?.interior_color || null;
+
+    console.log(`[DetailScrape] ${listingId} → mileage:${mileage} year:${year} make:${make} transmission:${transmission} fuel:${fuelType}`);
+    return { mileage, year, make, model, transmission, fuelType, exteriorColor, interiorColor };
   } catch (e) {
     console.error('[DetailScrape] Error:', e.message);
     return null;
@@ -970,10 +983,14 @@ async function scanWatchItem(watcher, opts = {}) {
         const listing = chunk[idx];
         const idx2 = userListings.findIndex(l => l.id === listing.id);
         if (idx2 === -1) return;
-        if (detail.mileage) { userListings[idx2].mileage = detail.mileage; detailUpdated = true; }
-        if (detail.year)    { userListings[idx2].year    = detail.year;    detailUpdated = true; }
-        if (detail.make)    { userListings[idx2].make    = detail.make;    detailUpdated = true; }
-        if (detail.model)   { userListings[idx2].model   = detail.model;   detailUpdated = true; }
+        if (detail.mileage)      { userListings[idx2].mileage      = detail.mileage;      detailUpdated = true; }
+        if (detail.year)         { userListings[idx2].year         = detail.year;         detailUpdated = true; }
+        if (detail.make)         { userListings[idx2].make         = detail.make;         detailUpdated = true; }
+        if (detail.model)        { userListings[idx2].model        = detail.model;        detailUpdated = true; }
+        if (detail.transmission) { userListings[idx2].transmission = detail.transmission; detailUpdated = true; }
+        if (detail.fuelType)     { userListings[idx2].fuelType     = detail.fuelType;     detailUpdated = true; }
+        if (detail.exteriorColor){ userListings[idx2].exteriorColor= detail.exteriorColor;detailUpdated = true; }
+        if (detail.interiorColor){ userListings[idx2].interiorColor= detail.interiorColor;detailUpdated = true; }
       });
       await sleep(500);
     }
