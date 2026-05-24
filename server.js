@@ -194,12 +194,11 @@ async function getEbaySoldPrices(keyword) {
 
   // Fetch from eBay AU Finding API — no cost per call
   try {
-    const buildUrl = (page) => `https://svcs.ebay.com.au/services/search/FindingService/v1` +
+    const buildUrl = (page) => `https://svcs.ebay.com/services/search/FindingService/v1` +
       `?OPERATION-NAME=findCompletedItems` +
       `&SERVICE-VERSION=1.0.0` +
       `&SECURITY-APPNAME=${EBAY_APP_ID}` +
       `&RESPONSE-DATA-FORMAT=JSON` +
-      `&GLOBAL-ID=EBAY-AU` +
       `&keywords=${encodeURIComponent(keyword)}` +
       `&itemFilter(0).name=SoldItemsOnly&itemFilter(0).value=true` +
       `&sortOrder=EndTimeSoonest` +
