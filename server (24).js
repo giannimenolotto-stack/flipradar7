@@ -95,38 +95,6 @@ const EBAY_CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours — 1 eBay call per
 const EBAY_MIN_RESULTS    = 5;                     // need at least 5 sold prices to skip AI
 const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
 
-// ── Short-lived user cache — reduces Redis round-trips for burst AI calls ────
-// autoAppraise can fire /ai/text 10x in quick succession; caching avoids
-// 20 redundant Redis ops (getUser + saveUser) for the same user within seconds.
-const _userCache = new Map(); // userId -> { data: user, ts: number }
-const USER_CACHE_TTL_MS = 8000; // 8 seconds — safe for burst calls, stale fast enough
-
-function _getUserCached(userId) {
-  const hit = _userCache.get(userId);
-  if (hit && (Date.now() - hit.ts) < USER_CACHE_TTL_MS) return Promise.resolve(JSON.parse(JSON.stringify(hit.data)));
-  return getUser(userId).then(u => {
-    if (u) _userCache.set(userId, { data: JSON.parse(JSON.stringify(u)), ts: Date.now() });
-    return u;
-  });
-}
-function _invalidateUserCache(userId) { _userCache.delete(userId); }
-
-// ── Appraisal credit helper — single source of truth for limit check + increment ──
-// All AI routes call this. /auth/appraisal is a read-only gate that does NOT call this.
-async function consumeAppraisal(userId) {
-  const user = await _getUserCached(userId);
-  if (!user) return { ok: false, status: 404, error: 'User not found' };
-  const today = new Date().toISOString().slice(0, 10);
-  if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
-  const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
-  if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
-    return { ok: false, status: 429, error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) };
-  user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-  await saveUser(user);
-  _invalidateUserCache(userId); // force fresh read after write
-  return { ok: true, user, used: user.appraisalsToday, limit: limit === Infinity ? -1 : limit };
-}
-
 // ── Owner account — always premium, no payment required ──
 const OWNER_EMAIL = 'giannimenolotto@gmail.com';
 let ownerUserId = null; // resolved at boot
@@ -161,6 +129,33 @@ function authMiddleware(req, res, next) {
 // ── User helpers ──────────────────────────────────────────
 async function getUser(userId)  { return redisGet(K.user(userId)); }
 async function saveUser(user)   { await redisSet(K.user(user.id), user); }
+
+// ── In-memory user cache — avoids Redis round-trip on rapid appraisal bursts ──
+const _userCache = new Map();
+const USER_CACHE_TTL_MS = 8000;
+function _getUserCached(userId) {
+  const hit = _userCache.get(userId);
+  if (hit && (Date.now() - hit.ts) < USER_CACHE_TTL_MS) return Promise.resolve(JSON.parse(JSON.stringify(hit.data)));
+  return getUser(userId).then(u => {
+    if (u) _userCache.set(userId, { data: JSON.parse(JSON.stringify(u)), ts: Date.now() });
+    return u;
+  });
+}
+function _invalidateUserCache(userId) { _userCache.delete(userId); }
+
+async function consumeAppraisal(userId) {
+  const user = await _getUserCached(userId);
+  if (!user) return { ok: false, status: 404, error: 'User not found' };
+  const today = new Date().toISOString().slice(0, 10);
+  if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
+  const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
+  if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
+    return { ok: false, status: 429, error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) };
+  user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+  await saveUser(user);
+  _invalidateUserCache(userId);
+  return { ok: true, user, used: user.appraisalsToday, limit: limit === Infinity ? -1 : limit };
+}
 async function getUserByEmail(email) {
   const uid = await redisGet(K.emailIdx(email));
   if (!uid) return null;
@@ -214,62 +209,85 @@ async function saveUserSeen(userId, seen) {
 }
 
 // ── eBay sold price cache (FREE — official eBay API) ──────
+const _ebayInflight = new Map(); // deduplicates concurrent requests for same keyword
+const EBAY_RATE_LIMIT_TTL_MS = 5 * 60 * 1000; // 5 min negative cache on rate limit errors
+
 async function getEbaySoldPrices(keyword) {
   if (!EBAY_APP_ID) return null;
 
-  // Serve from cache if fresh
+  // Serve from cache — handles both positive results and rate-limit sentinels
   const cached = await redisGet(K.ebay(keyword));
-  if (cached && (Date.now() - new Date(cached.fetchedAt).getTime()) < EBAY_CACHE_TTL_MS) {
-    console.log(`[eBay] "${keyword}" → cache hit (${cached.count} prices, median $${cached.median})`);
-    return cached;
-  }
-
-  // Fetch from eBay AU Finding API — no cost per call
-  try {
-    const url = `https://svcs.ebay.com.au/services/search/FindingService/v1` +
-      `?OPERATION-NAME=findCompletedItems` +
-      `&SERVICE-VERSION=1.0.0` +
-      `&SECURITY-APPNAME=${EBAY_APP_ID}` +
-      `&RESPONSE-DATA-FORMAT=JSON` +
-      `&GLOBAL-ID=EBAY-AU` +
-      `&keywords=${encodeURIComponent(keyword)}` +
-      `&itemFilter(0).name=SoldItemsOnly&itemFilter(0).value=true` +
-      `&sortOrder=EndTimeSoonest` +
-      `&paginationInput.entriesPerPage=100`;
-
-    console.log(`[eBay] Fetching AU sold prices for "${keyword}"...`);
-    const res   = await axios.get(url, { timeout: 15000 });
-    const items = res.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
-    console.log(`[eBay] "${keyword}" → ${items.length} raw results from API`);
-
-    const prices = items
-      .map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0))
-      .filter(p => p > 0)
-      .sort((a, b) => a - b);
-
-    if (!prices.length) {
-      console.log(`[eBay] "${keyword}" → 0 sold prices after filtering`);
+  if (cached) {
+    if (cached._rateLimited && (Date.now() - new Date(cached.fetchedAt).getTime()) < EBAY_RATE_LIMIT_TTL_MS) {
+      console.log(`[eBay] "${keyword}" → rate-limited (cached)`);
       return null;
     }
-
-    const result = {
-      prices,
-      low:       prices[0],
-      high:      prices[prices.length - 1],
-      median:    prices[Math.floor(prices.length / 2)],
-      avg:       Math.round(prices.reduce((a, b) => a + b, 0) / prices.length),
-      count:     prices.length,
-      fetchedAt: new Date().toISOString(),
-      source:    'ebay_sold',
-    };
-
-    await redisSet(K.ebay(keyword), result);
-    console.log(`[eBay] "${keyword}" → ${prices.length} AU sold prices, median $${result.median}`);
-    return result;
-  } catch (e) {
-    console.error(`[eBay] Error for "${keyword}":`, e.response?.status, e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : e.message);
-    return null;
+    if (!cached._rateLimited && (Date.now() - new Date(cached.fetchedAt).getTime()) < EBAY_CACHE_TTL_MS) {
+      console.log(`[eBay] "${keyword}" → cache hit (${cached.count} prices, median $${cached.median})`);
+      return cached;
+    }
   }
+
+  // In-flight deduplication — concurrent callers share one eBay request
+  if (_ebayInflight.has(keyword)) {
+    console.log(`[eBay] "${keyword}" → joining in-flight request`);
+    return _ebayInflight.get(keyword);
+  }
+
+  const promise = (async () => {
+    try {
+      const url = `https://svcs.ebay.com.au/services/search/FindingService/v1` +
+        `?OPERATION-NAME=findCompletedItems` +
+        `&SERVICE-VERSION=1.0.0` +
+        `&SECURITY-APPNAME=${EBAY_APP_ID}` +
+        `&RESPONSE-DATA-FORMAT=JSON` +
+        `&GLOBAL-ID=EBAY-AU` +
+        `&keywords=${encodeURIComponent(keyword)}` +
+        `&itemFilter(0).name=SoldItemsOnly&itemFilter(0).value=true` +
+        `&sortOrder=EndTimeSoonest` +
+        `&paginationInput.entriesPerPage=100`;
+
+      console.log(`[eBay] Fetching AU sold prices for "${keyword}"...`);
+      const res   = await axios.get(url, { timeout: 15000 });
+      const items = res.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+      console.log(`[eBay] "${keyword}" → ${items.length} raw results from API`);
+
+      const prices = items
+        .map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0))
+        .filter(p => p > 0)
+        .sort((a, b) => a - b);
+
+      if (!prices.length) {
+        console.log(`[eBay] "${keyword}" → 0 sold prices after filtering`);
+        return null;
+      }
+
+      const result = {
+        prices,
+        low:       prices[0],
+        high:      prices[prices.length - 1],
+        median:    prices[Math.floor(prices.length / 2)],
+        avg:       Math.round(prices.reduce((a, b) => a + b, 0) / prices.length),
+        count:     prices.length,
+        fetchedAt: new Date().toISOString(),
+        source:    'ebay_sold',
+      };
+
+      await redisSet(K.ebay(keyword), result);
+      console.log(`[eBay] "${keyword}" → ${prices.length} AU sold prices, median $${result.median}`);
+      return result;
+    } catch (e) {
+      console.error(`[eBay] Error for "${keyword}":`, e.response?.status, e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : e.message);
+      // Cache rate-limit errors so retries don't immediately hammer eBay again
+      await redisSet(K.ebay(keyword), { _rateLimited: true, fetchedAt: new Date().toISOString() });
+      return null;
+    } finally {
+      _ebayInflight.delete(keyword);
+    }
+  })();
+
+  _ebayInflight.set(keyword, promise);
+  return promise;
 }
 
 // ── Our own scan price history ────────────────────────────
@@ -312,25 +330,21 @@ async function getOwnPriceRange(keyword) {
 // ── Master price lookup — call this before AI ─────────────
 // Returns price data if we have enough to skip AI, null if AI needed
 async function getPriceCacheForKeyword(keyword) {
-  // Run both Redis reads concurrently — each is an independent HTTP call to Upstash
-  const [own, ebay] = await Promise.all([
-    getOwnPriceRange(keyword),
-    getEbaySoldPrices(keyword),
-  ]);
-
-  // Own scan history preferred — most relevant (AU marketplace prices)
+  // 1. Check our own scan history first (most relevant — AU marketplace prices)
+  const own = await getOwnPriceRange(keyword);
   if (own) {
     console.log(`[PriceCache] "${keyword}" → own history (${own.count} records), skipping AI`);
     return own;
   }
 
-  // Fall back to eBay sold prices (free API)
+  // 2. Fall back to eBay sold prices (free API)
+  const ebay = await getEbaySoldPrices(keyword);
   if (ebay && ebay.count >= EBAY_MIN_RESULTS) {
     console.log(`[PriceCache] "${keyword}" → eBay cache (${ebay.count} records), skipping AI`);
     return ebay;
   }
 
-  // Not enough data — caller should use AI
+  // 3. Not enough data — caller should use AI
   console.log(`[PriceCache] "${keyword}" → no cache, AI needed`);
   return null;
 }
@@ -501,6 +515,22 @@ const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const APIFY_ACTOR        = 'curious_coder~facebook-marketplace';         // cheap — used for everything
 const APIFY_ACTOR_DETAIL = 'data-slayer~facebook-marketplace-details';  // expensive — vehicles only, fallback
 
+// ── Enrichment dedup cache ────────────────────────────────
+// Prevents data-slayer from re-enriching the same listing on every 30-min scan cycle.
+// Key = listingId, value = { ts }. TTL matches the shared scan cache (30 min).
+const _enrichCache = new Map();
+const ENRICH_CACHE_TTL_MS = 30 * 60 * 1000;
+
+// Types that look like vehicles in keywords/titles but don't need odometer enrichment
+const NON_VEHICLE_TYPES = ['scooter','e-bike','ebike','electric bike','electric scooter',
+  'golf cart','golf buggy','push bike','bicycle','mobility scooter'];
+
+function shouldEnrich(item) {
+  const text = ((item.marketplace_listing_title || item.title || '') + ' ' +
+                (item.redacted_description?.text || item.description || '')).toLowerCase();
+  return !NON_VEHICLE_TYPES.some(t => text.includes(t));
+}
+
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
   // Initial scan looks back 30 days, fetches up to 50, then we trim to the 20 most recent.
@@ -536,17 +566,28 @@ async function scrapeKeyword(keyword, opts = {}) {
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
 
     // ── Vehicle keywords: enrich with data-slayer ─────────
-    // data-slayer takes a single listingId and returns full vehicle specs.
-    // We call it for each listing in parallel batches after the cheap actor search.
+    // Per-listing check: only call data-slayer when year/odometer/transmission are missing.
+    // Skip listings recently enriched (in-memory cache) and non-vehicle types (scooters, etc.).
     if (vehicleMode && items.length > 0) {
-      const hasOdo = items.some(i => i.vehicle_odometer_data || i.odometer || i.mileage);
-      if (!hasOdo) {
-        console.log(`[Apify] "${keyword}" — enriching ${items.length} listings via data-slayer`);
+      const toEnrich = items.filter(item => {
+        const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
+        if (!listingId) return false;
+        const cached = _enrichCache.get(listingId);
+        if (cached && (Date.now() - cached.ts) < ENRICH_CACHE_TTL_MS) return false;
+        if (!shouldEnrich(item)) return false;
+        const hasOdo   = !!(item.vehicle_odometer_data || item.odometer || item.mileage);
+        const hasYear  = !!(item.vehicle_info?.year || item.listing_vehicle_data?.year || item.vehicleInfo?.year || item.year);
+        const hasTrans = !!(item.vehicle_transmission_type || item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission);
+        return !hasOdo || !hasYear || !hasTrans;
+      });
+
+      if (toEnrich.length > 0) {
+        console.log(`[Apify] "${keyword}" — enriching ${toEnrich.length}/${items.length} listing(s) via data-slayer`);
         try {
           const batchSize = 5;
           const detailMap = {};
-          for (let b = 0; b < items.length; b += batchSize) {
-            const batch = items.slice(b, b + batchSize);
+          for (let b = 0; b < toEnrich.length; b += batchSize) {
+            const batch = toEnrich.slice(b, b + batchSize);
             await Promise.all(batch.map(async item => {
               const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
               if (!listingId) return;
@@ -554,33 +595,22 @@ async function scrapeKeyword(keyword, opts = {}) {
                 const r = await axios.post(
                   `https://api.apify.com/v2/acts/${APIFY_ACTOR_DETAIL}/run-sync-get-dataset-items`,
                   { listingId },
-                  { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 90000 }
+                  { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 45000 }
                 );
                 const rows = Array.isArray(r.data) ? r.data.filter(x => !x.error) : [];
-                if (rows[0]) detailMap[listingId] = rows[0];
+                if (rows[0]) {
+                  detailMap[listingId] = rows[0];
+                  _enrichCache.set(listingId, { ts: Date.now() });
+                }
               } catch (e) {
                 console.error(`[DataSlayer] Failed for listingId ${listingId}:`, e.message);
               }
             }));
-            if (b + batchSize < items.length) await sleep(500);
+            if (b + batchSize < toEnrich.length) await sleep(500);
           }
           const enriched = Object.keys(detailMap).length;
-          console.log(`[DataSlayer] Enriched ${enriched}/${items.length} listings`);
+          console.log(`[DataSlayer] Enriched ${enriched}/${toEnrich.length} listing(s)`);
           if (enriched > 0) {
-            // Log first result so we can verify field names
-            const sample = Object.values(detailMap)[0];
-            console.log('[DataSlayer] KEYS:', Object.keys(sample).join(', '));
-            console.log('[DataSlayer] VEHICLE FIELDS:', JSON.stringify({
-              vehicle_make_display_name:  sample.vehicle_make_display_name,
-              vehicle_model_display_name: sample.vehicle_model_display_name,
-              vehicle_odometer_data:      sample.vehicle_odometer_data,
-              vehicle_transmission_type:  sample.vehicle_transmission_type,
-              vehicle_fuel_type:          sample.vehicle_fuel_type,
-              vehicle_exterior_color:     sample.vehicle_exterior_color,
-              vehicle_seller_type:        sample.vehicle_seller_type,
-              condition:                  sample.condition,
-            }));
-            // Merge detail fields onto each item
             items = items.map(item => {
               const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
               const detail = detailMap[listingId];
@@ -591,45 +621,8 @@ async function scrapeKeyword(keyword, opts = {}) {
           console.error(`[DataSlayer] Batch error for "${keyword}":`, detailErr.message);
         }
       } else {
-        console.log(`[Apify] "${keyword}" — odometer already present, skipping data-slayer`);
+        console.log(`[Apify] "${keyword}" — all ${items.length} vehicle listing(s) complete or cached, skipping data-slayer`);
       }
-    }
-    // Log date fields from first item so we can see what Apify actually returns
-    if (items.length > 0) {
-      const s = items[0];
-      console.log('[ApifyRaw] Date fields sample:', JSON.stringify({
-        creation_time:       s.creation_time,
-        listed_at:           s.listed_at,
-        listingCreationTime: s.listingCreationTime,
-        created_time:        s.created_time,
-        date:                s.date,
-        custom_sub_titles:   s.custom_sub_titles,
-        subtitle:            s.subtitle,
-      }));
-      // For vehicle keywords, dump the full item so we can see all field names
-      if (vehicleMode) {
-        console.log('[ApifyRaw] Vehicle item ALL KEYS:', Object.keys(s).join(', '));
-        console.log('[ApifyRaw] Vehicle item FULL:', JSON.stringify(s).slice(0, 3000));
-      }
-    }
-    // TEMP: log raw first vehicle item so we can see what fields Apify returns
-    if (items.length > 0 && isVehicleKeyword(keyword)) {
-      const sample = items[0];
-      console.log('[ApifyRaw] Sample vehicle listing fields:', JSON.stringify({
-        vehicle_info:         sample.vehicle_info,
-        vehicleInfo:          sample.vehicleInfo,
-        listing_vehicle_data: sample.listing_vehicle_data,
-        custom_sub_titles:    sample.custom_sub_titles,
-        additional_info:      sample.additional_info,
-        attributes:           sample.attributes,
-        odometer:             sample.odometer,
-        mileage:              sample.mileage,
-        year:                 sample.year,
-        make:                 sample.make,
-        transmission:         sample.transmission,
-        fuel_type:            sample.fuel_type,
-        exterior_color:       sample.exterior_color,
-      }).slice(0, 1000));
     }
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
@@ -674,13 +667,28 @@ async function scrapeKeyword(keyword, opts = {}) {
       const listedAtUnknown = !listedAt;
       if (!listedAt) listedAt = new Date().toISOString();
 
-      const title       = item.marketplace_listing_title || item.custom_title || item.title || keyword;
+      const rawTitle    = item.marketplace_listing_title || item.custom_title || item.title || keyword;
       const description = item.redacted_description?.text || item.description || null;
-      const isVehicle   = isVehicleListing(keyword, title, description);
+      const isVehicle   = isVehicleListing(keyword, rawTitle, description);
       const rawPrice = parsePrice(
         item.listing_price?.amount || item.listing_price?.formatted_amount ||
         item.formatted_price || item.price
       );
+
+      // Extract structured fields before building title so we can inject missing make/year
+      const year = isVehicle ? (
+        item.vehicle_info?.year || item.listing_vehicle_data?.year ||
+        item.vehicleInfo?.year || item.year ||
+        extractYear(rawTitle, description)
+      ) : null;
+      const make = isVehicle ? (
+        item.vehicle_make_display_name ||
+        item.vehicle_info?.make || item.listing_vehicle_data?.make ||
+        item.vehicleInfo?.make || item.make ||
+        extractMake(keyword, rawTitle)
+      ) : null;
+      const title = isVehicle ? normalizeVehicleTitle(rawTitle, year, make) : rawTitle;
+
       return {
         id,
         title,
@@ -692,20 +700,11 @@ async function scrapeKeyword(keyword, opts = {}) {
         description,
         keyword,
         listedAt,
-        listedAtUnknown, // true when we couldn't determine the actual listed date
+        listedAtUnknown,
         foundAt:  new Date().toISOString(),
-        mileage:       isVehicle ? (extractMileageFromVehicleInfo(item) || extractMileage(title, description)) : null,
-        year:          isVehicle ? (
-                         item.vehicle_info?.year || item.listing_vehicle_data?.year ||
-                         item.vehicleInfo?.year || item.year ||
-                         extractYear(title, description)
-                       ) : null,
-        make:          isVehicle ? (
-                         item.vehicle_make_display_name ||
-                         item.vehicle_info?.make || item.listing_vehicle_data?.make ||
-                         item.vehicleInfo?.make || item.make ||
-                         extractMake(keyword, title)
-                       ) : null,
+        mileage:       isVehicle ? (extractMileageFromVehicleInfo(item) || extractMileage(rawTitle, description)) : null,
+        year,
+        make,
         model:         isVehicle ? (
                          item.vehicle_model_display_name ||
                          item.vehicle_info?.model || item.listing_vehicle_data?.model ||
@@ -714,7 +713,8 @@ async function scrapeKeyword(keyword, opts = {}) {
         transmission:  isVehicle ? (
                          item.vehicle_transmission_type ||
                          item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission ||
-                         item.vehicleInfo?.transmission || item.transmission || null
+                         item.vehicleInfo?.transmission || item.transmission ||
+                         extractTransmission(rawTitle, description)
                        ) : null,
         fuelType:      isVehicle ? (
                          item.vehicle_fuel_type ||
@@ -888,6 +888,31 @@ function extractMake(keyword, title) {
   return null;
 }
 
+function extractTransmission(title, description) {
+  const text = (title + ' ' + (description || '')).toLowerCase();
+  if (/\bdsg\b|\bdct\b|\bdual.?clutch\b/.test(text)) return 'DSG';
+  if (/\bcvt\b/.test(text)) return 'CVT';
+  if (/\bamt\b/.test(text)) return 'Auto';
+  // "auto" as standalone word — avoid matching "automatic car" twice
+  if (/\bautomatic\b/.test(text)) return 'Automatic';
+  if (/(?:^|[\s,•·\-])auto(?:[\s,•·\-]|$)/.test(text)) return 'Auto';
+  if (/\bmanual\b|\b[456]\s*speed\b|\b[456]\s*sp\b/.test(text)) return 'Manual';
+  return null;
+}
+
+// Prepend year and/or make to title when they're known but absent from the raw title.
+// Produces: "2012 Toyota Hilux SR5" from "Hilux SR5" + year=2012, make=Toyota.
+// Never duplicates if make/year already in title.
+function normalizeVehicleTitle(rawTitle, year, make) {
+  if (!rawTitle) return rawTitle;
+  const title = rawTitle.trim();
+  const lo = title.toLowerCase();
+  let prefix = '';
+  if (year && !title.includes(String(year))) prefix += year + ' ';
+  if (make && !lo.includes(make.toLowerCase())) prefix += make + ' ';
+  return prefix ? (prefix + title) : title;
+}
+
 function parsePrice(raw) {
   if (!raw) return 0;
   if (typeof raw === 'number') return Math.round(raw);
@@ -1033,7 +1058,7 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
 
   const dropped = raw.length - relevant.length;
   if (dropped > 0) {
-    console.log(`[Filter] "${keyword}" — dropped ${dropped} listing(s) (keyword mismatch or excluded words)`);
+    console.log(`[Filter] "${keyword}" — dropped ${dropped} listing(s) (matched excluded words)`);
     // Save blocked listings so user can review them
     const blockedListings = raw.filter(l => !relevant.includes(l)).map(l => ({
       id: l.id, title: l.title, price: l.price, url: l.url,
@@ -1452,6 +1477,13 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     startWatchTimer(item);
     console.log(`[Watch] Added "${item.keyword}" for user ${req.userId}`);
     res.json(item);
+    // Clear any stale seen entries for this keyword so the initial scan delivers fresh results
+    getUserSeen(req.userId).then(seen => {
+      const prefix = `${item.keyword}:`;
+      if (!Object.keys(seen).some(k => k.startsWith(prefix))) return;
+      const pruned = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
+      return saveUserSeen(req.userId, pruned);
+    }).catch(() => {});
     // Initial backfill — runs once when watch is added
     // DO NOT also call /scan/now — that causes a double scan
     scanWatchItem(item, { initialScan: true })
@@ -1608,29 +1640,38 @@ app.post('/appraise', authMiddleware, async (req, res) => {
 
     const listingPrice = parsePrice(price);
 
-    // Read-only limit gate — do NOT consume a credit yet
-    const user = await getUser(req.userId);
+    // 1. Check appraisal limit (read-only — don't increment yet)
+    const user = await _getUserCached(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today = new Date().toISOString().slice(0, 10);
-    const appraisalsToday = user.appraisalDate === today ? (user.appraisalsToday || 0) : 0;
+    if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
-    if (limit !== Infinity && limit < 999 && appraisalsToday >= limit)
+    if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
 
-    // Try price cache
+    // 2. Try price cache first — free, no AI needed
     const priceData = await getPriceCacheForKeyword(keyword);
     if (priceData) {
-      // Cache hit: consume the credit now — AI will not be called
-      const check = await consumeAppraisal(req.userId);
-      if (!check.ok) return res.status(check.status).json({ error: check.error, limit: check.limit, plan: check.plan });
       const verdict = buildCacheVerdict(listingPrice, priceData);
-      console.log(`[Appraise] "${keyword}" → cache hit (${priceData.count} prices, source: ${priceData.source})`);
+      user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+      await saveUser(user);
+      _invalidateUserCache(req.userId);
+      console.log(`[Appraise] "${keyword}" → served from ${verdict.source} cache (no AI used)`);
       return res.json({ ...verdict, usedCache: true });
     }
 
-    // Cache miss: do NOT consume credit — the AI route will consume it
+    // 3. Not enough price data — caller (frontend) must use AI directly
+    user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+    await saveUser(user);
+    _invalidateUserCache(req.userId);
     console.log(`[Appraise] "${keyword}" → no cache, AI required`);
-    return res.json({ found: false, usedCache: false });
+    res.json({
+      found:      false,
+      usedCache:  false,
+      message:    'No price data yet — use AI appraisal',
+      used:       user.appraisalsToday,
+      limit:      limit === Infinity ? -1 : limit,
+    });
   } catch (e) { console.error('[Appraise]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -1792,14 +1833,9 @@ app.get('/auth/plan', authMiddleware, async (req, res) => {
 
 app.post('/auth/appraisal', authMiddleware, async (req, res) => {
   try {
-    const user = await getUser(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    const today = new Date().toISOString().slice(0, 10);
-    const appraisalsToday = user.appraisalDate === today ? (user.appraisalsToday || 0) : 0;
-    const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
-    if (limit !== Infinity && limit < 999 && appraisalsToday >= limit)
-      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
-    res.json({ ok: true, used: appraisalsToday, limit: limit === Infinity ? -1 : limit });
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+    res.json({ ok: true, used: cr.used, limit: cr.limit });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -1875,8 +1911,9 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     const { parts } = req.body;
     if (!parts || !Array.isArray(parts)) return res.status(400).json({ error: 'parts array required' });
 
-    const check = await consumeAppraisal(req.userId);
-    if (!check.ok) return res.status(check.status).json({ error: check.error, limit: check.limit, plan: check.plan });
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
     const geminiRes = await axios.post(url, { contents: [{ parts }] }, {
@@ -1899,8 +1936,9 @@ app.post('/ai/text', authMiddleware, async (req, res) => {
     const { prompt, max_tokens } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
 
-    const check = await consumeAppraisal(req.userId);
-    if (!check.ok) return res.status(check.status).json({ error: check.error, limit: check.limit, plan: check.plan });
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
     const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
       model: 'claude-haiku-4-5-20251001',
@@ -1930,18 +1968,14 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
     const { prompt, imageUrl } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
 
-    const check = await consumeAppraisal(req.userId);
-    if (!check.ok) return res.status(check.status).json({ error: check.error, limit: check.limit, plan: check.plan });
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
     var parts = [{ text: prompt }];
 
-    // Pre-fetched base64 from frontend proxy takes priority — avoids expired FB CDN URLs
-    if (req.body.imageB64) {
-      const mime = req.body.mediaType || 'image/jpeg';
-      parts = [{ inline_data: { mime_type: mime, data: req.body.imageB64 } }, { text: prompt }];
-      console.log('[AI/text-image] Using pre-fetched base64 image');
-    } else if (imageUrl) {
-      // Fallback: fetch image by URL (may fail if FB CDN URL has expired)
+    // If there's an image URL, fetch and include it
+    if (imageUrl) {
       try {
         const imgRes = await axios.get(imageUrl, {
           responseType: 'arraybuffer', timeout: 10000,
@@ -1951,7 +1985,7 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
         const mime = imgRes.headers['content-type'] || 'image/jpeg';
         parts = [{ inline_data: { mime_type: mime, data: b64 } }, { text: prompt }];
       } catch(e) {
-        console.log('[AI/text-image] Could not fetch image URL, proceeding text-only');
+        console.log('[AI/text-image] Could not fetch image, proceeding text-only');
       }
     }
 
