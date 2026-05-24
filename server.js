@@ -750,13 +750,27 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
   // Split keyword into words — all must appear in title OR a synonym matches
   const kwWords = keyword.replace(/['"]/g, '').toLowerCase().split(/\s+/).filter(w => w.length > 0);
 
+  // ── Auto exclude — always wrong for this keyword category ──
+  const AUTO_EXCLUDE = {
+    'electric scooter': ['kids scooter', 'micro scooter', 'mini scooter', 'push scooter', 'kick scooter', 'stunt scooter', 'trick scooter', 'pro scooter', 'park scooter', 'toddler scooter', 'children scooter', 'child scooter'],
+    'e scooter':        ['kids scooter', 'micro scooter', 'mini scooter', 'push scooter', 'kick scooter', 'stunt scooter', 'trick scooter', 'pro scooter', 'park scooter', 'toddler scooter'],
+    'scooter':          ['kids scooter', 'micro scooter', 'mini scooter', 'push scooter', 'kick scooter', 'stunt scooter', 'trick scooter', 'pro scooter', 'park scooter', 'toddler scooter'],
+    'electric bike':    ['kids bike', 'balance bike', 'toy bike', 'parts only'],
+    'iphone':           ['case only', 'charger only', 'cable only'],
+    'golf clubs':       ['golf cart', 'golf buggy', 'golf shoes', 'golf bag only'],
+  };
+  const autoExclude = AUTO_EXCLUDE[keyword] || [];
+
   const relevant = raw.filter(l => {
     const title = (l.title || '').toLowerCase();
     const desc  = (l.description || '').toLowerCase();
     const full  = title + ' ' + desc;
 
-    // Only block user-defined excluded words — AI handles everything else
+    // Block user-defined excluded words
     if (excludeWords.length && excludeWords.some(w => w && full.includes(w))) return false;
+
+    // Block auto-excluded phrases for this keyword category
+    if (autoExclude.length && autoExclude.some(w => title.includes(w))) return false;
 
     return true;
   });
