@@ -319,25 +319,14 @@ async function getOwnPriceRange(keyword) {
   };
 }
 
-// ── Master price lookup — call this before AI ─────────────
-// Returns price data if we have enough to skip AI, null if AI needed
+// ── Master price lookup — always use eBay sold data ──────
 async function getPriceCacheForKeyword(keyword) {
-  // 1. Check our own scan history first (most relevant — AU marketplace prices)
-  const own = await getOwnPriceRange(keyword);
-  if (own) {
-    console.log(`[PriceCache] "${keyword}" → own history (${own.count} records), skipping AI`);
-    return own;
-  }
-
-  // 2. Fall back to eBay sold prices (free API)
   const ebay = await getEbaySoldPrices(keyword);
   if (ebay && ebay.count >= EBAY_MIN_RESULTS) {
-    console.log(`[PriceCache] "${keyword}" → eBay cache (${ebay.count} records), skipping AI`);
+    console.log(`[PriceCache] "${keyword}" → eBay (${ebay.count} records, median $${ebay.median})`);
     return ebay;
   }
-
-  // 3. Not enough data — caller should use AI
-  console.log(`[PriceCache] "${keyword}" → no cache, AI needed`);
+  console.log(`[PriceCache] "${keyword}" → no eBay data`);
   return null;
 }
 
