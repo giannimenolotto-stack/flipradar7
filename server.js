@@ -91,7 +91,7 @@ const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
 
 // ── eBay price cache settings ─────────────────────────────
-const EBAY_CACHE_TTL_MS   = 12 * 60 * 60 * 1000; // 12 hours — avoid rate limits
+const EBAY_CACHE_TTL_MS   = 48 * 60 * 60 * 1000; // 48 hours — minimise eBay API calls
 const EBAY_MIN_RESULTS    = 3;                     // need at least 3 sold prices to use data
 const OWN_PRICE_MIN       = 50;                    // need 50 of our own records before trusting it
 
@@ -206,14 +206,21 @@ async function getEbaySoldPrices(keyword) {
       `&paginationInput.pageNumber=${page}`;
 
     console.log(`[eBay] Fetching AU sold prices for "${keyword}"...`);
-    // Fetch 2 pages sequentially to avoid eBay rate limits
+    // Single page fetch — stays well under eBay rate limits
     const res1  = await axios.get(buildUrl(1), { timeout: 15000 });
-    await sleep(500);
-    const res2  = await axios.get(buildUrl(2), { timeout: 15000 }).catch(() => null);
-    const items1 = res1.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
-    const items2 = res2?.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
-    const items  = [...items1, ...items2];
-    console.log(`[eBay] "${keyword}" → ${items.length} raw results (${items1.length}+${items2.length})`);
+
+    // Check for rate limit error
+    const ack = res1.data?.findCompletedItemsResponse?.[0]?.ack?.[0];
+    if (ack === 'Failure') {
+      const errId = res1.data?.findCompletedItemsResponse?.[0]?.errorMessage?.[0]?.error?.[0]?.errorId?.[0];
+      if (errId === '10001') {
+        console.error(`[eBay] Rate limited — backing off for this keyword`);
+        return null;
+      }
+    }
+
+    const items = res1.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
+    console.log(`[eBay] "${keyword}" → ${items.length} raw results`);
 
     // Fetch live USD→AUD rate (cache for 6 hours)
     let usdToAud = 1.55; // fallback if API fails
