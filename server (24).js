@@ -95,10 +95,26 @@ const EBAY_CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours — 1 eBay call per
 const EBAY_MIN_RESULTS    = 5;                     // need at least 5 sold prices to skip AI
 const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
 
+// ── Short-lived user cache — reduces Redis round-trips for burst AI calls ────
+// autoAppraise can fire /ai/text 10x in quick succession; caching avoids
+// 20 redundant Redis ops (getUser + saveUser) for the same user within seconds.
+const _userCache = new Map(); // userId -> { data: user, ts: number }
+const USER_CACHE_TTL_MS = 8000; // 8 seconds — safe for burst calls, stale fast enough
+
+function _getUserCached(userId) {
+  const hit = _userCache.get(userId);
+  if (hit && (Date.now() - hit.ts) < USER_CACHE_TTL_MS) return Promise.resolve(JSON.parse(JSON.stringify(hit.data)));
+  return getUser(userId).then(u => {
+    if (u) _userCache.set(userId, { data: JSON.parse(JSON.stringify(u)), ts: Date.now() });
+    return u;
+  });
+}
+function _invalidateUserCache(userId) { _userCache.delete(userId); }
+
 // ── Appraisal credit helper — single source of truth for limit check + increment ──
 // All AI routes call this. /auth/appraisal is a read-only gate that does NOT call this.
 async function consumeAppraisal(userId) {
-  const user = await getUser(userId);
+  const user = await _getUserCached(userId);
   if (!user) return { ok: false, status: 404, error: 'User not found' };
   const today = new Date().toISOString().slice(0, 10);
   if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
@@ -107,6 +123,7 @@ async function consumeAppraisal(userId) {
     return { ok: false, status: 429, error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) };
   user.appraisalsToday = (user.appraisalsToday || 0) + 1;
   await saveUser(user);
+  _invalidateUserCache(userId); // force fresh read after write
   return { ok: true, user, used: user.appraisalsToday, limit: limit === Infinity ? -1 : limit };
 }
 
@@ -295,21 +312,25 @@ async function getOwnPriceRange(keyword) {
 // ── Master price lookup — call this before AI ─────────────
 // Returns price data if we have enough to skip AI, null if AI needed
 async function getPriceCacheForKeyword(keyword) {
-  // 1. Check our own scan history first (most relevant — AU marketplace prices)
-  const own = await getOwnPriceRange(keyword);
+  // Run both Redis reads concurrently — each is an independent HTTP call to Upstash
+  const [own, ebay] = await Promise.all([
+    getOwnPriceRange(keyword),
+    getEbaySoldPrices(keyword),
+  ]);
+
+  // Own scan history preferred — most relevant (AU marketplace prices)
   if (own) {
     console.log(`[PriceCache] "${keyword}" → own history (${own.count} records), skipping AI`);
     return own;
   }
 
-  // 2. Fall back to eBay sold prices (free API)
-  const ebay = await getEbaySoldPrices(keyword);
+  // Fall back to eBay sold prices (free API)
   if (ebay && ebay.count >= EBAY_MIN_RESULTS) {
     console.log(`[PriceCache] "${keyword}" → eBay cache (${ebay.count} records), skipping AI`);
     return ebay;
   }
 
-  // 3. Not enough data — caller should use AI
+  // Not enough data — caller should use AI
   console.log(`[PriceCache] "${keyword}" → no cache, AI needed`);
   return null;
 }
