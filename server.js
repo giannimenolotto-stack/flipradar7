@@ -1174,11 +1174,19 @@ app.delete('/watchlist/:id', authMiddleware, async (req, res) => {
     const watch = await getWatch(req.params.id);
     if (!watch || watch.userId !== req.userId)
       return res.status(404).json({ error: 'Not found' });
+    const keyword = watch.keyword;
     stopWatchTimer(req.params.id);
     await deleteWatch(req.params.id);
     await removeWatchId(req.userId, req.params.id);
     await removeFromGlobalWatchIndex(req.params.id);
     watchlist = watchlist.filter(w => w.id !== req.params.id);
+
+    // Clear blocked listings for this keyword so they show fresh if re-added
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    const remaining = blocked.filter(l => l.keyword !== keyword);
+    await redisSet(K.blocked(req.userId), remaining);
+    console.log(`[Watch] Deleted "${keyword}" — cleared ${blocked.length - remaining.length} blocked listings`);
+
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
