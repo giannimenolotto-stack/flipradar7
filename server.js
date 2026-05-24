@@ -1147,7 +1147,7 @@ app.post('/auth/signup', async (req, res) => {
     const token = makeToken(user.id);
     console.log(`[Auth] Signup: ${user.email}`);
     verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Verify failed:', e.message));
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan, emailVerified: false } });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user), emailVerified: false } });
   } catch (e) { console.error('[Signup]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -1198,7 +1198,7 @@ app.post('/auth/login', async (req, res) => {
     await saveUser(user);
     const token = makeToken(user.id);
     console.log(`[Auth] Login: ${user.email}`);
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan } });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user) } });
   } catch (e) { console.error('[Login]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -1225,7 +1225,7 @@ app.get('/auth/me', authMiddleware, async (req, res) => {
   try {
     const user = await getUser(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ id: user.id, email: user.email, name: user.name, plan: user.plan, lastSeen: user.lastSeen });
+    res.json({ id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user), lastSeen: user.lastSeen });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -1422,7 +1422,7 @@ app.post('/appraise', authMiddleware, async (req, res) => {
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
-      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
 
     // 2. Try price cache first — free, no AI needed
     const priceData = await getPriceCacheForKeyword(keyword);
@@ -1598,7 +1598,7 @@ app.get('/auth/plan', authMiddleware, async (req, res) => {
     const appraised = user.appraisalDate === today ? (user.appraisalsToday || 0) : 0;
     const limit     = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     res.json({
-      plan: user.plan || 'free',
+      plan: getEffectivePlan(user),
       appraisalsUsedToday: appraised,
       appraisalsLimit:     limit === Infinity ? -1 : limit,
       watchlistLimit:      PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
@@ -1614,7 +1614,7 @@ app.post('/auth/appraisal', authMiddleware, async (req, res) => {
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
-      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
     res.json({ ok: true, used: user.appraisalsToday, limit: limit === Infinity ? -1 : limit });
@@ -1700,7 +1700,7 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
-      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
 
@@ -1732,7 +1732,7 @@ app.post('/ai/text', authMiddleware, async (req, res) => {
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
-      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
 
@@ -1771,7 +1771,7 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
     if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
     const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
-      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: user.plan });
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
 
