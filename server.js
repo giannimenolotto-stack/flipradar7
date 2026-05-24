@@ -91,7 +91,7 @@ const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
 
 // ── eBay price cache settings ─────────────────────────────
-const EBAY_CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours — 1 eBay call per keyword per day max
+const EBAY_CACHE_TTL_MS   = 12 * 60 * 60 * 1000; // 12 hours — avoid rate limits
 const EBAY_MIN_RESULTS    = 3;                     // need at least 3 sold prices to use data
 const OWN_PRICE_MIN       = 50;                    // need 50 of our own records before trusting it
 
@@ -206,19 +206,14 @@ async function getEbaySoldPrices(keyword) {
       `&paginationInput.pageNumber=${page}`;
 
     console.log(`[eBay] Fetching AU sold prices for "${keyword}"...`);
-    // Fetch 4 pages in parallel for up to 400 results
-    const [res1, res2, res3, res4] = await Promise.all([
-      axios.get(buildUrl(1), { timeout: 15000 }),
-      axios.get(buildUrl(2), { timeout: 15000 }).catch(() => null),
-      axios.get(buildUrl(3), { timeout: 15000 }).catch(() => null),
-      axios.get(buildUrl(4), { timeout: 15000 }).catch(() => null),
-    ]);
+    // Fetch 2 pages sequentially to avoid eBay rate limits
+    const res1  = await axios.get(buildUrl(1), { timeout: 15000 });
+    await sleep(500);
+    const res2  = await axios.get(buildUrl(2), { timeout: 15000 }).catch(() => null);
     const items1 = res1.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
     const items2 = res2?.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
-    const items3 = res3?.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
-    const items4 = res4?.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
-    const items  = [...items1, ...items2, ...items3, ...items4];
-    console.log(`[eBay] "${keyword}" → ${items.length} raw results (${items1.length}+${items2.length}+${items3.length}+${items4.length})`);
+    const items  = [...items1, ...items2];
+    console.log(`[eBay] "${keyword}" → ${items.length} raw results (${items1.length}+${items2.length})`);
 
     // Fetch live USD→AUD rate (cache for 6 hours)
     let usdToAud = 1.55; // fallback if API fails
