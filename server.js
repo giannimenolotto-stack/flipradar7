@@ -216,8 +216,31 @@ async function getEbaySoldPrices(keyword) {
     const items  = [...items1, ...items2];
     console.log(`[eBay] "${keyword}" → ${items.length} raw results (${items1.length} + ${items2.length})`);
 
+    // Fetch live USD→AUD rate (cache for 6 hours)
+    let usdToAud = 1.55; // fallback if API fails
+    try {
+      const fxCached = await redisGet('fr:fx:usd_aud');
+      if (fxCached && (Date.now() - new Date(fxCached.fetchedAt).getTime()) < 6 * 60 * 60 * 1000) {
+        usdToAud = fxCached.rate;
+        console.log(`[eBay] FX rate USD→AUD: ${usdToAud} (cached)`);
+      } else {
+        const fxRes = await axios.get('https://open.er-api.com/v6/latest/USD', { timeout: 5000 });
+        usdToAud = fxRes.data?.rates?.AUD || 1.55;
+        await redisSet('fr:fx:usd_aud', { rate: usdToAud, fetchedAt: new Date().toISOString() });
+        console.log(`[eBay] FX rate USD→AUD: ${usdToAud} (fresh)`);
+      }
+    } catch (e) {
+      console.log(`[eBay] FX fetch failed, using fallback rate ${usdToAud}`);
+    }
+
     const prices = items
-      .map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0))
+      .map(i => {
+        const rawPrice  = parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0);
+        const currency  = i.sellingStatus?.[0]?.currentPrice?.[0]?.['@currencyId'] || 'USD';
+        // Convert to AUD — most eBay prices are USD, some are already AUD
+        const priceAUD  = currency === 'AUD' ? rawPrice : Math.round(rawPrice * usdToAud);
+        return priceAUD;
+      })
       .filter(p => p > 0)
       .sort((a, b) => a - b);
 
@@ -235,10 +258,12 @@ async function getEbaySoldPrices(keyword) {
       count:     prices.length,
       fetchedAt: new Date().toISOString(),
       source:    'ebay_sold',
+      currency:  'AUD',
+      fxRate:    usdToAud,
     };
 
     await redisSet(K.ebay(keyword), result);
-    console.log(`[eBay] "${keyword}" → ${prices.length} AU sold prices, median $${result.median}`);
+    console.log(`[eBay] "${keyword}" → ${prices.length} sold prices in AUD, median $${result.median} (rate: ${usdToAud})`);
     return result;
   } catch (e) {
     console.error(`[eBay] Error for "${keyword}":`, e.response?.status, e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : e.message);
