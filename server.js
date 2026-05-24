@@ -853,17 +853,8 @@ async function scanWatchItem(watcher, opts = {}) {
     }
   }
 
-  // ── On initial scan, clear seen cache for this keyword ──
-  // So listings always come through fresh when user first adds a watch
-  if (opts.initialScan) {
-    const seen = await getUserSeen(watcher.userId);
-    const cleared = Object.keys(seen).filter(k => k.startsWith(keyword + ':'));
-    cleared.forEach(k => delete seen[k]);
-    if (cleared.length > 0) {
-      await saveUserSeen(watcher.userId, seen);
-      console.log(`[InitialScan] Cleared ${cleared.length} seen entries for "${keyword}"`);
-    }
-  }
+  // NOTE: We do NOT clear seen cache on initial scan anymore
+  // This preserves existing listings in the feed when adding a new keyword
 
   // ── Distribute to this user ───────────────────────────────
   // Safety net — ensure raw is always an array
