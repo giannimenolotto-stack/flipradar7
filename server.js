@@ -1245,8 +1245,8 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     const user = await getUser(req.userId);
     const planLimit = PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)];
     const existingWatches = await getUserWatches(req.userId);
-    if (existingWatches.length >= planLimit)
-      return res.status(403).json({ error: 'Watchlist limit reached for your plan', plan: user?.plan, limit: planLimit });
+    if (!isOwner(user) && existingWatches.length >= planLimit)
+      return res.status(403).json({ error: 'Watchlist limit reached for your plan', plan: getEffectivePlan(user), limit: planLimit });
     const watchPlan = plan || (speed === 'premium' ? 'premium' : 'basic');
     const rawExclude = req.body.excludeWords || [];
     const excludeWords = Array.isArray(rawExclude)
