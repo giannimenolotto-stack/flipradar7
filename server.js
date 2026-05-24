@@ -490,17 +490,6 @@ async function scrapeKeyword(keyword, opts = {}) {
     let items      = allItems.slice(0, maxItems);
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
 
-    // For initial scans, pre-sort and trim to 20 BEFORE enrichment so we don't
-    // waste data-slayer calls on listings we'll discard anyway
-    if (opts.initialScan && items.length > 20) {
-      items = [...items].sort((a, b) => {
-        const ta = a.creation_time ? (a.creation_time < 1e10 ? a.creation_time * 1000 : a.creation_time) : 0;
-        const tb = b.creation_time ? (b.creation_time < 1e10 ? b.creation_time * 1000 : b.creation_time) : 0;
-        return tb - ta;
-      }).slice(0, 20);
-      console.log(`[Apify] "${keyword}" — pre-trimmed to ${items.length} most recent for enrichment`);
-    }
-
     // ── Vehicle keywords: enrich with data-slayer ─────────
     // data-slayer takes a single listingId and returns full vehicle specs.
     // We call it for each listing in parallel batches after the cheap actor search.
@@ -1121,30 +1110,15 @@ async function scanWatchItem(watcher, opts = {}) {
   // Safety net — ensure raw is always an array
   if (!Array.isArray(raw)) raw = [];
 
-  // On initial scan: sort by listedAt and keep only the 20 most recent.
-  // Only pre-mark the older ones as seen if this keyword has NEVER been scanned before.
-  // If the user deleted and re-added the keyword, show everything fresh — no pre-marking.
-  if (opts.initialScan && raw.length > 20) {
-    const sorted = [...raw].sort((a, b) => {
+  // On initial scan: sort by recency so the feed shows newest first.
+  // No cap — let all scraped listings through (up to 50).
+  if (opts.initialScan && raw.length > 1) {
+    raw = [...raw].sort((a, b) => {
       if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
       if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
       return new Date(b.listedAt || b.foundAt || 0) - new Date(a.listedAt || a.foundAt || 0);
     });
-    const keep    = sorted.slice(0, 20);
-    const discard = sorted.slice(20);
-    // Only pre-mark if this is a genuinely fresh keyword (never scanned before).
-    // watcher.lastScanned will be null on first-ever add; re-adds may have stale data
-    // but the seen cache was cleared when the watch was deleted so it's safe not to pre-mark.
-    const isFirstEver = !watcher.lastScanned;
-    if (isFirstEver) {
-      const seen = await getUserSeen(watcher.userId);
-      for (const l of discard) seen[`${keyword}:${l.id}`] = Date.now();
-      await saveUserSeen(watcher.userId, seen);
-      console.log(`[InitialScan] "${keyword}" → kept 20 most recent, pre-marked ${discard.length} older listings as seen`);
-    } else {
-      console.log(`[InitialScan] "${keyword}" → kept 20 most recent, skipped pre-marking (re-add)`);
-    }
-    raw = keep;
+    console.log(`[InitialScan] "${keyword}" → passing all ${raw.length} listings through`);
   }
 
   const { newCount, userListings } = await distributeListingsToUser(watcher, raw, opts);
