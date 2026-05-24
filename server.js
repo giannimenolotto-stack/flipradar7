@@ -1202,6 +1202,24 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
   } catch (e) { console.error('[AddWatch]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
+// PATCH /watchlist/:id — update exclude words on existing watch
+app.patch('/watchlist/:id', authMiddleware, async (req, res) => {
+  try {
+    const watch = await getWatch(req.params.id);
+    if (!watch || watch.userId !== req.userId)
+      return res.status(404).json({ error: 'Not found' });
+    const { excludeWords } = req.body;
+    if (Array.isArray(excludeWords)) {
+      watch.excludeWords = excludeWords.map(w => w.toLowerCase().trim()).filter(Boolean);
+      await saveWatch(watch);
+      // Update in-memory watchlist too
+      const idx = watchlist.findIndex(w => w.id === req.params.id);
+      if (idx !== -1) watchlist[idx].excludeWords = watch.excludeWords;
+    }
+    res.json({ ok: true, excludeWords: watch.excludeWords });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
 app.delete('/watchlist/:id', authMiddleware, async (req, res) => {
   try {
     const watch = await getWatch(req.params.id);
