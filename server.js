@@ -494,9 +494,14 @@ async function scrapeKeyword(keyword, opts = {}) {
         keyword,
         listedAt,
         foundAt:  new Date().toISOString(),
-        mileage:  isVehicle ? extractMileage(title, description) : null,
-        year:     isVehicle ? extractYear(title, description)    : null,
-        make:     isVehicle ? extractMake(keyword, title)        : null,
+        mileage:       isVehicle ? (extractMileageFromVehicleInfo(item) || extractMileage(title, description)) : null,
+        year:          isVehicle ? (item.vehicle_info?.year || item.listing_vehicle_data?.year || extractYear(title, description)) : null,
+        make:          isVehicle ? (item.vehicle_info?.make || item.listing_vehicle_data?.make || extractMake(keyword, title)) : null,
+        transmission:  isVehicle ? (item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission || null) : null,
+        fuelType:      isVehicle ? (item.vehicle_info?.fuel_type || item.listing_vehicle_data?.fuel_type || item.vehicle_info?.fuelType || null) : null,
+        exteriorColor: isVehicle ? (item.vehicle_info?.exterior_color || item.listing_vehicle_data?.exterior_color || null) : null,
+        interiorColor: isVehicle ? (item.vehicle_info?.interior_color || item.listing_vehicle_data?.interior_color || null) : null,
+        bodyStyle:     isVehicle ? (item.vehicle_info?.body_style || item.listing_vehicle_data?.body_style || null) : null,
       };
     }).filter(l => l.id);
   } catch (e) {
@@ -556,6 +561,17 @@ function isVehicleKeyword(keyword) {
 function isVehicleListing(keyword, title, description) {
   const text = (keyword + ' ' + title + ' ' + (description || '')).toLowerCase();
   return VEHICLE_KEYWORDS.some(kw => text.includes(kw));
+}
+
+// Extract mileage from Apify's structured vehicle_info block (more accurate than regex)
+function extractMileageFromVehicleInfo(item) {
+  const vi = item.vehicle_info || item.listing_vehicle_data || item.vehicleInfo || {};
+  const raw = vi.odometer || vi.mileage || vi.kilometers || vi.driven_km || vi.driven || null;
+  if (!raw) return null;
+  if (typeof raw === 'number') return raw;
+  // Parse strings like "250,000 km" or "250000"
+  const parsed = parseInt(String(raw).replace(/[^0-9]/g, ''));
+  return parsed > 0 && parsed < 2000000 ? parsed : null;
 }
 
 function extractMileage(title, description) {
