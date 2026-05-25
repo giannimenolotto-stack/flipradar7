@@ -3720,24 +3720,8 @@ function appraiseListing(listing) {
         .catch(function() { window._appraisalContext.proxyFailed = true; })
     : Promise.resolve();
 
-  // Call /appraise first — returns a full cached verdict if enough price data exists,
-  // saving a credit and skipping AI entirely. On cache miss returns {found:false}.
-  var appraisePromise = (backendUrl && keyword && listing.price && !listing.isOfferPrice)
-    ? fetch(backendUrl + '/appraise', {
-        method: 'POST',
-        headers: authHeaders(),
-        body: JSON.stringify({
-          keyword: keyword,
-          price: listing.price,
-          title: listing.title,
-          description: listing.description || '',
-          make: listing.make || null,
-          model: listing.model || null,
-          year: listing.year || null,
-          mileage: listing.mileage || null
-        })
-      }).then(function(r) { return r.json(); }).catch(function() { return null; })
-    : Promise.resolve(null);
+  // Always go straight to AI — no market data pre-check
+  var appraisePromise = Promise.resolve(null);
 
   // Inline helper — shared by cache-hit and AI paths
   function showResult(r) {
@@ -3802,32 +3786,7 @@ function appraiseListing(listing) {
       return;
     }
 
-    // ── Cache-hit fast path — VPX/Carsales verdict ready, no AI or image needed ──
-    // Skip own_history for vehicles — it stores keyword prices, not vehicle prices
-    var isVehicleWeakCache = appraiseData && appraiseData.usedCache &&
-      listing.make && listing.year &&
-      appraiseData.source === 'own_history';
-    if (appraiseData && appraiseData.usedCache && !isVehicleWeakCache) {
-      clearInterval(stepTimer);
-      for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
-      var r = Object.assign({
-        extractedTitle:      listing.title,
-        extractedPrice:      listing.price || 0,
-        extractedMileage:    listing.mileage || null,
-        timeToSell:          '—',
-        demandLevel:         '—',
-        greenFlags:          [],
-        redFlags:            [],
-        whatToCheckInPerson: [],
-        whyItsWorth:         'Verdict from ' + appraiseData.dataPoints + ' real sold prices — no AI used.',
-      }, appraiseData);
-      var entry = { id: Date.now(), title: r.extractedTitle, price: r.extractedPrice, image: listing.image || null, url: listing.url || null, result: r, date: new Date().toLocaleDateString('en-AU') };
-      hist.unshift(entry); sv(); updatePill();
-      setTimeout(function() { showResult(r); }, 400);
-      return;
-    }
-
-    // ── Cache miss — need AI — wait for image proxy (already running) then call AI ──
+    // ── Wait for image proxy then call AI ──
     imageProxyPromise.then(function() {
       if (window._appraisalContext.proxyFailed) {
         toast('⚠️ Listing image expired — appraising from text only');

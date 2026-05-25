@@ -2120,17 +2120,12 @@ app.get('/prices/vehicle', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── Appraisal route — cache-first, AI fallback ────────────
-// POST /appraise  { keyword, price, title, description, make?, model?, year?, mileage? }
-// VPX checked first for vehicles; falls back to keyword history then eBay
+// ── Appraisal route — limit check only, always defers to AI ──
+// POST /appraise  { keyword, price }
 app.post('/appraise', authMiddleware, async (req, res) => {
   try {
-    const { keyword, price, title, description, make, model, year, mileage } = req.body;
+    const { keyword, price } = req.body;
     if (!keyword || !price) return res.status(400).json({ error: 'keyword and price required' });
-
-    const listingPrice = parsePrice(price);
-
-    // 1. Check appraisal limit (read-only — don't increment yet)
     const user = await _getUserCached(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today = new Date().toISOString().slice(0, 10);
@@ -2138,46 +2133,7 @@ app.post('/appraise', authMiddleware, async (req, res) => {
     const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
-
-    // 2a. Vehicle path — tiered pricing: VPX → Carsales → AutoGrab (most accurate for cars)
-    if (make && year) {
-      const resolvedModel = model || extractModel(make, title || '');
-      const priceSource = await fetchBestVehiclePrice(make, resolvedModel, year, mileage || null);
-      if (priceSource) {
-        const verdict = buildVehicleVerdict(listingPrice, priceSource, mileage || null);
-        user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-        await saveUser(user);
-        _invalidateUserCache(req.userId);
-        console.log(`[Appraise] ${make} ${resolvedModel} ${year} → ${priceSource.source} (${priceSource.sourceLabel}, conf ${Math.round((priceSource.confidence||0)*100)}%)`);
-        return res.json({ ...verdict, usedCache: true });
-      }
-    }
-
-    // 2b. Keyword price history / eBay fallback (skip for vehicle listings — VPX or AI only)
-    if (!make || !year) {
-      const priceData = await getPriceCacheForKeyword(keyword);
-      if (priceData) {
-        const verdict = buildCacheVerdict(listingPrice, priceData);
-        user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-        await saveUser(user);
-        _invalidateUserCache(req.userId);
-        console.log(`[Appraise] "${keyword}" → served from ${verdict.source} cache (no AI used)`);
-        return res.json({ ...verdict, usedCache: true });
-      }
-    }
-
-    // 3. Not enough price data — caller (frontend) must use AI directly
-    user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-    await saveUser(user);
-    _invalidateUserCache(req.userId);
-    console.log(`[Appraise] "${keyword}" → no cache, AI required`);
-    res.json({
-      found:      false,
-      usedCache:  false,
-      message:    'No price data yet — use AI appraisal',
-      used:       user.appraisalsToday,
-      limit:      limit === Infinity ? -1 : limit,
-    });
+    res.json({ found: false, usedCache: false });
   } catch (e) { console.error('[Appraise]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -2431,10 +2387,8 @@ app.post('/seed/vehicles', authMiddleware, async (req, res) => {
 // Redis key for push subscriptions
 const K_push = userId => `fr:push:${userId}`;
 
-// POST /ai/vehicle — vehicle-specific appraisal with market context injection
+// POST /ai/vehicle — vehicle-specific AI appraisal (pure AI, no market data lookup)
 // Body: { make, model, year, mileage, listingPrice, title, description, imageUrl?, imageBase64?, imageMime? }
-// Fetches VPX stats, builds a structured market-context prompt, calls Gemini Flash.
-// AI role is condition/risk assessor, not price guesser — reduces hallucination.
 app.post('/ai/vehicle', authMiddleware, async (req, res) => {
   try {
     if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
@@ -2444,27 +2398,6 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
 
     const cr = await consumeAppraisal(req.userId);
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
-
-    // Build market context block from best available pricing source
-    let marketContext = '';
-    let vpxStats = null;
-    if (make && year) {
-      const resolvedModel = model || extractModel(make, title || '');
-      vpxStats = await fetchBestVehiclePrice(make, resolvedModel, year, mileage || null);
-    }
-    if (vpxStats) {
-      const adj      = vpxStats.mileageAdjusted ? ` (adjusted for ${(mileage || 0).toLocaleString()}km)` : '';
-      const pricedAt = Number(listingPrice);
-      const discountPct = vpxStats.marketMedian > 0
-        ? Math.round(((vpxStats.marketMedian - pricedAt) / pricedAt) * 100) : 0;
-      const srcNote = vpxStats.sourceLabel || (vpxStats.samples ? `${vpxStats.samples} AU samples` : 'AU market data');
-      marketContext = `\n\nMARKET DATA (${srcNote}${adj}):
-- Market median: $${vpxStats.marketMedian.toLocaleString()}
-- Typical range: $${vpxStats.marketLow.toLocaleString()} – $${vpxStats.marketHigh.toLocaleString()}
-- Listing price: $${pricedAt.toLocaleString()}
-- ${discountPct >= 0 ? `${discountPct}% below` : `${Math.abs(discountPct)}% above`} market median
-- Data confidence: ${Math.round((vpxStats.confidence || 0) * 100)}%`;
-    }
 
     const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
     const vehicleDetails = [
@@ -2483,18 +2416,16 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
 - Over 250,000 km: hard sell — price well below median, expect long time-to-sell`
       : '';
 
-    const prompt = `You are an expert Australian used-vehicle flipper and assessor. Your goal is conservative, realistic flip analysis — do NOT overestimate profit potential.
+    const prompt = `You are an expert Australian used-vehicle flipper and assessor. Your goal is conservative, realistic flip analysis using your knowledge of the AU used-car market — do NOT overestimate profit potential.
 
 VEHICLE DETAILS:
 ${vehicleDetails}
-${marketContext}${mileageGuide}
+${mileageGuide}
 
 LISTING TITLE: ${title || '(not provided)'}
 DESCRIPTION: ${description || '(not provided)'}
 
-${vpxStats
-  ? 'Market data is provided above. Use it as your primary pricing anchor — do NOT invent or significantly deviate from these figures. Your role is condition and risk assessor. Apply mileage depreciation on top of market median when appropriate.'
-  : 'No local market data available — use your knowledge of the AU used-car market to estimate pricing conservatively. Apply the mileage guide above.'}
+Use your knowledge of AU used-car pricing to estimate market value conservatively. Apply the mileage guide above when mileage is provided.
 
 Flip guidance: account for selling fees (~8% on Facebook/Gumtree), detailing/minor repairs (~$200–500), and time cost. Only call it a STEAL if the margin is genuinely exceptional after all these costs.
 
