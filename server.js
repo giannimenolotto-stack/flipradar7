@@ -2872,4 +2872,38 @@ app.listen(PORT, async () => {
   console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
   await loadAllWatches();
   console.log('[Ready] Server fully loaded');
+
+  // ── Auto-seed vehicle market data on first boot ───────────
+  // Checks a permanent Redis flag before doing anything — safe to redeploy as many
+  // times as you like, the seed only ever runs once unless you delete fr:seed:done.
+  if (APIFY_TOKEN) {
+    (async () => {
+      try {
+        const already = await redisGet('fr:seed:done');
+        if (already) {
+          console.log(`[AutoSeed] Skipping — already seeded on ${already.seededAt}`);
+          return;
+        }
+        console.log(`[AutoSeed] First boot detected — seeding ${TOP_AU_SEED_MODELS.length} vehicle cohorts in background...`);
+        let seeded = 0, failed = 0;
+        for (const { make, model, year } of TOP_AU_SEED_MODELS) {
+          try {
+            const n = await scrapeCarsalesForModel(make, model, year);
+            if (n > 0) seeded++;
+            else failed++;
+          } catch (e) {
+            console.error(`[AutoSeed] ${make} ${model} ${year}:`, e.message);
+            failed++;
+          }
+          await sleep(2000); // stay polite to Apify + Carsales
+        }
+        await redisSet('fr:seed:done', { seededAt: new Date().toISOString(), seeded, failed });
+        console.log(`[AutoSeed] Done — ${seeded} cohorts seeded, ${failed} failed`);
+      } catch (e) {
+        console.error('[AutoSeed] Fatal error:', e.message);
+      }
+    })();
+  } else {
+    console.log('[AutoSeed] Skipping — no APIFY_TOKEN set');
+  }
 });
