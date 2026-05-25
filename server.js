@@ -2307,8 +2307,12 @@ app.post('/appraise', authMiddleware, async (req, res) => {
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
 
-    // 2a. Vehicle path — tiered pricing: VPX → Carsales → AutoGrab (most accurate for cars)
-    if (make && year) {
+    // 2a. Vehicle path — tiered pricing: bucket → VPX → Carsales → AutoGrab
+    // Vehicles NEVER fall through to eBay or keyword history — those sources mix
+    // unrelated listings and produce garbage verdicts on thin data.
+    // If no confident vehicle data exists, go straight to AI.
+    const isVehicle = !!(make && year);
+    if (isVehicle) {
       const resolvedModel = model || extractModel(make, title || '');
       const priceSource = await fetchBestVehiclePrice(make, resolvedModel, year, mileage || null);
       if (priceSource) {
@@ -2319,20 +2323,27 @@ app.post('/appraise', authMiddleware, async (req, res) => {
         console.log(`[Appraise] ${make} ${resolvedModel} ${year} → ${priceSource.source} (${priceSource.sourceLabel}, conf ${Math.round((priceSource.confidence||0)*100)}%)`);
         return res.json({ ...verdict, usedCache: true });
       }
-    }
-
-    // 2b. Keyword price history / eBay fallback
-    const priceData = await getPriceCacheForKeyword(keyword);
-    if (priceData) {
-      const verdict = buildCacheVerdict(listingPrice, priceData);
+      // No confident vehicle data — tell frontend to call AI
       user.appraisalsToday = (user.appraisalsToday || 0) + 1;
       await saveUser(user);
       _invalidateUserCache(req.userId);
-      console.log(`[Appraise] "${keyword}" → served from ${verdict.source} cache (no AI used)`);
+      console.log(`[Appraise] ${make} ${resolvedModel} ${year} → no vehicle data, AI required`);
+      return res.json({ found: false, usedCache: false, message: 'No vehicle data yet — use AI appraisal' });
+    }
+
+    // 2b. Non-vehicle keyword — own scan history only (no eBay)
+    // eBay mixes international listings, wrong categories, and wrong price points.
+    const ownPrices = await getOwnPriceRange(keyword);
+    if (ownPrices) {
+      const verdict = buildCacheVerdict(listingPrice, ownPrices);
+      user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+      await saveUser(user);
+      _invalidateUserCache(req.userId);
+      console.log(`[Appraise] "${keyword}" → own history (${ownPrices.count} records)`);
       return res.json({ ...verdict, usedCache: true });
     }
 
-    // 3. Not enough price data — caller (frontend) must use AI directly
+    // 3. Non-vehicle, no own history — caller must use AI
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
     _invalidateUserCache(req.userId);
