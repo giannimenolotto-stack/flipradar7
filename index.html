@@ -3492,7 +3492,8 @@ function autoAppraise(items) {
 
     priceFetch.then(function(priceData) {
     var ebayContext = '';
-    if (priceData && priceData.found && priceData.median) {
+    var batchHasVehicles = batch.some(function(l) { return l && l.make && l.year; });
+    if (priceData && priceData.found && priceData.median && !batchHasVehicles) {
       ebayContext = ' MARKET DATA: eBay sold prices for "' + watchKeyword + '" — low $' + priceData.low + ', median $' + priceData.median + ', high $' + priceData.high + '. Use this to judge Green/Yellow/Red/Rainbow.';
     }
     var prompt = 'You are an Australian secondhand market expert filtering and rating listings for someone searching: "' + watchKeyword + '". Decide if each listing is relevant then rate it. VEHICLES: if searching for a car/ute/van/bike model (e.g. "bmw e36", "hilux", "patrol") then the actual vehicle = relevant:true. Parts, wrecking, manuals, merchandise, toys, models, books about that car = relevant:false. NON-VEHICLES: if searching "electric scooter" then electric/motorised scooters, any brand (Ninebot, Segway etc) = relevant:true. Trick/stunt/push/kids scooters = relevant:false. If searching "golf clubs" then actual clubs, irons, drivers, putters, wedges = relevant:true. Golf balls, shoes, bags alone, books, accessories = relevant:false. For ALL other keywords use common sense — only mark relevant:false if it clearly has nothing to do with what they want. When in doubt: relevant:true. Rate relevant items: Green=30%+ below market, Yellow=fair, Red=overpriced, Rainbow=50%+ below market steal.' + ebayContext + ' Reply ONLY as JSON array: [{"idx":0,"rating":"yellow","reason":"Fair price","relevant":true}]. Max 6 words reason. Listings: ' + lines;
@@ -3519,6 +3520,7 @@ function autoAppraise(items) {
             var listing = batch[r.idx];
             if (!listing || !listing.price || r.relevant === false) return r;
             if (listing.isOfferPrice) return r; // placeholder — never compute ROI from fake price
+            if (listing.make && listing.year) return r; // whole vehicle — eBay returns parts not cars
             var median = priceData.median;
             var roi = Math.round(((median - listing.price) / listing.price) * 100);
             var rating, reason;
@@ -3853,7 +3855,7 @@ function appraiseListing(listing) {
     // For vehicles, own_history/ebay verdicts are too inaccurate — fall through to AI
     var isVehicleWeakCache = appraiseData && appraiseData.usedCache &&
       listing.make && listing.year &&
-      (appraiseData.source === 'own_history' || appraiseData.source === 'ebay');
+      (appraiseData.source === 'own_history' || appraiseData.source === 'ebay_sold');
     if (appraiseData && appraiseData.usedCache && !isVehicleWeakCache) {
       clearInterval(stepTimer);
       for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
