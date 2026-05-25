@@ -1353,6 +1353,60 @@ function getDepRates(make, model) {
   return DEP_TABLE[(make || '').toLowerCase()] || DEP_TABLE._default;
 }
 
+// ── Fallback mileage estimator ────────────────────────────
+// Called when no odometer data is available. Returns a conservative age-based
+// estimate so the AI has a concrete number instead of a vague "unknown" instruction.
+// Diesel 4WDs tolerate higher km usage patterns; European cars tend to do less AU km.
+// All estimates are intentionally mid-conservative — not punishing, not optimistic.
+function estimateMileage(year, make, model) {
+  const currentYear = new Date().getFullYear();
+  const age = Math.max(0, currentYear - parseInt(year || currentYear));
+  if (age < 3) return { km: 40000, isEstimate: true, label: 'estimated from age' };
+
+  const m = (model || '').toLowerCase();
+  const mk = (make  || '').toLowerCase();
+  const isDiesel4WD = DIESEL_4WD_MODELS.some(d => m.includes(d));
+
+  let kmPerYear, cap;
+  if (isDiesel4WD) {
+    // Workhorses — driven more but built for it
+    kmPerYear = 15000; cap = 220000;
+  } else if (['toyota','mazda','honda','lexus','subaru'].includes(mk)) {
+    // Reliable Japanese — steady AU usage
+    kmPerYear = 14000; cap = 200000;
+  } else if (['bmw','audi','mercedes','volkswagen','volvo','peugeot','renault','citroen','alfa'].includes(mk)) {
+    // European — typically lower km in AU, higher repair risk
+    kmPerYear = 12000; cap = 185000;
+  } else {
+    kmPerYear = 13000; cap = 195000;
+  }
+
+  const km = Math.min(Math.round(age * kmPerYear / 5000) * 5000, cap);
+  return { km, isEstimate: true, label: 'estimated from age' };
+}
+
+// Vehicle category label — injected into prompt for model-specific context
+function getVehicleCategory(make, model) {
+  const m = (model || '').toLowerCase();
+  const mk = (make  || '').toLowerCase();
+  if (DIESEL_4WD_MODELS.some(d => m.includes(d))) {
+    return 'diesel 4WD/ute platform — higher km tolerance, strong AU resale demand, parts availability good';
+  }
+  if (['toyota','mazda','honda','lexus'].includes(mk)) {
+    return 'reliable Japanese platform — steady depreciation, good parts, reasonable resale';
+  }
+  if (['bmw','audi','mercedes','volkswagen'].includes(mk)) {
+    return 'European — factor in elevated service/repair costs, narrower buyer pool, harder resell at high km';
+  }
+  if (['holden'].includes(mk)) {
+    return 'Holden — no longer manufactured, parts becoming scarcer, buyer pool narrowing over time';
+  }
+  if (['ford'].includes(mk) && ['falcon','territory'].some(d => m.includes(d))) {
+    return 'discontinued Ford AU model — similar concerns to Holden, narrowing buyer pool';
+  }
+  return null;
+}
+
 // Confidence score: how much to trust this pricing source (0–1).
 // Drives: AI skip threshold, border glow intensity, "confidence" display bar.
 function calcConfidence(source, count = 0) {
@@ -2496,34 +2550,54 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
     const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
+
+    // ── Fallback mileage estimation ───────────────────────
+    // If no odometer data, estimate from age/make/model so AI has a concrete number.
+    // mileageIsEstimate drives post-parse confidence penalty and verdict cap.
+    let effectiveMileage = mileage ? parseInt(mileage) : null;
+    let mileageIsEstimate = false;
+    let mileageEstimateKm = null;
+    if (!effectiveMileage && year) {
+      const est = estimateMileage(year, make, model);
+      effectiveMileage  = est.km;
+      mileageIsEstimate = true;
+      mileageEstimateKm = est.km;
+    }
+
+    const vehicleCategory = getVehicleCategory(make, model);
+
     const vehicleDetails = [
       `Make/Model/Year: ${carLabel}`,
-      mileage ? `Mileage: ${Number(mileage).toLocaleString()} km` : null,
+      effectiveMileage
+        ? `Mileage: ${effectiveMileage.toLocaleString()} km${mileageIsEstimate ? ' (estimated from age — actual unknown)' : ''}`
+        : null,
       transmission ? `Transmission: ${transmission}` : null,
       `Listing Price: $${Number(listingPrice).toLocaleString()}`,
+      vehicleCategory ? `Vehicle type: ${vehicleCategory}` : null,
     ].filter(Boolean).join('\n');
 
-    const mileageGuide = mileage
-      ? `Mileage context: <80k premium, 80-130k normal, 130-180k ~10-20% below median, 180-250k ~25-40% below, >250k hard sell.`
-      : `Mileage not provided - flag as red flag, widen resell range to reflect uncertainty.`;
+    const mileageGuide = effectiveMileage
+      ? (mileageIsEstimate
+          ? `Mileage is estimated (~${effectiveMileage.toLocaleString()} km based on age) — actual km unknown. Treat conservatively. Use broader resale range. Do NOT appraise as a verified low-km example.`
+          : `Mileage context: <80k premium, 80-130k normal, 130-180k ~10-20% below median, 180-250k ~25-40% below, >250k hard sell${vehicleCategory && vehicleCategory.includes('diesel 4WD') ? ' (diesel 4WDs tolerate higher km — adjust accordingly)' : ''}.`)
+      : `Mileage completely unknown — assume high km scenario, widen range significantly, reduce confidence.`;
 
     // Patch E: inject FlipRadar's own AU scan data when we have enough samples.
-    // Anchors Gemini to real AU private-sale prices instead of general knowledge.
     let vpxContext = '';
     if (make && model && year) {
       try {
-        const vpx = await getVehiclePriceStats(make, model, parseInt(year), mileage ? parseInt(mileage) : null);
+        const vpx = await getVehiclePriceStats(make, model, parseInt(year), effectiveMileage || null);
         if (vpx && vpx.samples >= 10) {
           const fmtP = n => '$' + (Math.round(n / 500) * 500).toLocaleString();
           vpxContext = `\nFLIPRADAR AU DATA (${vpx.samples} comparable AU private-sale listings):\n`
             + `Market median: ${fmtP(vpx.marketMedian)}${vpx.mileageAdjusted ? ' (mileage-adjusted)' : ''}\n`
             + `Range: ${fmtP(vpx.marketLow)} - ${fmtP(vpx.marketHigh)}\n`
-            + `Use these as your primary pricing anchor. Estimates should be within ~20% of the median unless exceptional reason.`;
+            + `Use these as your primary pricing anchor. Stay within ~20% of median unless exceptional reason.`;
         }
-      } catch (_) {} // VPX lookup is best-effort; never block appraisal
+      } catch (_) {}
     }
 
-    const prompt = `You are an expert Australian used-vehicle flipper. Analyse conservatively using AU private-sale market knowledge.
+    const prompt = `You are an expert Australian used-vehicle appraiser and flipper. Produce a realistic, detailed, risk-aware appraisal using AU private-sale market knowledge.
 
 VEHICLE:
 ${vehicleDetails}
@@ -2532,15 +2606,20 @@ ${mileageGuide}${vpxContext}
 TITLE: ${title || '(not provided)'}
 DESCRIPTION: ${description || '(not provided)'}
 
-RULES:
-- Deduct ~8% selling fees + $200-500 prep before calculating profit
-- STEAL only if margin is genuinely exceptional after all costs
-- Use round numbers ($500 increments) - no fake precision like $11,847
-- If uncertain, use wider resell range and softer wording in whyItsWorth
-- Broken/project (spares, not running, damage, blown HG, needs work, as-is): isBrokenOrProject true, realistic repairEstimate AUD, subtract from profit, cap verdict at FAIR
+APPRAISAL REQUIREMENTS:
+- Be specific to this make/model — mention known reliability issues, common faults, typical repair costs for AU market
+- Assess realistic flip difficulty: is there an actual buyer pool? How long to sell?
+- Account for ALL costs: ~8% selling fees, $200-500 detailing/prep, any likely repairs
+- STEAL only if margin is genuinely exceptional after ALL costs — be skeptical
+- If mileage is estimated: treat as high-km scenario, widen resale range, reduce profit projection
+- Use round numbers ($500 increments) — never fake precision like $11,847
+- If uncertain: use FAIR verdict, broader range, and explain why in whyItsWorth
+- Broken/project: isBrokenOrProject true, realistic repairEstimate AUD, subtract from profit, cap at FAIR
+- confidence: 0.9 if real kms + strong data, 0.6-0.7 if estimated kms, 0.3-0.5 if very uncertain
+- mileageSource: "real" if actual odometer provided, "estimated" if inferred from age
 
 Respond ONLY with raw JSON (no markdown):
-{"verdict":"STEAL|GOOD DEAL|FAIR|PASS","dealScore":0-100,"oneLiner":"punchy sentence","extractedTitle":"cleaned title","extractedPrice":number,"extractedMileage":number or null,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"roiPercent":number,"timeToSell":"e.g. 1-3 days","demandLevel":"High or Moderate or Low","whyItsWorth":"1-2 sentences","greenFlags":["..."],"redFlags":["..."],"whatToCheckInPerson":["..."],"negotiationScript":"what to say","isBrokenOrProject":false,"repairEstimate":0,"repairNotes":"","aiGenerated":true}`;
+{"verdict":"STEAL|GOOD DEAL|FAIR|PASS","dealScore":0-100,"oneLiner":"punchy sentence","extractedTitle":"cleaned title","extractedPrice":number,"extractedMileage":number or null,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"roiPercent":number,"timeToSell":"e.g. 1-3 days","demandLevel":"High or Moderate or Low","whyItsWorth":"2-3 sentences including specific model risks and flip realism","greenFlags":["..."],"redFlags":["..."],"whatToCheckInPerson":["..."],"negotiationScript":"what to say","isBrokenOrProject":false,"repairEstimate":0,"repairNotes":"","confidence":0.7,"mileageSource":"real|estimated","aiGenerated":true}`;
 
     // Prefer Gemini when image is available, otherwise Claude Haiku
     let text = '';
@@ -2585,6 +2664,44 @@ Respond ONLY with raw JSON (no markdown):
     } catch (_) {}
 
     if (parsed) {
+      // ── Post-parse enforcement ─────────────────────────
+      // Server enforces conservative rules regardless of what Gemini returned.
+      // This prevents the AI from being optimistic despite our instructions.
+
+      // 1. Clamp money fields to $500 increments — no fake precision
+      const round500 = n => n ? Math.round(n / 500) * 500 : n;
+      for (const f of ['estimatedMarketValue','estimatedResellLow','estimatedResellHigh','recommendedOffer','walkAwayPrice','estimatedProfit']) {
+        if (parsed[f] != null) parsed[f] = round500(parsed[f]);
+      }
+
+      // 2. Stamp mileage source from server — don't trust AI's self-report alone
+      parsed.mileageSource = mileageIsEstimate ? 'estimated' : (mileage ? 'real' : 'unknown');
+      if (mileageIsEstimate) parsed.extractedMileage = mileageEstimateKm;
+
+      // 3. Confidence cap for estimated/unknown mileage
+      if (mileageIsEstimate) {
+        parsed.confidence = Math.min(parsed.confidence ?? 0.7, 0.62);
+        parsed.dealScore  = Math.max(0, (parsed.dealScore || 0) - 10);
+      }
+      if (!mileage && !mileageIsEstimate) {
+        parsed.confidence = Math.min(parsed.confidence ?? 0.5, 0.45);
+        parsed.dealScore  = Math.max(0, (parsed.dealScore || 0) - 15);
+      }
+
+      // 4. Verdict cap for estimated mileage — can't call it a STEAL without real kms
+      if (mileageIsEstimate || !mileage) {
+        if (parsed.verdict === 'STEAL') {
+          parsed.verdict   = 'GOOD DEAL';
+          parsed.oneLiner  = (parsed.oneLiner || '') + ' (kms unverified — treat with caution)';
+        }
+      }
+
+      // 5. Confidence cap for weak confidence — downgrade borderline verdicts
+      const conf = parsed.confidence ?? 1;
+      if (conf < 0.5 && parsed.verdict === 'GOOD DEAL' && (parsed.dealScore || 0) < 65) {
+        parsed.verdict = 'FAIR';
+      }
+
       res.json({ ...parsed, text, usedCache: false });
     } else {
       res.json({ text, usedCache: false });
