@@ -60,7 +60,6 @@ const K = {
   watch:       id  => `fr:watch:${id}`,
   listings:    uid => `fr:listings:${uid}`,
   seen:        uid => `fr:seen:${uid}`,
-  ebay:        kw  => `fr:ebay:${kw.toLowerCase().trim()}`,
   prices:      kw  => `fr:prices:${kw.toLowerCase().trim()}`,
   sharedScan:  kw  => `fr:scan:${kw.toLowerCase().trim()}`,  // shared scan cache across all users
   enrich:      id  => `fr:enrich:${id}`,                     // slim enrichment data per listing (7-day TTL)
@@ -73,8 +72,6 @@ const K = {
 // ── Auth ──────────────────────────────────────────────────
 const JWT_SECRET     = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
-const EBAY_APP_ID    = process.env.EBAY_APP_ID || null;   // free at developer.ebay.com
-
 // ── Stripe ────────────────────────────────────────────────
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || null;
 const PRICE_IDS = {
@@ -95,9 +92,6 @@ const FROM_EMAIL    = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.c
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
 
-// ── eBay price cache settings ─────────────────────────────
-const EBAY_CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours — 1 eBay call per keyword per day max
-const EBAY_MIN_RESULTS    = 5;                     // need at least 5 sold prices to skip AI
 const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
 const VPX_REF_KM          = 100000;               // mileage reference for price normalization
 const VPX_MIN_SAMPLES     = 5;                    // samples needed to use VPX instead of AI
@@ -251,91 +245,8 @@ async function saveUserSeen(userId, seen, { merge = true } = {}) {
   await redisSet(K.seen(userId), pruned);
 }
 
-// ── eBay sold price cache (FREE — official eBay API) ──────
-const _ebayInflight = new Map(); // deduplicates concurrent requests for same keyword
-const EBAY_RATE_LIMIT_TTL_MS = 5 * 60 * 1000; // 5 min negative cache on rate limit errors
-
-async function getEbaySoldPrices(keyword) {
-  if (!EBAY_APP_ID) return null;
-
-  // Serve from cache — handles both positive results and rate-limit sentinels
-  const cached = await redisGet(K.ebay(keyword));
-  if (cached) {
-    if (cached._rateLimited && (Date.now() - new Date(cached.fetchedAt).getTime()) < EBAY_RATE_LIMIT_TTL_MS) {
-      console.log(`[eBay] "${keyword}" → rate-limited (cached)`);
-      return null;
-    }
-    if (!cached._rateLimited && (Date.now() - new Date(cached.fetchedAt).getTime()) < EBAY_CACHE_TTL_MS) {
-      console.log(`[eBay] "${keyword}" → cache hit (${cached.count} prices, median $${cached.median})`);
-      return cached;
-    }
-  }
-
-  // In-flight deduplication — concurrent callers share one eBay request
-  if (_ebayInflight.has(keyword)) {
-    console.log(`[eBay] "${keyword}" → joining in-flight request`);
-    return _ebayInflight.get(keyword);
-  }
-
-  const promise = (async () => {
-    try {
-      const url = `https://svcs.ebay.com.au/services/search/FindingService/v1` +
-        `?OPERATION-NAME=findCompletedItems` +
-        `&SERVICE-VERSION=1.0.0` +
-        `&SECURITY-APPNAME=${EBAY_APP_ID}` +
-        `&RESPONSE-DATA-FORMAT=JSON` +
-        `&GLOBAL-ID=EBAY-AU` +
-        `&keywords=${encodeURIComponent(keyword)}` +
-        `&itemFilter(0).name=SoldItemsOnly&itemFilter(0).value=true` +
-        `&sortOrder=EndTimeSoonest` +
-        `&paginationInput.entriesPerPage=100`;
-
-      console.log(`[eBay] Fetching AU sold prices for "${keyword}"...`);
-      const res   = await axios.get(url, { timeout: 15000 });
-      const items = res.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
-      console.log(`[eBay] "${keyword}" → ${items.length} raw results from API`);
-
-      const prices = items
-        .map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0))
-        .filter(p => p > 0)
-        .sort((a, b) => a - b);
-
-      if (!prices.length) {
-        console.log(`[eBay] "${keyword}" → 0 sold prices after filtering`);
-        return null;
-      }
-
-      const result = {
-        prices,
-        low:       prices[0],
-        high:      prices[prices.length - 1],
-        median:    prices[Math.floor(prices.length / 2)],
-        avg:       Math.round(prices.reduce((a, b) => a + b, 0) / prices.length),
-        count:     prices.length,
-        fetchedAt: new Date().toISOString(),
-        source:    'ebay_sold',
-      };
-
-      await redisSet(K.ebay(keyword), result);
-      console.log(`[eBay] "${keyword}" → ${prices.length} AU sold prices, median $${result.median}`);
-      return result;
-    } catch (e) {
-      console.error(`[eBay] Error for "${keyword}":`, e.response?.status, e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : e.message);
-      // Cache rate-limit errors so retries don't immediately hammer eBay again
-      await redisSet(K.ebay(keyword), { _rateLimited: true, fetchedAt: new Date().toISOString() });
-      return null;
-    } finally {
-      _ebayInflight.delete(keyword);
-    }
-  })();
-
-  _ebayInflight.set(keyword, promise);
-  return promise;
-}
-
 // ── Our own scan price history ────────────────────────────
 // Every time we see a listing for a keyword, store its price
-// Builds up over time — eventually replaces eBay for popular keywords
 async function storeScanPrice(keyword, listing) {
   if (!listing.price || listing.price <= 0) return;
   if (listing.isOfferPrice) return; // placeholder prices pollute keyword price history
@@ -638,14 +549,7 @@ async function getPriceCacheForKeyword(keyword) {
     return own;
   }
 
-  // 2. Fall back to eBay sold prices (free API)
-  const ebay = await getEbaySoldPrices(keyword);
-  if (ebay && ebay.count >= EBAY_MIN_RESULTS) {
-    console.log(`[PriceCache] "${keyword}" → eBay cache (${ebay.count} records), skipping AI`);
-    return ebay;
-  }
-
-  // 3. Not enough data — caller should use AI
+  // 2. Not enough data — caller should use AI
   console.log(`[PriceCache] "${keyword}" → no cache, AI needed`);
   return null;
 }
@@ -693,7 +597,7 @@ function buildCacheVerdict(listingPrice, priceData) {
     dataPoints:          count,
     source,
     low, median, high,
-    negotiationScript:   `This is going for around $${median} sold on eBay AU — would you take $${Math.round(listingPrice * 0.85)}?`,
+    negotiationScript:   `Similar listings sell for around $${median} — would you take $${Math.round(listingPrice * 0.85)}?`,
   };
 }
 
@@ -1402,7 +1306,6 @@ function calcConfidence(source, count = 0) {
     case 'autograb':    return 0.87;  // RedBook industry data
     case 'csales':      return Math.min(0.82, 0.55 + count * 0.018); // grows with listing count
     case 'own_history': return Math.min(0.55, 0.28 + count * 0.015);
-    case 'ebay_sold':   return Math.min(0.50, 0.25 + count * 0.015);
     default:            return 0.20;
   }
 }
@@ -2192,14 +2095,11 @@ app.post('/listings/remove', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── Price cache route — lets frontend check before triggering AI ──
-// GET /prices?keyword=ps5&refresh=1  (refresh=1 busts the eBay cache for testing)
+// ── Price cache route — lets frontend check own scan history before triggering AI ──
 app.get('/prices', authMiddleware, async (req, res) => {
   try {
-    const { keyword, refresh } = req.query;
+    const { keyword } = req.query;
     if (!keyword) return res.status(400).json({ error: 'keyword required' });
-    console.log('[Prices] Request for keyword:', keyword, '| EBAY_APP_ID set:', !!EBAY_APP_ID);
-    if (refresh === '1') await redisDel(K.ebay(keyword.toLowerCase().trim()));
     const priceData = await getPriceCacheForKeyword(keyword);
     console.log('[Prices] Result for', keyword, ':', priceData ? 'found (' + priceData.count + ' prices, median $' + priceData.median + ')' : 'not found');
     if (!priceData) return res.json({ found: false, keyword });
@@ -2826,7 +2726,6 @@ app.listen(PORT, async () => {
   console.log(`FlipRadar backend on port ${PORT}`);
   console.log(`Apify:      ${APIFY_TOKEN     ? 'set' : 'NO TOKEN'}`);
   console.log(`Redis:      ${REDIS_URL        ? 'connected' : 'NOT SET'}`);
-  console.log(`eBay:       ${EBAY_APP_ID      ? 'connected' : 'NOT SET — add EBAY_APP_ID env var (free at developer.ebay.com)'}`);
   console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
   console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
   await loadAllWatches();
