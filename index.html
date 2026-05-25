@@ -3843,16 +3843,44 @@ function appraiseListing(listing) {
     }
   }
 
-  // Run image proxy + /appraise in parallel, then decide which path to take
-  Promise.all([imageProxyPromise, appraisePromise]).then(function(results) {
-    var appraiseData = results[1];
+  function _showErr(msg) {
+    clearInterval(stepTimer);
+    document.getElementById('lw').classList.remove('on');
+    document.getElementById('scrScan').classList.add('on');
+    showErr(msg);
+  }
 
-    if (window._appraisalContext.proxyFailed) {
-      toast('⚠️ Listing image expired — appraising from text only');
+  function _finishAI(r) {
+    clearInterval(stepTimer);
+    for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
+    r = Object.assign({
+      extractedTitle:      listing.title,
+      extractedPrice:      listing.price || 0,
+      extractedMileage:    listing.mileage || null,
+      timeToSell:          '—',
+      demandLevel:         '—',
+      greenFlags:          [],
+      redFlags:            [],
+      whatToCheckInPerson: [],
+      whyItsWorth:         ''
+    }, r);
+    if (listing.isOfferPrice) normalizeOfferPriceResult(r);
+    var entry = { id: Date.now(), title: r.extractedTitle, price: r.extractedPrice || listing.price, image: listing.image || null, url: listing.url || null, result: r, date: new Date().toLocaleDateString('en-AU') };
+    hist.unshift(entry); sv(); updatePill();
+    setTimeout(function() { showResult(r); }, 400);
+  }
+
+  // /appraise resolves first — check for cache hit or limit hit immediately (no image needed)
+  appraisePromise.then(function(appraiseData) {
+
+    // ── Limit hit ──
+    if (appraiseData && appraiseData.error) {
+      _showErr('❌ ' + appraiseData.error);
+      return;
     }
 
-    // ── Cache-hit fast path — full verdict from price data, no AI call ──
-    // For vehicles, own_history/ebay verdicts are too inaccurate — fall through to AI
+    // ── Cache-hit fast path — VPX/Carsales verdict ready, no AI or image needed ──
+    // Skip weak cache sources for vehicles (own_history/ebay = parts prices)
     var isVehicleWeakCache = appraiseData && appraiseData.usedCache &&
       listing.make && listing.year &&
       (appraiseData.source === 'own_history' || appraiseData.source === 'ebay_sold');
@@ -3876,84 +3904,52 @@ function appraiseListing(listing) {
       return;
     }
 
-    // ── Limit hit returned by /appraise — surface it immediately ──
-    if (appraiseData && appraiseData.error) {
-      clearInterval(stepTimer);
-      document.getElementById('lw').classList.remove('on');
-      document.getElementById('scrScan').classList.add('on');
-      showErr('❌ ' + appraiseData.error);
-      return;
-    }
-
-    // ── Cache miss — vehicle uses /ai/vehicle; non-vehicle uses callAI_text ──
-    if (listing.make && listing.year && backendUrl) {
-      var vehiclePayload = {
-        make: listing.make,
-        model: listing.model || '',
-        year: listing.year,
-        mileage: listing.mileage || null,
-        transmission: listing.transmission || null,
-        listingPrice: listing.price,
-        title: listing.title,
-        description: listing.description || ''
-      };
-      var imgCtx = window._appraisalContext;
-      if (imgCtx && imgCtx.imageB64 && !imgCtx.proxyFailed) {
-        vehiclePayload.imageBase64 = imgCtx.imageB64;
-        vehiclePayload.imageMime   = imgCtx.mediaType || 'image/jpeg';
+    // ── Cache miss — need AI — wait for image proxy (already running) then call AI ──
+    imageProxyPromise.then(function() {
+      if (window._appraisalContext.proxyFailed) {
+        toast('⚠️ Listing image expired — appraising from text only');
       }
-      fetch(backendUrl + '/ai/vehicle', {
-        method: 'POST',
-        headers: authHeaders(),
-        body: JSON.stringify(vehiclePayload)
-      }).then(function(resp) { return resp.json(); })
-      .then(function(r) {
+
+      // Vehicle path — /ai/vehicle with mileage/year/make context + image if available
+      if (listing.make && listing.year && backendUrl) {
+        var vehiclePayload = {
+          make: listing.make,
+          model: listing.model || '',
+          year: listing.year,
+          mileage: listing.mileage || null,
+          transmission: listing.transmission || null,
+          listingPrice: listing.price,
+          title: listing.title,
+          description: listing.description || ''
+        };
+        var imgCtx = window._appraisalContext;
+        if (imgCtx && imgCtx.imageB64 && !imgCtx.proxyFailed) {
+          vehiclePayload.imageBase64 = imgCtx.imageB64;
+          vehiclePayload.imageMime   = imgCtx.mediaType || 'image/jpeg';
+        }
+        fetch(backendUrl + '/ai/vehicle', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify(vehiclePayload)
+        }).then(function(resp) { return resp.json(); })
+          .then(_finishAI)
+          .catch(function(e) { _showErr('Error: ' + e.message); });
+        return;
+      }
+
+      // Non-vehicle — call AI text path
+      callAI_text(txt, keyword).then(function(r) {
         clearInterval(stepTimer);
         for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
-        r = Object.assign({
-          extractedTitle:      listing.title,
-          extractedPrice:      listing.price || 0,
-          extractedMileage:    listing.mileage || null,
-          timeToSell:          '—',
-          demandLevel:         '—',
-          greenFlags:          [],
-          redFlags:            [],
-          whatToCheckInPerson: [],
-          whyItsWorth:         ''
-        }, r);
         if (listing.isOfferPrice) normalizeOfferPriceResult(r);
-        var entry = { id: Date.now(), title: r.extractedTitle, price: r.extractedPrice || listing.price, image: listing.image || null, url: listing.url || null, result: r, date: new Date().toLocaleDateString('en-AU') };
+        var entry = { id: Date.now(), title: r.extractedTitle || listing.title, price: r.extractedPrice || listing.price, image: listing.image || null, url: listing.url || null, result: r, date: new Date().toLocaleDateString('en-AU') };
         hist.unshift(entry); sv(); updatePill();
         setTimeout(function() { showResult(r); }, 400);
-      }).catch(function(e) {
-        clearInterval(stepTimer);
-        document.getElementById('lw').classList.remove('on');
-        document.getElementById('scrScan').classList.add('on');
-        showErr('Error: ' + e.message);
-      });
-      return;
-    }
+      }).catch(function(e) { _showErr('Error: ' + e.message); });
 
-    // Non-vehicle — call AI with eBay context injection
-    callAI_text(txt, keyword).then(function(r) {
-      clearInterval(stepTimer);
-      for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
-      if (listing.isOfferPrice) normalizeOfferPriceResult(r);
-      var entry = { id: Date.now(), title: r.extractedTitle || listing.title, price: r.extractedPrice || listing.price, image: listing.image || null, url: listing.url || null, result: r, date: new Date().toLocaleDateString('en-AU') };
-      hist.unshift(entry); sv(); updatePill();
-      setTimeout(function() { showResult(r); }, 400);
-    }).catch(function(e) {
-      clearInterval(stepTimer);
-      document.getElementById('lw').classList.remove('on');
-      document.getElementById('scrScan').classList.add('on');
-      showErr('Error: ' + e.message);
-    });
-  }).catch(function(e) {
-    clearInterval(stepTimer);
-    document.getElementById('lw').classList.remove('on');
-    document.getElementById('scrScan').classList.add('on');
-    showErr('Error: ' + e.message);
-  });
+    }).catch(function(e) { _showErr('Error: ' + e.message); });
+
+  }).catch(function(e) { _showErr('Error: ' + e.message); });
 }
 
 function appraiseIdx(el) {

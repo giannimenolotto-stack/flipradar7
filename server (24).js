@@ -733,14 +733,20 @@ function buildVehicleVerdict(listingPrice, priceSource) {
   else if (dealScore >= 55) demandLevel = '📈 Moderate';
   else                      demandLevel = '📉 Low';
 
+  // Mileage unknown: lower dealScore and flag it — market median is at reference km, actual may differ significantly
+  if (!mileageAdjusted) {
+    dealScore = Math.max(0, dealScore - 8);
+  }
+
   const mileageNote = mileageAdjusted ? ' (mileage-adjusted)' : '';
   const carLabel    = [year, make, model].filter(Boolean).join(' ');
   const srcLabel    = sourceLabel || 'AU vehicle index';
   const confPct     = confidence != null ? Math.round(confidence * 100) : null;
+  const mileageWarning = !mileageAdjusted ? ' Mileage not provided — actual value may vary significantly.' : '';
 
   const whyItsWorth = confPct != null
-    ? `${srcLabel} — ${confPct}% confidence${samples ? `, ${samples} comparable${samples !== 1 ? 's' : ''}` : ''}${mileageNote}.`
-    : `Based on ${samples} comparable ${carLabel} listings in AU${mileageNote}.`;
+    ? `${srcLabel} — ${confPct}% confidence${samples ? `, ${samples} comparable${samples !== 1 ? 's' : ''}` : ''}${mileageNote}.${mileageWarning}`
+    : `Based on ${samples} comparable ${carLabel} listings in AU${mileageNote}.${mileageWarning}`;
 
   return {
     verdict,
@@ -1088,6 +1094,16 @@ async function scrapeKeyword(keyword, opts = {}) {
                          item.vehicle_transmission_type ||
                          item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission ||
                          item.vehicleInfo?.transmission || item.transmission ||
+                         (() => {
+                           const subs = item.custom_sub_titles || item.listing_subtitle || item.subtitle || [];
+                           const arr = Array.isArray(subs) ? subs : String(subs || '').split(/[·|]/);
+                           for (const c of arr) {
+                             const t = String(c || '').toLowerCase().trim();
+                             if (t === 'automatic' || t === 'auto') return 'Automatic';
+                             if (t === 'manual') return 'Manual';
+                           }
+                           return null;
+                         })() ||
                          extractTransmission(rawTitle, description)
                        ) : null,
         fuelType:      isVehicle ? (
@@ -1174,12 +1190,25 @@ function isVehicleListing(keyword, title, description) {
 
 // Extract mileage from Apify's structured vehicle_info block (more accurate than regex)
 function extractMileageFromVehicleInfo(item) {
-  // data-slayer uses vehicle_odometer_data which is a string like "250,000 km"
+  // Priority 1: subtitle chips — FB returns ["2005", "175,000 km", "Automatic"] here
+  const subs = item.custom_sub_titles || item.listing_subtitle || item.subtitle || [];
+  const subArr = Array.isArray(subs) ? subs : String(subs || '').split(/[·|]/);
+  for (const chip of subArr) {
+    const c = String(chip || '').trim();
+    const m = c.match(/^(\d{1,3}(?:[,\s]\d{3})+)\s*k(?:m|ms|ilometres?)?$/i)
+           || c.match(/^(\d{4,6})\s*k(?:m|ms|ilometres?)?$/i);
+    if (m) {
+      const val = parseInt(m[1].replace(/[,\s]/g, ''));
+      if (val > 1000 && val < 2000000) return val;
+    }
+  }
+  // Priority 2: data-slayer vehicle_odometer_data — string like "250,000 km"
   const odoData = item.vehicle_odometer_data;
   if (odoData) {
     const parsed = parseInt(String(odoData).replace(/[^0-9]/g, ''));
     if (parsed > 0 && parsed < 2000000) return parsed;
   }
+  // Priority 3: structured vehicle_info fields
   const vi = item.vehicle_info || item.listing_vehicle_data || item.vehicleInfo || {};
   const raw = vi.odometer || vi.mileage || vi.kilometers || vi.driven_km || vi.driven
     || item.odometer || item.mileage || item.kilometers || null;
@@ -1218,6 +1247,13 @@ function extractMileage(title, description) {
   const commaMatch = text.match(/(\d{1,3}(?:,\d{3})+)\s*k(?:m|ms|ilometres?|ilometers?|s\b)/);
   if (commaMatch) {
     const val = parseInt(commaMatch[1].replace(/,/g, ''));
+    if (val > 1000 && val < 1000000) return val;
+  }
+
+  // Space-separated thousands — e.g. "181 000 km" (common AU format)
+  const spaceMatch = text.match(/(\d{1,3}(?:\s\d{3})+)\s*k(?:m|ms|ilometres?|ilometers?|s\b)/);
+  if (spaceMatch) {
+    const val = parseInt(spaceMatch[1].replace(/\s/g, ''));
     if (val > 1000 && val < 1000000) return val;
   }
 
