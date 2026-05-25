@@ -60,13 +60,9 @@ const K = {
   watch:       id  => `fr:watch:${id}`,
   listings:    uid => `fr:listings:${uid}`,
   seen:        uid => `fr:seen:${uid}`,
-  prices:      kw  => `fr:prices:${kw.toLowerCase().trim()}`,
   sharedScan:  kw  => `fr:scan:${kw.toLowerCase().trim()}`,  // shared scan cache across all users
   enrich:      id  => `fr:enrich:${id}`,                     // slim enrichment data per listing (7-day TTL)
   blocked:     uid => `fr:blocked:${uid}`,
-  vpx:   (make, model, year) => `fr:vpx:${make}:${model}:${year}`,
-  csales:(make, model, year) => `fr:csales:${make}:${model}:${year}`, // carsales market cache
-  agrab: (make, model, year) => `fr:agrab:${make}:${model}:${year}`,  // autograb/redbook cache
 };
 
 // ── Auth ──────────────────────────────────────────────────
@@ -92,35 +88,9 @@ const FROM_EMAIL    = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.c
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
 
-const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
-const VPX_REF_KM          = 100000;               // mileage reference for price normalization
-const VPX_MIN_SAMPLES     = 5;                    // samples needed to use VPX instead of AI
-const VPX_SAMPLE_CAP      = 500;                  // max samples stored per vehicle cohort
-const VPX_TTL_SECS        = null;                 // permanent — hard-won scraped data must not expire
 const SEEN_TTL_MS         = 48 * 60 * 60 * 1000;
 const SEEN_MAX_ENTRIES    = 5000;
-const CSALES_TTL_SECS     = 48 * 3600;            // 48 h carsales market cache
-const AGRAB_TTL_SECS      = 30 * 24 * 3600;       // 30 day autograb/redbook cache
-const CARSALES_BIAS       = 0.92;                  // asking-price → cleared-price correction (~8%)
-const AUTOGRAB_API_KEY    = process.env.AUTOGRAB_API_KEY  || null;
-const AUTOGRAB_BASE_URL   = process.env.AUTOGRAB_BASE_URL || 'https://api.autograb.com.au/v1';
-const CARSALES_APIFY_ACTOR = process.env.CARSALES_APIFY_ACTOR || 'zuzka_k~carsales-scraper';
 
-// Top AU vehicle models to seed on first deploy (make, model, year range)
-const TOP_AU_SEED_MODELS = [
-  ...['2019','2020','2021','2022'].flatMap(y => [
-    {make:'Toyota',model:'Camry',year:parseInt(y)},
-    {make:'Toyota',model:'Hilux',year:parseInt(y)},
-    {make:'Toyota',model:'RAV4',year:parseInt(y)},
-    {make:'Toyota',model:'LandCruiser Prado',year:parseInt(y)},
-    {make:'Mazda',model:'CX-5',year:parseInt(y)},
-    {make:'Ford',model:'Ranger',year:parseInt(y)},
-    {make:'Hyundai',model:'Tucson',year:parseInt(y)},
-    {make:'Mitsubishi',model:'Triton',year:parseInt(y)},
-    {make:'Isuzu',model:'D-MAX',year:parseInt(y)},
-    {make:'Subaru',model:'Forester',year:parseInt(y)},
-  ]),
-];
 
 // ── Owner account — always premium, no payment required ──
 const OWNER_EMAIL = 'giannimenolotto@gmail.com';
@@ -245,470 +215,6 @@ async function saveUserSeen(userId, seen, { merge = true } = {}) {
   await redisSet(K.seen(userId), pruned);
 }
 
-// ── Our own scan price history ────────────────────────────
-// Every time we see a listing for a keyword, store its price
-async function storeScanPrice(keyword, listing) {
-  if (!listing.price || listing.price <= 0) return;
-  if (listing.isOfferPrice) return; // placeholder prices pollute keyword price history
-  // Patch B: only store price history for specific enough keywords.
-  // Single generic words (bmw, ford, iphone, car) produce meaningless mixed medians.
-  // Require either: 2+ words, OR a make+model is detected on the listing.
-  const kwWords = keyword.trim().split(/\s+/).filter(Boolean);
-  const isSpecific = kwWords.length >= 2 || !!(listing.make && listing.model);
-  if (!isSpecific) {
-    // Still feed VPX for vehicles with full make/model — just skip the broad keyword bucket
-    if (listing.make && listing.year) {
-      storeVehiclePrice(listing).catch(e => console.error('[VPX] passive write error:', e.message));
-    }
-    return;
-  }
-  // Patch C: don't store broken/project vehicle prices — they pollute medians
-  if (listing.isBrokenOrProject) return;
-  try {
-    const existing = await redisGet(K.prices(keyword)) || [];
-    if (!existing.find(r => r.id === listing.id)) {
-      existing.unshift({ id: listing.id, price: listing.price, title: listing.title, date: new Date().toISOString() });
-      await redisSet(K.prices(keyword), existing.slice(0, 200));
-    }
-  } catch (e) {
-    console.error(`[PriceStore] Error for "${keyword}":`, e.message);
-  }
-  // Also feed the vehicle price index when structured vehicle data is present
-  if (listing.make && listing.year) {
-    storeVehiclePrice(listing).catch(e => console.error('[VPX] passive write error:', e.message));
-  }
-}
-
-async function getOwnPriceRange(keyword) {
-  const records = await redisGet(K.prices(keyword)) || [];
-  if (records.length < OWN_PRICE_MIN) return null;
-  const prices = records.map(r => r.price).filter(Boolean).sort((a, b) => a - b);
-  return {
-    prices,
-    low:    prices[0],
-    high:   prices[prices.length - 1],
-    median: prices[Math.floor(prices.length / 2)],
-    avg:    Math.round(prices.reduce((a, b) => a + b, 0) / prices.length),
-    count:  prices.length,
-    source: 'own_history',
-  };
-}
-
-// ── Vehicle Price Index (VPX) ─────────────────────────────
-// fr:vpx:<make>:<model>:<year> — mileage-normalised price samples per vehicle cohort.
-// Populated passively from every FB listing; seeded by Carsales scrapes.
-const _vpxCache = new Map();
-const VPX_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min hot-cache — avoids Redis on every appraisal
-
-async function storeVehiclePrice(listing) {
-  let { make, model, year, mileage, price, id, location } = listing;
-  if (!make || !year || !price || price <= 0) return;
-  if (isOfferPrice(price)) return;
-  // Patch F: don't index broken/project vehicles — their prices are not market comps
-  if (listing.isBrokenOrProject) return;
-  // Sanity-check price range for AU vehicles ($500–$500k)
-  if (price > 500000) return;
-  // Always coerce location to a string here — Apify can return objects
-  if (location !== null && location !== undefined && typeof location !== 'string') {
-    location = location.state || location.city || location.name || '';
-  }
-
-  // Fall back to extractModel if Apify didn't provide model
-  if (!model) model = extractModel(make, listing.title || '');
-  if (!model) return; // without model we can't build a meaningful cohort key
-
-  const makeKey  = make.toLowerCase().trim();
-  const modelKey = model.toLowerCase().trim().replace(/\s+/g, '-');
-  const key      = K.vpx(makeKey, modelKey, year);
-
-  try {
-    const existing = await redisGet(key) || { samples: [] };
-    if (existing.samples.find(s => s.id === id)) return; // already stored
-
-    const normPrice = normalizePriceToRefKm(price, mileage, makeKey, modelKey);
-    existing.samples.unshift({
-      id,
-      price,
-      mileage:    mileage || null,
-      normPrice,
-      date:       new Date().toISOString(),
-      state:      extractState(location),
-      source:     'fb',
-    });
-    existing.samples = existing.samples.slice(0, VPX_SAMPLE_CAP);
-
-    // Recompute stats from normalised prices
-    const norm = existing.samples.map(s => s.normPrice).filter(p => p && p > 0).sort((a, b) => a - b);
-    if (norm.length >= 3) {
-      existing.stats = {
-        count:          norm.length,
-        medianAt100k:   norm[Math.floor(norm.length / 2)],
-        p25At100k:      norm[Math.floor(norm.length * 0.25)],
-        p75At100k:      norm[Math.floor(norm.length * 0.75)],
-        lowAt100k:      norm[0],
-        highAt100k:     norm[norm.length - 1],
-        updatedAt:      new Date().toISOString(),
-      };
-    }
-
-    await redisSet(key, existing, VPX_TTL_SECS);
-    _vpxCache.delete(key); // invalidate hot-cache on write
-  } catch (e) {
-    console.error(`[VPX] storeVehiclePrice error ${make} ${model} ${year}:`, e.message);
-  }
-}
-
-async function getVehiclePriceStats(make, model, year, mileage) {
-  if (!make || !model || !year) return null;
-  const makeKey  = make.toLowerCase().trim();
-  const modelKey = model.toLowerCase().trim().replace(/\s+/g, '-');
-  const key      = K.vpx(makeKey, modelKey, year);
-
-  // Hot-cache first
-  const hit = _vpxCache.get(key);
-  if (hit && (Date.now() - hit.ts) < VPX_CACHE_TTL_MS) return hit.data;
-
-  const doc = await redisGet(key);
-  if (!doc || !doc.stats || doc.stats.count < VPX_MIN_SAMPLES) return null;
-
-  const { medianAt100k, p25At100k, p75At100k, lowAt100k, highAt100k, count } = doc.stats;
-
-  // Adjust reference prices to the listing's actual mileage for display
-  const result = {
-    make, model, year,
-    samples:                count,
-    medianAt100k,
-    p25At100k,
-    p75At100k,
-    marketMedian:           mileage ? adjustMarketPriceToMileage(medianAt100k, mileage, makeKey, modelKey) : medianAt100k,
-    marketLow:              mileage ? adjustMarketPriceToMileage(p25At100k,    mileage, makeKey, modelKey) : p25At100k,
-    marketHigh:             mileage ? adjustMarketPriceToMileage(p75At100k,    mileage, makeKey, modelKey) : p75At100k,
-    mileageAdjusted:        !!(mileage),
-    updatedAt:              doc.stats.updatedAt,
-    source:                 'vpx',
-  };
-
-  _vpxCache.set(key, { data: result, ts: Date.now() });
-  return result;
-}
-
-// ── Carsales market cache ─────────────────────────────────
-async function getCarsalesCache(makeKey, modelKey, year) {
-  const doc = await redisGet(K.csales(makeKey, modelKey, year));
-  if (!doc || doc.count < 3) return null;
-  return doc;
-}
-async function storeCarsalesCache(makeKey, modelKey, year, samples) {
-  if (!samples.length) return;
-  const prices = samples.map(s => s.normPrice || s.price).filter(Boolean).sort((a, b) => a - b);
-  const doc = {
-    count:  prices.length,
-    median: prices[Math.floor(prices.length / 2)],
-    p25:    prices[Math.floor(prices.length * 0.25)],
-    p75:    prices[Math.floor(prices.length * 0.75)],
-    low:    prices[0],
-    high:   prices[prices.length - 1],
-    updatedAt: new Date().toISOString(),
-  };
-  await redisSet(K.csales(makeKey, modelKey, year), doc, CSALES_TTL_SECS);
-}
-
-// ── AutoGrab / RedBook cache ──────────────────────────────
-async function getAutoGrabCache(makeKey, modelKey, year) {
-  return redisGet(K.agrab(makeKey, modelKey, year));
-}
-async function storeAutoGrabCache(makeKey, modelKey, year, data) {
-  await redisSet(K.agrab(makeKey, modelKey, year), data, AGRAB_TTL_SECS);
-}
-
-// Live AutoGrab API call — returns { privateSale, tradeIn, dealerRetail } or null.
-// Sign up at autograb.com.au for an API key. Endpoint may need adjustment per their docs.
-async function fetchAutoGrabLive(make, model, year) {
-  if (!AUTOGRAB_API_KEY) return null;
-  try {
-    const res = await axios.get(`${AUTOGRAB_BASE_URL}/valuations`, {
-      params: { make, model, year },
-      headers: { Authorization: `Bearer ${AUTOGRAB_API_KEY}`, Accept: 'application/json' },
-      timeout: 8000,
-    });
-    const d = res.data?.data || res.data || {};
-    // Normalise field names — adjust if AutoGrab response shape differs
-    const privateSale  = d.private_sale  || d.privateSale  || d.retail || null;
-    const tradeIn      = d.trade_in      || d.tradeIn      || d.wholesale || null;
-    const dealerRetail = d.dealer_retail || d.dealerRetail || d.dealer || privateSale;
-    if (!privateSale) return null;
-    return { privateSale: Math.round(privateSale), tradeIn: Math.round(tradeIn || privateSale * 0.82), dealerRetail: Math.round(dealerRetail) };
-  } catch (e) {
-    console.error(`[AutoGrab] ${make} ${model} ${year}:`, e.response?.status || e.message);
-    return null;
-  }
-}
-
-// ── Carsales Apify seeding — scrape active listings, write to VPX + cache ──
-async function scrapeCarsalesForModel(make, model, year) {
-  if (!APIFY_TOKEN) return 0;
-  const makeKey  = make.toLowerCase().trim();
-  const modelKey = model.toLowerCase().trim().replace(/\s+/g, '-');
-  try {
-    console.log(`[Carsales] Seeding ${make} ${model} ${year}...`);
-    const res = await axios.post(
-      `https://api.apify.com/v2/acts/${CARSALES_APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { make, model, yearFrom: year, yearTo: year, maxItems: 40 },
-      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
-    );
-    const items = Array.isArray(res.data) ? res.data.filter(i => i && !i.error) : [];
-    if (!items.length) { console.log(`[Carsales] No results for ${make} ${model} ${year}`); return 0; }
-
-    const samples = [];
-    for (const item of items) {
-      const price   = parsePrice(item.price || item.priceValue || 0);
-      const mileage = item.odometer || item.mileage || item.kilometres || null;
-      const state   = item.state || item.location?.state || extractState(item.location || '');
-      if (!price || price < 500 || isOfferPrice(price)) continue;
-      const normPrice = normalizePriceToRefKm(price, mileage, makeKey, modelKey);
-      samples.push({ id: item.id || item.listingId || String(Math.random()), price, mileage, normPrice, date: new Date().toISOString(), state, source: 'carsales' });
-      // Also write directly into VPX — coerce location to string so extractState never crashes
-      const locationStr = typeof item.location === 'string' ? item.location : (state || '');
-      await storeVehiclePrice({ id: item.id, make, model, year, price, mileage, location: locationStr }).catch(() => {});
-    }
-    await storeCarsalesCache(makeKey, modelKey, year, samples);
-    console.log(`[Carsales] ${make} ${model} ${year} — seeded ${samples.length} listings`);
-    return samples.length;
-  } catch (e) {
-    console.error(`[Carsales] Seed error ${make} ${model} ${year}:`, e.response?.status || e.message);
-    return 0;
-  }
-}
-
-// ── Tiered vehicle pricing orchestrator ──────────────────
-// Checks all cached sources in parallel, fetches live on cache miss.
-// Returns the highest-confidence priced source, or null if none available.
-async function fetchBestVehiclePrice(make, model, year, mileage) {
-  const makeKey  = (make  || '').toLowerCase().trim();
-  const modelKey = (model || '').toLowerCase().trim().replace(/\s+/g, '-');
-
-  // Tier 1–3: all cache reads in parallel (~50ms)
-  const [vpxStats, csalesDoc, agrabDoc] = await Promise.all([
-    getVehiclePriceStats(make, model, year, mileage),
-    getCarsalesCache(makeKey, modelKey, year),
-    getAutoGrabCache(makeKey, modelKey, year),
-  ]);
-
-  const candidates = [];
-
-  if (vpxStats && vpxStats.samples >= VPX_MIN_SAMPLES) {
-    candidates.push({
-      marketMedian:    vpxStats.marketMedian,
-      marketLow:       vpxStats.marketLow,
-      marketHigh:      vpxStats.marketHigh,
-      samples:         vpxStats.samples,
-      mileageAdjusted: vpxStats.mileageAdjusted,
-      source:    'vpx',
-      sourceLabel: `FlipRadar AU index · ${vpxStats.samples} comparable${vpxStats.samples !== 1 ? 's' : ''}`,
-      confidence: calcConfidence('vpx', vpxStats.samples),
-      make, model, year,
-    });
-  }
-
-  if (agrabDoc) {
-    const med  = mileage ? adjustMarketPriceToMileage(agrabDoc.privateSale,  mileage, makeKey, modelKey) : agrabDoc.privateSale;
-    const low  = mileage ? adjustMarketPriceToMileage(agrabDoc.tradeIn,      mileage, makeKey, modelKey) : agrabDoc.tradeIn;
-    const high = mileage ? adjustMarketPriceToMileage(agrabDoc.dealerRetail, mileage, makeKey, modelKey) : agrabDoc.dealerRetail;
-    candidates.push({
-      marketMedian: med, marketLow: low, marketHigh: high,
-      samples: 0, mileageAdjusted: !!(mileage),
-      source: 'autograb', sourceLabel: 'RedBook valuation (AutoGrab)',
-      confidence: calcConfidence('autograb', 0),
-      make, model, year,
-    });
-  }
-
-  if (csalesDoc && csalesDoc.count >= 3) {
-    const med  = Math.round((mileage ? adjustMarketPriceToMileage(csalesDoc.median, mileage, makeKey, modelKey) : csalesDoc.median) * CARSALES_BIAS);
-    const low  = Math.round((mileage ? adjustMarketPriceToMileage(csalesDoc.p25,    mileage, makeKey, modelKey) : csalesDoc.p25)    * CARSALES_BIAS);
-    const high = Math.round((mileage ? adjustMarketPriceToMileage(csalesDoc.p75,    mileage, makeKey, modelKey) : csalesDoc.p75)    * CARSALES_BIAS);
-    candidates.push({
-      marketMedian: med, marketLow: low, marketHigh: high,
-      samples: csalesDoc.count, mileageAdjusted: !!(mileage),
-      source: 'csales', sourceLabel: `Carsales AU market · ${csalesDoc.count} active listings`,
-      confidence: calcConfidence('csales', csalesDoc.count),
-      make, model, year,
-    });
-  }
-
-  // Sort by confidence — return immediately if best is already high enough
-  candidates.sort((a, b) => b.confidence - a.confidence);
-  if (candidates.length && candidates[0].confidence >= 0.65) return candidates[0];
-
-  // Tier 4: live AutoGrab (cache miss, $0.10–0.50, cached 30 days)
-  if (AUTOGRAB_API_KEY) {
-    const live = await fetchAutoGrabLive(makeKey, modelKey, year);
-    if (live) {
-      await storeAutoGrabCache(makeKey, modelKey, year, live);
-      const med  = mileage ? adjustMarketPriceToMileage(live.privateSale,  mileage, makeKey, modelKey) : live.privateSale;
-      const low  = mileage ? adjustMarketPriceToMileage(live.tradeIn,      mileage, makeKey, modelKey) : live.tradeIn;
-      const high = mileage ? adjustMarketPriceToMileage(live.dealerRetail, mileage, makeKey, modelKey) : live.dealerRetail;
-      return {
-        marketMedian: med, marketLow: low, marketHigh: high,
-        samples: 0, mileageAdjusted: !!(mileage),
-        source: 'autograb', sourceLabel: 'RedBook valuation (AutoGrab)',
-        confidence: calcConfidence('autograb', 0),
-        make, model, year,
-      };
-    }
-  }
-
-  // Return best we have even if below threshold (caller decides whether to use AI)
-  return candidates.length ? candidates[0] : null;
-}
-
-// ── Master price lookup — call this before AI ─────────────
-// Returns price data if we have enough to skip AI, null if AI needed
-async function getPriceCacheForKeyword(keyword) {
-  // 1. Check our own scan history first (most relevant — AU marketplace prices)
-  const own = await getOwnPriceRange(keyword);
-  if (own) {
-    console.log(`[PriceCache] "${keyword}" → own history (${own.count} records), skipping AI`);
-    return own;
-  }
-
-  // 2. Not enough data — caller should use AI
-  console.log(`[PriceCache] "${keyword}" → no cache, AI needed`);
-  return null;
-}
-
-// Build a verdict from price data alone (no AI)
-function buildCacheVerdict(listingPrice, priceData) {
-  const { low, median, high, count, source } = priceData;
-
-  const roi = median > 0 ? Math.round(((median - listingPrice) / listingPrice) * 100) : 0;
-  const estimatedProfit = Math.round(median - listingPrice);
-
-  let verdict, oneLiner, dealScore;
-  if (roi >= 50) {
-    verdict   = 'STEAL';
-    oneLiner  = `Listed ${roi}% below median sold — incredible flip potential`;
-    dealScore = 95;
-  } else if (roi >= 30) {
-    verdict   = 'GOOD DEAL';
-    oneLiner  = `Listed ${roi}% below median sold price — strong flip potential`;
-    dealScore = 80;
-  } else if (roi >= 10) {
-    verdict   = 'GOOD DEAL';
-    oneLiner  = `Priced below market — room to profit`;
-    dealScore = 65;
-  } else if (roi >= 0) {
-    verdict   = 'FAIR';
-    oneLiner  = `Around market rate — slim margin`;
-    dealScore = 45;
-  } else {
-    verdict   = 'PASS';
-    oneLiner  = `Listed ${Math.abs(roi)}% above typical sold prices — negotiate hard or pass`;
-    dealScore = 20;
-  }
-
-  return {
-    verdict,
-    dealScore,
-    oneLiner,
-    estimatedResellLow:  low,
-    estimatedResellHigh: high,
-    recommendedOffer:    Math.round(listingPrice * 0.85),
-    walkAwayPrice:       Math.round(median * 1.05),
-    estimatedProfit:     Math.max(0, estimatedProfit),
-    roiPercent:          roi,
-    dataPoints:          count,
-    source,
-    low, median, high,
-    negotiationScript:   `Similar listings sell for around $${median} — would you take $${Math.round(listingPrice * 0.85)}?`,
-  };
-}
-
-// Mileage-aware verdict using the unified priceSource format from fetchBestVehiclePrice.
-function buildVehicleVerdict(listingPrice, priceSource, mileage) {
-  const { marketMedian, marketLow, marketHigh, samples, make, model, year, mileageAdjusted,
-          source, sourceLabel, confidence } = priceSource;
-
-  const feeAdj          = marketMedian * 0.92;  // ~8% selling fees (FB/Gumtree)
-  const roi             = marketMedian > 0 ? Math.round(((feeAdj - listingPrice) / listingPrice) * 100) : 0;
-  const estimatedProfit = Math.max(0, Math.round(feeAdj - listingPrice));
-
-  let verdict, oneLiner, dealScore;
-  if (roi >= 50) {
-    verdict = 'STEAL'; dealScore = 95;
-    oneLiner = `Listed ${roi}% below AU market median — exceptional flip potential`;
-  } else if (roi >= 30) {
-    verdict = 'GOOD DEAL'; dealScore = 82;
-    oneLiner = `Listed ${roi}% below market — strong flip potential`;
-  } else if (roi >= 15) {
-    verdict = 'GOOD DEAL'; dealScore = 68;
-    oneLiner = `Priced below market — solid room to profit`;
-  } else if (roi >= 0) {
-    verdict = 'FAIR'; dealScore = 45;
-    oneLiner = `Around market rate — slim margin`;
-  } else {
-    verdict = 'PASS'; dealScore = 18;
-    oneLiner = `Listed ${Math.abs(roi)}% above market — negotiate hard or pass`;
-  }
-
-  let timeToSell;
-  if (dealScore >= 80)      timeToSell = '1–3 days';
-  else if (dealScore >= 60) timeToSell = '3–7 days';
-  else if (dealScore >= 40) timeToSell = '1–2 weeks';
-  else                      timeToSell = '2–4 weeks';
-
-  let demandLevel;
-  if (dealScore >= 80)      demandLevel = '🔥 High';
-  else if (dealScore >= 55) demandLevel = '📈 Moderate';
-  else                      demandLevel = '📉 Low';
-
-  // Mileage unknown: lower dealScore and flag it — market median is at reference km, actual may differ significantly
-  if (!mileageAdjusted) {
-    dealScore = Math.max(0, dealScore - 8);
-  }
-  // Extra penalty for very high mileage — hard sell regardless of price
-  if (mileage && mileage > 200000) {
-    dealScore = Math.max(0, dealScore - 5);
-  }
-
-  const mileageNote = mileageAdjusted ? ' (mileage-adjusted)' : '';
-  const carLabel    = [year, make, model].filter(Boolean).join(' ');
-  const srcLabel    = sourceLabel || 'AU vehicle index';
-  const confPct     = confidence != null ? Math.round(confidence * 100) : null;
-  const mileageWarning = !mileageAdjusted ? ' Mileage not provided — actual value may vary significantly.' : '';
-
-  const whyItsWorth = confPct != null
-    ? `${srcLabel} — ${confPct}% confidence${samples ? `, ${samples} comparable${samples !== 1 ? 's' : ''}` : ''}${mileageNote}.${mileageWarning}`
-    : `Based on ${samples} comparable ${carLabel} listings in AU${mileageNote}.${mileageWarning}`;
-
-  return {
-    verdict,
-    dealScore,
-    oneLiner,
-    estimatedMarketValue: marketMedian,
-    estimatedResellLow:   marketLow,
-    estimatedResellHigh:  marketHigh,
-    recommendedOffer:     Math.round(listingPrice * 0.82),
-    walkAwayPrice:        Math.round(marketMedian * 0.95),
-    estimatedProfit,
-    roiPercent:           roi,
-    timeToSell,
-    demandLevel,
-    whyItsWorth,
-    greenFlags:          [],
-    redFlags:            [],
-    whatToCheckInPerson: [],
-    dataPoints:          samples,
-    source:              source || 'vpx',
-    sourceLabel:         srcLabel,
-    confidence:          confidence || 0,
-    low:    marketLow,
-    median: marketMedian,
-    high:   marketHigh,
-    negotiationScript: `Similar ${carLabel}s sell for around $${marketMedian.toLocaleString()}${mileageNote} in AU — would you take $${Math.round(listingPrice * 0.82).toLocaleString()}?`,
-    vpxData: priceSource,
-  };
-}
 
 // ── Email (Resend) ────────────────────────────────────────
 async function sendEmail(to, subject, html) {
@@ -1445,15 +951,6 @@ function getVehicleCategory(make, model) {
 
 // Confidence score: how much to trust this pricing source (0–1).
 // Drives: AI skip threshold, border glow intensity, "confidence" display bar.
-function calcConfidence(source, count = 0) {
-  switch (source) {
-    case 'vpx':         return Math.min(0.92, 0.52 + count * 0.025); // grows with AU samples
-    case 'autograb':    return 0.87;  // RedBook industry data
-    case 'csales':      return Math.min(0.82, 0.55 + count * 0.018); // grows with listing count
-    case 'own_history': return Math.min(0.55, 0.28 + count * 0.015);
-    default:            return 0.20;
-  }
-}
 
 function extractState(location) {
   if (!location) return null;
@@ -1511,18 +1008,6 @@ function extractModel(make, title) {
 
 // Normalize listed price to VPX_REF_KM equivalent for apples-to-apples comparison.
 // Higher-km car listed at $10k → would have been $13k at 100k km → normPrice = $13k.
-function normalizePriceToRefKm(price, mileage, make, model) {
-  if (!price || price <= 0 || !mileage || mileage <= 0) return price;
-  const { perKm } = getDepRates(make, model);
-  return Math.round(price + (mileage - VPX_REF_KM) * perKm);
-}
-
-// Reverse: given median at VPX_REF_KM, what is market value at targetMileage?
-function adjustMarketPriceToMileage(refMedian, targetMileage, make, model) {
-  if (!refMedian || !targetMileage || targetMileage <= 0) return refMedian;
-  const { perKm } = getDepRates(make, model);
-  return Math.round(refMedian - (targetMileage - VPX_REF_KM) * perKm);
-}
 
 function parsePrice(raw) {
   if (!raw) return 0;
@@ -1726,7 +1211,6 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
 
     seen[key] = Date.now();
 
-    storeScanPrice(keyword, listing).catch(() => {});
 
     if (!userListings.find(l => l.id === listing.id)) {
       userListings.unshift(listing);
@@ -2246,30 +1730,6 @@ app.post('/listings/remove', authMiddleware, async (req, res) => {
 });
 
 // ── Price cache route — lets frontend check own scan history before triggering AI ──
-app.get('/prices', authMiddleware, async (req, res) => {
-  try {
-    const { keyword } = req.query;
-    if (!keyword) return res.status(400).json({ error: 'keyword required' });
-    const priceData = await getPriceCacheForKeyword(keyword);
-    console.log('[Prices] Result for', keyword, ':', priceData ? 'found (' + priceData.count + ' prices, median $' + priceData.median + ')' : 'not found');
-    if (!priceData) return res.json({ found: false, keyword });
-    res.json({ found: true, keyword, ...priceData });
-  } catch (e) { console.error('[Prices] Error:', e.message); res.status(500).json({ error: 'Server error' }); }
-});
-
-// GET /prices/vehicle?make=Toyota&model=Camry&year=2019&mileage=72000
-// Returns VPX market stats for a specific vehicle cohort
-app.get('/prices/vehicle', authMiddleware, async (req, res) => {
-  try {
-    const { make, model, year, mileage } = req.query;
-    if (!make || !year) return res.status(400).json({ error: 'make and year required' });
-    const resolvedModel = model || null;
-    const stats = await getVehiclePriceStats(make, resolvedModel, parseInt(year), mileage ? parseInt(mileage) : null);
-    if (!stats) return res.json({ found: false, make, model, year });
-    res.json({ found: true, ...stats });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
 // ── Appraisal route — limit check only, always defers to AI ──
 // POST /appraise  { keyword, price }
 app.post('/appraise', authMiddleware, async (req, res) => {
@@ -2549,26 +2009,6 @@ const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
 const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
 
 // POST /seed/vehicles — owner-only: triggers Carsales seeding for all TOP_AU_SEED_MODELS
-app.post('/seed/vehicles', authMiddleware, async (req, res) => {
-  try {
-    const user = await getUser(req.userId);
-    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
-    const total = TOP_AU_SEED_MODELS.length;
-    res.json({ ok: true, message: `Seeding ${total} vehicle cohorts in background` });
-    (async () => {
-      let seeded = 0;
-      for (const { make, model, year } of TOP_AU_SEED_MODELS) {
-        try {
-          const n = await scrapeCarsalesForModel(make, model, year);
-          if (n > 0) seeded++;
-          console.log(`[Seed/vehicles] ${make} ${model} ${year} → ${n} samples`);
-        } catch (e) { console.error(`[Seed/vehicles] ${make} ${model} ${year}:`, e.message); }
-        await sleep(2000);
-      }
-      console.log(`[Seed/vehicles] Done — ${seeded}/${total} cohorts seeded`);
-    })();
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
 
 // Redis key for push subscriptions
 const K_push = userId => `fr:push:${userId}`;
@@ -2625,26 +2065,12 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
           : `Mileage context: <80k premium, 80-130k normal, 130-180k ~10-20% below median, 180-250k ~25-40% below, >250k hard sell${vehicleCategory && vehicleCategory.includes('diesel 4WD') ? ' (diesel 4WDs tolerate higher km — adjust accordingly)' : ''}.`)
       : `Mileage completely unknown — assume high km scenario, widen range significantly, reduce confidence.`;
 
-    // Patch E: inject FlipRadar's own AU scan data when we have enough samples.
-    let vpxContext = '';
-    if (make && model && year) {
-      try {
-        const vpx = await getVehiclePriceStats(make, model, parseInt(year), effectiveMileage || null);
-        if (vpx && vpx.samples >= 10) {
-          const fmtP = n => '$' + (Math.round(n / 500) * 500).toLocaleString();
-          vpxContext = `\nFLIPRADAR AU DATA (${vpx.samples} comparable AU private-sale listings):\n`
-            + `Market median: ${fmtP(vpx.marketMedian)}${vpx.mileageAdjusted ? ' (mileage-adjusted)' : ''}\n`
-            + `Range: ${fmtP(vpx.marketLow)} - ${fmtP(vpx.marketHigh)}\n`
-            + `Use these as your primary pricing anchor. Stay within ~20% of median unless exceptional reason.`;
-        }
-      } catch (_) {}
-    }
 
     const prompt = `You are an expert Australian used-vehicle appraiser and flipper. Produce a realistic, detailed, risk-aware appraisal using AU private-sale market knowledge.
 
 VEHICLE:
 ${vehicleDetails}
-${mileageGuide}${vpxContext}
+${mileageGuide}
 
 TITLE: ${title || '(not provided)'}
 DESCRIPTION: ${description || '(not provided)'}
