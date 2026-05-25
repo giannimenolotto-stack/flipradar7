@@ -1313,6 +1313,7 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
   }
 
   let seenSkipped = 0;
+  let seenModified = false; // tracks whether seen map changed without a new listing (Fix C)
   // On regular scans (after initial scan completed), drop any listing that was
   // posted before the initial scan finished — those should have been caught then.
   // This stops old listings trickling in on every 30-min scan.
@@ -1323,7 +1324,13 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
   for (const listing of relevant) {
     const key    = `${keyword}:${listing.id}`;
     const seenTs = seen[key];
-    if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS) { seenSkipped++; continue; }
+    if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS) {
+      // During initial scan: refresh the timestamp so 48h TTL restarts from now.
+      // Prevents entries from expiring and trickling back in on future scans.
+      if (opts.initialScan) { seen[key] = Date.now(); seenModified = true; }
+      seenSkipped++;
+      continue;
+    }
     if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
     if (watcher.minPrice && listing.price < watcher.minPrice) continue;
 
@@ -1331,10 +1338,18 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     // Backfill already covered everything older — this blocks old listings
     // from trickling in on subsequent 30-min scans.
     if (initialScanCutoff && !opts.initialScan && !opts.backfill) {
+      // listedAtUnknown means Apify couldn't parse the date, so listedAt was set to
+      // the current scrape time — it always passes the cutoff check even for old listings.
+      // Treat these conservatively: mark seen and skip rather than risking a flood.
+      if (listing.listedAtUnknown) {
+        seen[key] = Date.now();
+        seenModified = true;
+        continue;
+      }
       const listedTs = listing.listedAt ? new Date(listing.listedAt).getTime() : null;
       if (listedTs && listedTs < initialScanCutoff) {
-        // Still mark as seen so it doesn't keep being evaluated
         seen[key] = Date.now();
+        seenModified = true;
         continue;
       }
     }
@@ -1371,6 +1386,10 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
 
   if (newCount > 0) {
     await saveUserListings(userId, userListings);
+    await saveUserSeen(userId, seen);
+  } else if (seenModified) {
+    // Seen map changed (cutoff blocks or initial-scan refreshes) but no new listings.
+    // Must persist so those entries survive across the next scan cycle.
     await saveUserSeen(userId, seen);
   }
 
