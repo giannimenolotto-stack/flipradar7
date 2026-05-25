@@ -60,9 +60,9 @@ const K = {
   watch:       id  => `fr:watch:${id}`,
   listings:    uid => `fr:listings:${uid}`,
   seen:        uid => `fr:seen:${uid}`,
-  ebay:        kw  => `fr:ebay:${kw.toLowerCase().trim()}`,
   prices:      kw  => `fr:prices:${kw.toLowerCase().trim()}`,
   sharedScan:  kw  => `fr:scan:${kw.toLowerCase().trim()}`,  // shared scan cache across all users
+  enrich:      id  => `fr:enrich:${id}`,                     // slim enrichment data per listing (7-day TTL)
   blocked:     uid => `fr:blocked:${uid}`,
   vpx:   (make, model, year) => `fr:vpx:${make}:${model}:${year}`,
   csales:(make, model, year) => `fr:csales:${make}:${model}:${year}`, // carsales market cache
@@ -72,8 +72,6 @@ const K = {
 // ── Auth ──────────────────────────────────────────────────
 const JWT_SECRET     = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
-const EBAY_APP_ID    = process.env.EBAY_APP_ID || null;   // free at developer.ebay.com
-
 // ── Stripe ────────────────────────────────────────────────
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || null;
 const PRICE_IDS = {
@@ -94,9 +92,6 @@ const FROM_EMAIL    = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.c
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
 
-// ── eBay price cache settings ─────────────────────────────
-const EBAY_CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours — 1 eBay call per keyword per day max
-const EBAY_MIN_RESULTS    = 5;                     // need at least 5 sold prices to skip AI
 const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
 const VPX_REF_KM          = 100000;               // mileage reference for price normalization
 const VPX_MIN_SAMPLES     = 5;                    // samples needed to use VPX instead of AI
@@ -109,7 +104,23 @@ const AGRAB_TTL_SECS      = 30 * 24 * 3600;       // 30 day autograb/redbook cac
 const CARSALES_BIAS       = 0.92;                  // asking-price → cleared-price correction (~8%)
 const AUTOGRAB_API_KEY    = process.env.AUTOGRAB_API_KEY  || null;
 const AUTOGRAB_BASE_URL   = process.env.AUTOGRAB_BASE_URL || 'https://api.autograb.com.au/v1';
+const CARSALES_APIFY_ACTOR = process.env.CARSALES_APIFY_ACTOR || 'zuzka_k~carsales-scraper';
 
+// Top AU vehicle models to seed on first deploy (make, model, year range)
+const TOP_AU_SEED_MODELS = [
+  ...['2019','2020','2021','2022'].flatMap(y => [
+    {make:'Toyota',model:'Camry',year:parseInt(y)},
+    {make:'Toyota',model:'Hilux',year:parseInt(y)},
+    {make:'Toyota',model:'RAV4',year:parseInt(y)},
+    {make:'Toyota',model:'LandCruiser Prado',year:parseInt(y)},
+    {make:'Mazda',model:'CX-5',year:parseInt(y)},
+    {make:'Ford',model:'Ranger',year:parseInt(y)},
+    {make:'Hyundai',model:'Tucson',year:parseInt(y)},
+    {make:'Mitsubishi',model:'Triton',year:parseInt(y)},
+    {make:'Isuzu',model:'D-MAX',year:parseInt(y)},
+    {make:'Subaru',model:'Forester',year:parseInt(y)},
+  ]),
+];
 
 // ── Owner account — always premium, no payment required ──
 const OWNER_EMAIL = 'giannimenolotto@gmail.com';
@@ -234,91 +245,8 @@ async function saveUserSeen(userId, seen, { merge = true } = {}) {
   await redisSet(K.seen(userId), pruned);
 }
 
-// ── eBay sold price cache (FREE — official eBay API) ──────
-const _ebayInflight = new Map(); // deduplicates concurrent requests for same keyword
-const EBAY_RATE_LIMIT_TTL_MS = 5 * 60 * 1000; // 5 min negative cache on rate limit errors
-
-async function getEbaySoldPrices(keyword) {
-  if (!EBAY_APP_ID) return null;
-
-  // Serve from cache — handles both positive results and rate-limit sentinels
-  const cached = await redisGet(K.ebay(keyword));
-  if (cached) {
-    if (cached._rateLimited && (Date.now() - new Date(cached.fetchedAt).getTime()) < EBAY_RATE_LIMIT_TTL_MS) {
-      console.log(`[eBay] "${keyword}" → rate-limited (cached)`);
-      return null;
-    }
-    if (!cached._rateLimited && (Date.now() - new Date(cached.fetchedAt).getTime()) < EBAY_CACHE_TTL_MS) {
-      console.log(`[eBay] "${keyword}" → cache hit (${cached.count} prices, median $${cached.median})`);
-      return cached;
-    }
-  }
-
-  // In-flight deduplication — concurrent callers share one eBay request
-  if (_ebayInflight.has(keyword)) {
-    console.log(`[eBay] "${keyword}" → joining in-flight request`);
-    return _ebayInflight.get(keyword);
-  }
-
-  const promise = (async () => {
-    try {
-      const url = `https://svcs.ebay.com.au/services/search/FindingService/v1` +
-        `?OPERATION-NAME=findCompletedItems` +
-        `&SERVICE-VERSION=1.0.0` +
-        `&SECURITY-APPNAME=${EBAY_APP_ID}` +
-        `&RESPONSE-DATA-FORMAT=JSON` +
-        `&GLOBAL-ID=EBAY-AU` +
-        `&keywords=${encodeURIComponent(keyword)}` +
-        `&itemFilter(0).name=SoldItemsOnly&itemFilter(0).value=true` +
-        `&sortOrder=EndTimeSoonest` +
-        `&paginationInput.entriesPerPage=100`;
-
-      console.log(`[eBay] Fetching AU sold prices for "${keyword}"...`);
-      const res   = await axios.get(url, { timeout: 15000 });
-      const items = res.data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || [];
-      console.log(`[eBay] "${keyword}" → ${items.length} raw results from API`);
-
-      const prices = items
-        .map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || 0))
-        .filter(p => p > 0)
-        .sort((a, b) => a - b);
-
-      if (!prices.length) {
-        console.log(`[eBay] "${keyword}" → 0 sold prices after filtering`);
-        return null;
-      }
-
-      const result = {
-        prices,
-        low:       prices[0],
-        high:      prices[prices.length - 1],
-        median:    prices[Math.floor(prices.length / 2)],
-        avg:       Math.round(prices.reduce((a, b) => a + b, 0) / prices.length),
-        count:     prices.length,
-        fetchedAt: new Date().toISOString(),
-        source:    'ebay_sold',
-      };
-
-      await redisSet(K.ebay(keyword), result);
-      console.log(`[eBay] "${keyword}" → ${prices.length} AU sold prices, median $${result.median}`);
-      return result;
-    } catch (e) {
-      console.error(`[eBay] Error for "${keyword}":`, e.response?.status, e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : e.message);
-      // Cache rate-limit errors so retries don't immediately hammer eBay again
-      await redisSet(K.ebay(keyword), { _rateLimited: true, fetchedAt: new Date().toISOString() });
-      return null;
-    } finally {
-      _ebayInflight.delete(keyword);
-    }
-  })();
-
-  _ebayInflight.set(keyword, promise);
-  return promise;
-}
-
 // ── Our own scan price history ────────────────────────────
 // Every time we see a listing for a keyword, store its price
-// Builds up over time — eventually replaces eBay for popular keywords
 async function storeScanPrice(keyword, listing) {
   if (!listing.price || listing.price <= 0) return;
   if (listing.isOfferPrice) return; // placeholder prices pollute keyword price history
@@ -494,6 +422,41 @@ async function fetchAutoGrabLive(make, model, year) {
   }
 }
 
+// ── Carsales Apify seeding — scrape active listings, write to VPX + cache ──
+async function scrapeCarsalesForModel(make, model, year) {
+  if (!APIFY_TOKEN) return 0;
+  const makeKey  = make.toLowerCase().trim();
+  const modelKey = model.toLowerCase().trim().replace(/\s+/g, '-');
+  try {
+    console.log(`[Carsales] Seeding ${make} ${model} ${year}...`);
+    const res = await axios.post(
+      `https://api.apify.com/v2/acts/${CARSALES_APIFY_ACTOR}/run-sync-get-dataset-items`,
+      { make, model, yearFrom: year, yearTo: year, maxItems: 40 },
+      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
+    );
+    const items = Array.isArray(res.data) ? res.data.filter(i => i && !i.error) : [];
+    if (!items.length) { console.log(`[Carsales] No results for ${make} ${model} ${year}`); return 0; }
+
+    const samples = [];
+    for (const item of items) {
+      const price   = parsePrice(item.price || item.priceValue || 0);
+      const mileage = item.odometer || item.mileage || item.kilometres || null;
+      const state   = item.state || item.location?.state || extractState(item.location || '');
+      if (!price || price < 500 || isOfferPrice(price)) continue;
+      const normPrice = normalizePriceToRefKm(price, mileage, makeKey, modelKey);
+      samples.push({ id: item.id || item.listingId || String(Math.random()), price, mileage, normPrice, date: new Date().toISOString(), state, source: 'carsales' });
+      // Also write directly into VPX so these samples count toward confidence
+      await storeVehiclePrice({ id: item.id, make, model, year, price, mileage, location: item.location || state || '' }).catch(() => {});
+    }
+    await storeCarsalesCache(makeKey, modelKey, year, samples);
+    console.log(`[Carsales] ${make} ${model} ${year} — seeded ${samples.length} listings`);
+    return samples.length;
+  } catch (e) {
+    console.error(`[Carsales] Seed error ${make} ${model} ${year}:`, e.response?.status || e.message);
+    return 0;
+  }
+}
+
 // ── Tiered vehicle pricing orchestrator ──────────────────
 // Checks all cached sources in parallel, fetches live on cache miss.
 // Returns the highest-confidence priced source, or null if none available.
@@ -586,14 +549,7 @@ async function getPriceCacheForKeyword(keyword) {
     return own;
   }
 
-  // 2. Fall back to eBay sold prices (free API)
-  const ebay = await getEbaySoldPrices(keyword);
-  if (ebay && ebay.count >= EBAY_MIN_RESULTS) {
-    console.log(`[PriceCache] "${keyword}" → eBay cache (${ebay.count} records), skipping AI`);
-    return ebay;
-  }
-
-  // 3. Not enough data — caller should use AI
+  // 2. Not enough data — caller should use AI
   console.log(`[PriceCache] "${keyword}" → no cache, AI needed`);
   return null;
 }
@@ -641,17 +597,18 @@ function buildCacheVerdict(listingPrice, priceData) {
     dataPoints:          count,
     source,
     low, median, high,
-    negotiationScript:   `This is going for around $${median} sold on eBay AU — would you take $${Math.round(listingPrice * 0.85)}?`,
+    negotiationScript:   `Similar listings sell for around $${median} — would you take $${Math.round(listingPrice * 0.85)}?`,
   };
 }
 
 // Mileage-aware verdict using the unified priceSource format from fetchBestVehiclePrice.
-function buildVehicleVerdict(listingPrice, priceSource) {
+function buildVehicleVerdict(listingPrice, priceSource, mileage) {
   const { marketMedian, marketLow, marketHigh, samples, make, model, year, mileageAdjusted,
           source, sourceLabel, confidence } = priceSource;
 
-  const roi             = marketMedian > 0 ? Math.round(((marketMedian - listingPrice) / listingPrice) * 100) : 0;
-  const estimatedProfit = Math.max(0, Math.round(marketMedian - listingPrice));
+  const feeAdj          = marketMedian * 0.92;  // ~8% selling fees (FB/Gumtree)
+  const roi             = marketMedian > 0 ? Math.round(((feeAdj - listingPrice) / listingPrice) * 100) : 0;
+  const estimatedProfit = Math.max(0, Math.round(feeAdj - listingPrice));
 
   let verdict, oneLiner, dealScore;
   if (roi >= 50) {
@@ -682,14 +639,24 @@ function buildVehicleVerdict(listingPrice, priceSource) {
   else if (dealScore >= 55) demandLevel = '📈 Moderate';
   else                      demandLevel = '📉 Low';
 
+  // Mileage unknown: lower dealScore and flag it — market median is at reference km, actual may differ significantly
+  if (!mileageAdjusted) {
+    dealScore = Math.max(0, dealScore - 8);
+  }
+  // Extra penalty for very high mileage — hard sell regardless of price
+  if (mileage && mileage > 200000) {
+    dealScore = Math.max(0, dealScore - 5);
+  }
+
   const mileageNote = mileageAdjusted ? ' (mileage-adjusted)' : '';
   const carLabel    = [year, make, model].filter(Boolean).join(' ');
   const srcLabel    = sourceLabel || 'AU vehicle index';
   const confPct     = confidence != null ? Math.round(confidence * 100) : null;
+  const mileageWarning = !mileageAdjusted ? ' Mileage not provided — actual value may vary significantly.' : '';
 
   const whyItsWorth = confPct != null
-    ? `${srcLabel} — ${confPct}% confidence${samples ? `, ${samples} comparable${samples !== 1 ? 's' : ''}` : ''}${mileageNote}.`
-    : `Based on ${samples} comparable ${carLabel} listings in AU${mileageNote}.`;
+    ? `${srcLabel} — ${confPct}% confidence${samples ? `, ${samples} comparable${samples !== 1 ? 's' : ''}` : ''}${mileageNote}.${mileageWarning}`
+    : `Based on ${samples} comparable ${carLabel} listings in AU${mileageNote}.${mileageWarning}`;
 
   return {
     verdict,
@@ -698,8 +665,8 @@ function buildVehicleVerdict(listingPrice, priceSource) {
     estimatedMarketValue: marketMedian,
     estimatedResellLow:   marketLow,
     estimatedResellHigh:  marketHigh,
-    recommendedOffer:     Math.round(listingPrice * 0.88),
-    walkAwayPrice:        Math.round(marketMedian * 1.05),
+    recommendedOffer:     Math.round(listingPrice * 0.82),
+    walkAwayPrice:        Math.round(marketMedian * 0.95),
     estimatedProfit,
     roiPercent:           roi,
     timeToSell,
@@ -715,7 +682,7 @@ function buildVehicleVerdict(listingPrice, priceSource) {
     low:    marketLow,
     median: marketMedian,
     high:   marketHigh,
-    negotiationScript: `Similar ${carLabel}s sell for around $${marketMedian.toLocaleString()}${mileageNote} in AU — would you take $${Math.round(listingPrice * 0.88).toLocaleString()}?`,
+    negotiationScript: `Similar ${carLabel}s sell for around $${marketMedian.toLocaleString()}${mileageNote} in AU — would you take $${Math.round(listingPrice * 0.82).toLocaleString()}?`,
     vpxData: priceSource,
   };
 }
@@ -842,7 +809,8 @@ const APIFY_ACTOR_DETAIL = 'data-slayer~facebook-marketplace-details';  // expen
 // Prevents data-slayer from re-enriching the same listing on every 30-min scan cycle.
 // Key = listingId, value = { ts }. TTL matches the shared scan cache (30 min).
 const _enrichCache = new Map();
-const ENRICH_CACHE_TTL_MS = 30 * 60 * 1000;
+const ENRICH_CACHE_TTL_MS  = 6 * 60 * 60 * 1000;  // 6 hours — mileage/year/transmission don't change
+const ENRICH_REDIS_TTL_SEC = 7 * 24 * 3600;        // 7 days — persists across restarts
 
 // Types that look like vehicles in keywords/titles but don't need odometer enrichment
 const NON_VEHICLE_TYPES = ['scooter','e-bike','ebike','electric bike','electric scooter',
@@ -889,23 +857,40 @@ async function scrapeKeyword(keyword, opts = {}) {
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
 
     // ── Vehicle keywords: enrich with data-slayer ─────────
-    // Per-listing check: only call data-slayer when year/odometer/transmission are missing.
-    // Skip listings recently enriched (in-memory cache) and non-vehicle types (scooters, etc.).
+    // Step 1: restore Redis-cached enrichment data (survives restarts, 7-day TTL).
+    // Step 2: only call data-slayer for listings still missing metadata after cache restore.
+    // Step 3: store fresh data-slayer results to Redis for future scans.
     if (vehicleMode && items.length > 0) {
+      // Restore Redis-cached enrichment in parallel for all listings
+      const redisEnriched = await Promise.all(
+        items.map(item => {
+          const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
+          return id ? redisGet(K.enrich(id)).catch(() => null) : Promise.resolve(null);
+        })
+      );
+      items = items.map((item, i) => redisEnriched[i] ? { ...item, ...redisEnriched[i] } : item);
+
+      // Only escalate to data-slayer when metadata is still genuinely missing
       const toEnrich = items.filter(item => {
         const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
         if (!listingId) return false;
-        const cached = _enrichCache.get(listingId);
-        if (cached && (Date.now() - cached.ts) < ENRICH_CACHE_TTL_MS) return false;
+        const inMem = _enrichCache.get(listingId);
+        if (inMem && (Date.now() - inMem.ts) < ENRICH_CACHE_TTL_MS) return false;
         if (!shouldEnrich(item)) return false;
-        const hasOdo   = !!(item.vehicle_odometer_data || item.odometer || item.mileage);
-        const hasYear  = !!(item.vehicle_info?.year || item.listing_vehicle_data?.year || item.vehicleInfo?.year || item.year);
-        const hasTrans = !!(item.vehicle_transmission_type || item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission);
+        // Use extraction functions so subtitle chips and regex count before deciding to enrich
+        const rawTitle    = item.marketplace_listing_title || item.custom_title || item.title || '';
+        const description = item.redacted_description?.text || item.description || null;
+        const hasOdo   = !!(extractMileageFromVehicleInfo(item) || extractMileage(rawTitle, description));
+        const hasYear  = !!(item.vehicle_info?.year || item.listing_vehicle_data?.year ||
+                            item.vehicleInfo?.year  || item.year || extractYear(rawTitle, description));
+        const hasTrans = !!(item.vehicle_transmission_type ||
+                            item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission ||
+                            extractTransmission(rawTitle, description));
         return !hasOdo || !hasYear || !hasTrans;
       });
 
       if (toEnrich.length > 0) {
-        console.log(`[Apify] "${keyword}" — enriching ${toEnrich.length}/${items.length} listing(s) via data-slayer`);
+        console.log(`[Apify] "${keyword}" — enriching ${toEnrich.length}/${items.length} via data-slayer (${items.length - toEnrich.length} already complete)`);
         try {
           const batchSize = 5;
           const detailMap = {};
@@ -924,6 +909,19 @@ async function scrapeKeyword(keyword, opts = {}) {
                 if (rows[0]) {
                   detailMap[listingId] = rows[0];
                   _enrichCache.set(listingId, { ts: Date.now() });
+                  // Persist slim enrichment fields to Redis — survives restarts for 7 days
+                  const slim = {
+                    vehicle_odometer_data:   rows[0].vehicle_odometer_data   || null,
+                    vehicle_transmission_type: rows[0].vehicle_transmission_type || null,
+                    vehicle_info:            rows[0].vehicle_info || rows[0].vehicleInfo || rows[0].listing_vehicle_data || null,
+                    custom_sub_titles:       rows[0].custom_sub_titles || null,
+                    odometer:  rows[0].odometer  || null,
+                    mileage:   rows[0].mileage   || null,
+                    year:      rows[0].year      || null,
+                    make:      rows[0].make      || null,
+                    model:     rows[0].model     || null,
+                  };
+                  redisSet(K.enrich(listingId), slim, ENRICH_REDIS_TTL_SEC).catch(() => {});
                 }
               } catch (e) {
                 console.error(`[DataSlayer] Failed for listingId ${listingId}:`, e.message);
@@ -1037,6 +1035,16 @@ async function scrapeKeyword(keyword, opts = {}) {
                          item.vehicle_transmission_type ||
                          item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission ||
                          item.vehicleInfo?.transmission || item.transmission ||
+                         (() => {
+                           const subs = item.custom_sub_titles || item.listing_subtitle || item.subtitle || [];
+                           const arr = Array.isArray(subs) ? subs : String(subs || '').split(/[·|]/);
+                           for (const c of arr) {
+                             const t = String(c || '').toLowerCase().trim();
+                             if (t === 'automatic' || t === 'auto') return 'Automatic';
+                             if (t === 'manual') return 'Manual';
+                           }
+                           return null;
+                         })() ||
                          extractTransmission(rawTitle, description)
                        ) : null,
         fuelType:      isVehicle ? (
@@ -1123,12 +1131,25 @@ function isVehicleListing(keyword, title, description) {
 
 // Extract mileage from Apify's structured vehicle_info block (more accurate than regex)
 function extractMileageFromVehicleInfo(item) {
-  // data-slayer uses vehicle_odometer_data which is a string like "250,000 km"
+  // Priority 1: subtitle chips — FB returns ["2005", "175,000 km", "Automatic"] here
+  const subs = item.custom_sub_titles || item.listing_subtitle || item.subtitle || [];
+  const subArr = Array.isArray(subs) ? subs : String(subs || '').split(/[·|]/);
+  for (const chip of subArr) {
+    const c = String(chip || '').trim();
+    const m = c.match(/^(\d{1,3}(?:[,\s]\d{3})+)\s*k(?:m|ms|ilometres?)?$/i)
+           || c.match(/^(\d{4,6})\s*k(?:m|ms|ilometres?)?$/i);
+    if (m) {
+      const val = parseInt(m[1].replace(/[,\s]/g, ''));
+      if (val > 1000 && val < 2000000) return val;
+    }
+  }
+  // Priority 2: data-slayer vehicle_odometer_data — string like "250,000 km"
   const odoData = item.vehicle_odometer_data;
   if (odoData) {
     const parsed = parseInt(String(odoData).replace(/[^0-9]/g, ''));
     if (parsed > 0 && parsed < 2000000) return parsed;
   }
+  // Priority 3: structured vehicle_info fields
   const vi = item.vehicle_info || item.listing_vehicle_data || item.vehicleInfo || {};
   const raw = vi.odometer || vi.mileage || vi.kilometers || vi.driven_km || vi.driven
     || item.odometer || item.mileage || item.kilometers || null;
@@ -1167,6 +1188,13 @@ function extractMileage(title, description) {
   const commaMatch = text.match(/(\d{1,3}(?:,\d{3})+)\s*k(?:m|ms|ilometres?|ilometers?|s\b)/);
   if (commaMatch) {
     const val = parseInt(commaMatch[1].replace(/,/g, ''));
+    if (val > 1000 && val < 1000000) return val;
+  }
+
+  // Space-separated thousands — e.g. "181 000 km" (common AU format)
+  const spaceMatch = text.match(/(\d{1,3}(?:\s\d{3})+)\s*k(?:m|ms|ilometres?|ilometers?|s\b)/);
+  if (spaceMatch) {
+    const val = parseInt(spaceMatch[1].replace(/\s/g, ''));
     if (val > 1000 && val < 1000000) return val;
   }
 
@@ -1278,7 +1306,6 @@ function calcConfidence(source, count = 0) {
     case 'autograb':    return 0.87;  // RedBook industry data
     case 'csales':      return Math.min(0.82, 0.55 + count * 0.018); // grows with listing count
     case 'own_history': return Math.min(0.55, 0.28 + count * 0.015);
-    case 'ebay_sold':   return Math.min(0.50, 0.25 + count * 0.015);
     default:            return 0.20;
   }
 }
@@ -1762,9 +1789,9 @@ if (SELF_URL) {
 // ── Routes ────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'ok',
-  apify:  APIFY_TOKEN ? 'connected' : 'NO APIFY_TOKEN SET',
-  redis:  REDIS_URL   ? 'connected' : 'not set',
-  ebay:   EBAY_APP_ID ? 'connected' : 'NO EBAY_APP_ID SET',
+  apify:  APIFY_TOKEN     ? 'connected' : 'NO APIFY_TOKEN SET',
+  redis:  REDIS_URL       ? 'connected' : 'not set',
+  gemini: GEMINI_API_KEY  ? 'connected' : 'not set',
   watches: watchlist.length,
   timers:  Object.keys(watchTimers).length,
   lastScan: lastScanTime,
@@ -2068,14 +2095,11 @@ app.post('/listings/remove', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── Price cache route — lets frontend check before triggering AI ──
-// GET /prices?keyword=ps5&refresh=1  (refresh=1 busts the eBay cache for testing)
+// ── Price cache route — lets frontend check own scan history before triggering AI ──
 app.get('/prices', authMiddleware, async (req, res) => {
   try {
-    const { keyword, refresh } = req.query;
+    const { keyword } = req.query;
     if (!keyword) return res.status(400).json({ error: 'keyword required' });
-    console.log('[Prices] Request for keyword:', keyword, '| EBAY_APP_ID set:', !!EBAY_APP_ID);
-    if (refresh === '1') await redisDel(K.ebay(keyword.toLowerCase().trim()));
     const priceData = await getPriceCacheForKeyword(keyword);
     console.log('[Prices] Result for', keyword, ':', priceData ? 'found (' + priceData.count + ' prices, median $' + priceData.median + ')' : 'not found');
     if (!priceData) return res.json({ found: false, keyword });
@@ -2096,17 +2120,12 @@ app.get('/prices/vehicle', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── Appraisal route — cache-first, AI fallback ────────────
-// POST /appraise  { keyword, price, title, description, make?, model?, year?, mileage? }
-// VPX checked first for vehicles; falls back to keyword history then eBay
+// ── Appraisal route — limit check only, always defers to AI ──
+// POST /appraise  { keyword, price }
 app.post('/appraise', authMiddleware, async (req, res) => {
   try {
-    const { keyword, price, title, description, make, model, year, mileage } = req.body;
+    const { keyword, price } = req.body;
     if (!keyword || !price) return res.status(400).json({ error: 'keyword and price required' });
-
-    const listingPrice = parsePrice(price);
-
-    // 1. Check appraisal limit (read-only — don't increment yet)
     const user = await _getUserCached(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today = new Date().toISOString().slice(0, 10);
@@ -2114,44 +2133,7 @@ app.post('/appraise', authMiddleware, async (req, res) => {
     const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
-
-    // 2a. Vehicle path — tiered pricing: VPX → Carsales → AutoGrab (most accurate for cars)
-    if (make && year) {
-      const resolvedModel = model || extractModel(make, title || '');
-      const priceSource = await fetchBestVehiclePrice(make, resolvedModel, year, mileage || null);
-      if (priceSource) {
-        const verdict = buildVehicleVerdict(listingPrice, priceSource);
-        user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-        await saveUser(user);
-        _invalidateUserCache(req.userId);
-        console.log(`[Appraise] ${make} ${resolvedModel} ${year} → ${priceSource.source} (${priceSource.sourceLabel}, conf ${Math.round((priceSource.confidence||0)*100)}%)`);
-        return res.json({ ...verdict, usedCache: true });
-      }
-    }
-
-    // 2b. Keyword price history / eBay fallback
-    const priceData = await getPriceCacheForKeyword(keyword);
-    if (priceData) {
-      const verdict = buildCacheVerdict(listingPrice, priceData);
-      user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-      await saveUser(user);
-      _invalidateUserCache(req.userId);
-      console.log(`[Appraise] "${keyword}" → served from ${verdict.source} cache (no AI used)`);
-      return res.json({ ...verdict, usedCache: true });
-    }
-
-    // 3. Not enough price data — caller (frontend) must use AI directly
-    user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-    await saveUser(user);
-    _invalidateUserCache(req.userId);
-    console.log(`[Appraise] "${keyword}" → no cache, AI required`);
-    res.json({
-      found:      false,
-      usedCache:  false,
-      message:    'No price data yet — use AI appraisal',
-      used:       user.appraisalsToday,
-      limit:      limit === Infinity ? -1 : limit,
-    });
+    res.json({ found: false, usedCache: false });
   } catch (e) { console.error('[Appraise]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -2380,79 +2362,73 @@ const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
 const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
 
+// POST /seed/vehicles — owner-only: triggers Carsales seeding for all TOP_AU_SEED_MODELS
+app.post('/seed/vehicles', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    const total = TOP_AU_SEED_MODELS.length;
+    res.json({ ok: true, message: `Seeding ${total} vehicle cohorts in background` });
+    (async () => {
+      let seeded = 0;
+      for (const { make, model, year } of TOP_AU_SEED_MODELS) {
+        try {
+          const n = await scrapeCarsalesForModel(make, model, year);
+          if (n > 0) seeded++;
+          console.log(`[Seed/vehicles] ${make} ${model} ${year} → ${n} samples`);
+        } catch (e) { console.error(`[Seed/vehicles] ${make} ${model} ${year}:`, e.message); }
+        await sleep(2000);
+      }
+      console.log(`[Seed/vehicles] Done — ${seeded}/${total} cohorts seeded`);
+    })();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Redis key for push subscriptions
 const K_push = userId => `fr:push:${userId}`;
 
-// POST /ai/vehicle — vehicle-specific appraisal with market context injection
+// POST /ai/vehicle — vehicle-specific AI appraisal (pure AI, no market data lookup)
 // Body: { make, model, year, mileage, listingPrice, title, description, imageUrl?, imageBase64?, imageMime? }
-// Fetches VPX stats, builds a structured market-context prompt, calls Gemini Flash.
-// AI role is condition/risk assessor, not price guesser — reduces hallucination.
 app.post('/ai/vehicle', authMiddleware, async (req, res) => {
   try {
     if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
 
-    const { make, model, year, mileage, listingPrice, title, description, imageUrl, imageBase64, imageMime } = req.body;
+    const { make, model, year, mileage, transmission, listingPrice, title, description, imageUrl, imageBase64, imageMime } = req.body;
     if (!listingPrice) return res.status(400).json({ error: 'listingPrice required' });
 
     const cr = await consumeAppraisal(req.userId);
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
-    // Build market context block from best available pricing source
-    let marketContext = '';
-    let vpxStats = null;
-    if (make && year) {
-      const resolvedModel = model || extractModel(make, title || '');
-      vpxStats = await fetchBestVehiclePrice(make, resolvedModel, year, mileage || null);
-    }
-    if (vpxStats) {
-      const adj      = vpxStats.mileageAdjusted ? ` (adjusted for ${(mileage || 0).toLocaleString()}km)` : '';
-      const pricedAt = Number(listingPrice);
-      const discountPct = vpxStats.marketMedian > 0
-        ? Math.round(((vpxStats.marketMedian - pricedAt) / pricedAt) * 100) : 0;
-      const srcNote = vpxStats.sourceLabel || (vpxStats.samples ? `${vpxStats.samples} AU samples` : 'AU market data');
-      marketContext = `\n\nMARKET DATA (${srcNote}${adj}):
-- Market median: $${vpxStats.marketMedian.toLocaleString()}
-- Typical range: $${vpxStats.marketLow.toLocaleString()} – $${vpxStats.marketHigh.toLocaleString()}
-- Listing price: $${pricedAt.toLocaleString()}
-- ${discountPct >= 0 ? `${discountPct}% below` : `${Math.abs(discountPct)}% above`} market median
-- Data confidence: ${Math.round((vpxStats.confidence || 0) * 100)}%`;
-    }
-
     const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
-    const prompt = `You are an expert Australian used-vehicle flipper and assessor.
-Assess ${carLabel} listed at $${Number(listingPrice).toLocaleString()}${mileage ? `, ${Number(mileage).toLocaleString()}km` : ''}.
-${marketContext}
+    const vehicleDetails = [
+      `Make/Model/Year: ${carLabel}`,
+      mileage ? `Mileage: ${Number(mileage).toLocaleString()} km` : null,
+      transmission ? `Transmission: ${transmission}` : null,
+      `Listing Price: $${Number(listingPrice).toLocaleString()}`,
+    ].filter(Boolean).join('\n');
 
-LISTING TITLE: ${title || '(not provided)'}
+    const mileageGuide = mileage
+      ? `Mileage context: <80k premium, 80–130k normal, 130–180k ~10–20% below median, 180–250k ~25–40% below, >250k hard sell.`
+      : `Mileage not provided — flag as red flag, widen resell range to reflect uncertainty.`;
+
+    const prompt = `You are an expert Australian used-vehicle flipper. Analyse conservatively using AU private-sale market knowledge.
+
+VEHICLE:
+${vehicleDetails}
+${mileageGuide}
+
+TITLE: ${title || '(not provided)'}
 DESCRIPTION: ${description || '(not provided)'}
 
-${vpxStats
-  ? 'Market data is provided above. Use it as your pricing anchor — do NOT invent or override these figures. Your role is condition and risk assessor, not price guesser.'
-  : 'No local market data available — use your knowledge of the AU used-car market to estimate pricing.'}
+RULES:
+- Deduct ~8% selling fees + $200–500 prep before calculating profit
+- STEAL only if margin is genuinely exceptional after all costs
+- Use round numbers ($500 increments) — no fake precision like $11,847
+- If uncertain, use wider resell range and softer wording in whyItsWorth
+- Broken/project (spares, not running, damage, blown HG, needs work, as-is): isBrokenOrProject true, realistic repairEstimate AUD, subtract from profit, cap verdict at FAIR
 
-Respond in this exact JSON format (no markdown, no prose outside JSON):
-{
-  "verdict": "STEAL|GOOD DEAL|FAIR|PASS",
-  "dealScore": 0-100,
-  "oneLiner": "one punchy sentence",
-  "extractedTitle": "cleaned listing title (make/model/year/variant)",
-  "extractedPrice": number,
-  "estimatedMarketValue": number,
-  "estimatedResellLow": number,
-  "estimatedResellHigh": number,
-  "recommendedOffer": number,
-  "walkAwayPrice": number,
-  "estimatedProfit": number,
-  "roiPercent": number,
-  "timeToSell": "e.g. 1-3 days or 1-2 weeks",
-  "demandLevel": "🔥 High or 📈 Moderate or 📉 Low",
-  "whyItsWorth": "1-2 sentence explanation of market value",
-  "greenFlags": ["positive aspects from listing"],
-  "redFlags": ["concerns or risks from listing"],
-  "whatToCheckInPerson": ["inspection checklist items"],
-  "negotiationScript": "what to say to the seller",
-  "aiGenerated": true
-}`;
+Respond ONLY with raw JSON (no markdown):
+{"verdict":"STEAL|GOOD DEAL|FAIR|PASS","dealScore":0-100,"oneLiner":"punchy sentence","extractedTitle":"cleaned title","extractedPrice":number,"extractedMileage":number or null,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"roiPercent":number,"timeToSell":"e.g. 1-3 days","demandLevel":"🔥 High or 📈 Moderate or 📉 Low","whyItsWorth":"1-2 sentences","greenFlags":["..."],"redFlags":["..."],"whatToCheckInPerson":["..."],"negotiationScript":"what to say","isBrokenOrProject":false,"repairEstimate":0,"repairNotes":"","aiGenerated":true}`;
 
     // Prefer Gemini when image is available, otherwise Claude Haiku
     let text = '';
@@ -2463,26 +2439,31 @@ Respond in this exact JSON format (no markdown, no prose outside JSON):
       if (imageBase64 && imageMime) {
         parts.push({ inline_data: { mime_type: imageMime, data: imageBase64 } });
       } else if (imageUrl) {
+        // Race image fetch vs 1.5s — expired FB CDN URLs can stall for 3–10s; proceed text-only on timeout
         try {
-          const imgRes = await axios.get(imageUrl, {
-            responseType: 'arraybuffer', timeout: 10000,
+          const imgFetch = axios.get(imageUrl, {
+            responseType: 'arraybuffer', timeout: 8000,
             headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
           });
+          const imgTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('img_timeout')), 1500));
+          const imgRes = await Promise.race([imgFetch, imgTimeout]);
           parts.push({ inline_data: { mime_type: imgRes.headers['content-type'] || 'image/jpeg', data: Buffer.from(imgRes.data).toString('base64') } });
-        } catch (_) {}
+        } catch (_) {
+          console.log('[AI/vehicle] Image skipped (timeout/error), proceeding text-only');
+        }
       }
       parts.push({ text: prompt });
       const geminiRes = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts }] },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
+        { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
       );
       text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else if (GEMINI_API_KEY) {
       const geminiRes = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts: [{ text: prompt }] }] },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
       );
       text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else {
@@ -2502,29 +2483,9 @@ Respond in this exact JSON format (no markdown, no prose outside JSON):
     } catch (_) {}
 
     if (parsed) {
-      if (vpxStats) {
-        // Anchor resell range to market data if AI drifted >25%
-        if (parsed.estimatedResellLow && parsed.estimatedResellHigh) {
-          const aiMedian = (parsed.estimatedResellLow + parsed.estimatedResellHigh) / 2;
-          const drift = Math.abs(aiMedian - vpxStats.marketMedian) / vpxStats.marketMedian;
-          if (drift > 0.25) {
-            parsed.estimatedResellLow  = vpxStats.marketLow;
-            parsed.estimatedResellHigh = vpxStats.marketHigh;
-            parsed._pricingCorrected   = true;
-          }
-        }
-        parsed.sourceLabel        = vpxStats.sourceLabel;
-        parsed.confidence         = vpxStats.confidence;
-        parsed.dataPoints         = vpxStats.samples;
-        parsed.low                = vpxStats.marketLow;
-        parsed.median             = vpxStats.marketMedian;
-        parsed.high               = vpxStats.marketHigh;
-        parsed.estimatedMarketValue = parsed.estimatedMarketValue || vpxStats.marketMedian;
-        parsed.vpxData = vpxStats;
-      }
       res.json({ ...parsed, text, usedCache: false });
     } else {
-      res.json({ text, usedCache: false, vpxData: vpxStats || null });
+      res.json({ text, usedCache: false });
     }
   } catch (e) {
     console.error('[AI/vehicle]', e.response?.data || e.message);
@@ -2545,9 +2506,9 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }] }, {
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
       headers: { 'Content-Type': 'application/json' },
-      timeout: 60000,
+      timeout: 30000,
     });
     const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     res.json({ text });
@@ -2619,9 +2580,9 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
     }
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }] }, {
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
       headers: { 'Content-Type': 'application/json' },
-      timeout: 60000,
+      timeout: 30000,
     });
     const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     res.json({ text });
@@ -2653,7 +2614,6 @@ app.listen(PORT, async () => {
   console.log(`FlipRadar backend on port ${PORT}`);
   console.log(`Apify:      ${APIFY_TOKEN     ? 'set' : 'NO TOKEN'}`);
   console.log(`Redis:      ${REDIS_URL        ? 'connected' : 'NOT SET'}`);
-  console.log(`eBay:       ${EBAY_APP_ID      ? 'connected' : 'NOT SET — add EBAY_APP_ID env var (free at developer.ebay.com)'}`);
   console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
   console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
   await loadAllWatches();
