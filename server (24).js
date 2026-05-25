@@ -100,8 +100,8 @@ const EBAY_MIN_RESULTS    = 5;                     // need at least 5 sold price
 const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
 const VPX_REF_KM          = 100000;               // mileage reference for price normalization
 const VPX_MIN_SAMPLES     = 5;                    // samples needed to use VPX instead of AI
-const VPX_SAMPLE_CAP      = 150;                  // max samples stored per vehicle cohort
-const VPX_TTL_SECS        = 14 * 24 * 3600;      // 14 days TTL on vehicle price index keys
+const VPX_SAMPLE_CAP      = 500;                  // max samples stored per vehicle cohort
+const VPX_TTL_SECS        = null;                 // permanent — hard-won scraped data must not expire
 const SEEN_TTL_MS         = 48 * 60 * 60 * 1000;
 const SEEN_MAX_ENTRIES    = 5000;
 const CSALES_TTL_SECS     = 48 * 3600;            // 48 h carsales market cache
@@ -337,6 +337,7 @@ async function getEbaySoldPrices(keyword) {
 // Builds up over time — eventually replaces eBay for popular keywords
 async function storeScanPrice(keyword, listing) {
   if (!listing.price || listing.price <= 0) return;
+  if (listing.isOfferPrice) return; // placeholder prices pollute keyword price history
   try {
     const existing = await redisGet(K.prices(keyword)) || [];
     if (!existing.find(r => r.id === listing.id)) {
