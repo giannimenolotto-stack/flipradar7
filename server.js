@@ -11,7 +11,23 @@ const Stripe = require('stripe');
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const app = express();
-app.use(cors());
+const ALLOWED_ORIGINS = [
+  'https://flipradar.pages.dev',
+  'https://flip-radar.app',
+  'https://www.flip-radar.app',
+  'http://localhost:3000',
+  'http://localhost:8080',
+];
+app.use(cors({
+  origin: function(origin, cb) {
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    if (/^https:\/\/[\w-]+\.flip-radar\.app$/.test(origin)) return cb(null, true);
+    if (/^https:\/\/[\w-]+\.flipradar\.pages\.dev$/.test(origin)) return cb(null, true);
+    cb(new Error('CORS: ' + origin + ' not allowed'));
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: '10mb' }));
 
 // ── Upstash Redis ─────────────────────────────────────────
