@@ -3850,7 +3850,11 @@ function appraiseListing(listing) {
     }
 
     // ── Cache-hit fast path — full verdict from price data, no AI call ──
-    if (appraiseData && appraiseData.usedCache) {
+    // For vehicles, own_history/ebay verdicts are too inaccurate — fall through to AI
+    var isVehicleWeakCache = appraiseData && appraiseData.usedCache &&
+      listing.make && listing.year &&
+      (appraiseData.source === 'own_history' || appraiseData.source === 'ebay');
+    if (appraiseData && appraiseData.usedCache && !isVehicleWeakCache) {
       clearInterval(stepTimer);
       for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
       var r = Object.assign({
@@ -3886,6 +3890,7 @@ function appraiseListing(listing) {
         model: listing.model || '',
         year: listing.year,
         mileage: listing.mileage || null,
+        transmission: listing.transmission || null,
         listingPrice: listing.price,
         title: listing.title,
         description: listing.description || ''

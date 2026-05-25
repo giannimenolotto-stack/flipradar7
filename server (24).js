@@ -2180,15 +2180,17 @@ app.post('/appraise', authMiddleware, async (req, res) => {
       }
     }
 
-    // 2b. Keyword price history / eBay fallback
-    const priceData = await getPriceCacheForKeyword(keyword);
-    if (priceData) {
-      const verdict = buildCacheVerdict(listingPrice, priceData);
-      user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-      await saveUser(user);
-      _invalidateUserCache(req.userId);
-      console.log(`[Appraise] "${keyword}" → served from ${verdict.source} cache (no AI used)`);
-      return res.json({ ...verdict, usedCache: true });
+    // 2b. Keyword price history / eBay fallback (skip for vehicle listings — VPX or AI only)
+    if (!make || !year) {
+      const priceData = await getPriceCacheForKeyword(keyword);
+      if (priceData) {
+        const verdict = buildCacheVerdict(listingPrice, priceData);
+        user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+        await saveUser(user);
+        _invalidateUserCache(req.userId);
+        console.log(`[Appraise] "${keyword}" → served from ${verdict.source} cache (no AI used)`);
+        return res.json({ ...verdict, usedCache: true });
+      }
     }
 
     // 3. Not enough price data — caller (frontend) must use AI directly
@@ -2464,7 +2466,7 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
   try {
     if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
 
-    const { make, model, year, mileage, listingPrice, title, description, imageUrl, imageBase64, imageMime } = req.body;
+    const { make, model, year, mileage, transmission, listingPrice, title, description, imageUrl, imageBase64, imageMime } = req.body;
     if (!listingPrice) return res.status(400).json({ error: 'listingPrice required' });
 
     const cr = await consumeAppraisal(req.userId);
@@ -2492,16 +2494,36 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
     }
 
     const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
-    const prompt = `You are an expert Australian used-vehicle flipper and assessor.
-Assess ${carLabel} listed at $${Number(listingPrice).toLocaleString()}${mileage ? `, ${Number(mileage).toLocaleString()}km` : ''}.
-${marketContext}
+    const vehicleDetails = [
+      `Make/Model/Year: ${carLabel}`,
+      mileage ? `Mileage: ${Number(mileage).toLocaleString()} km` : null,
+      transmission ? `Transmission: ${transmission}` : null,
+      `Listing Price: $${Number(listingPrice).toLocaleString()}`,
+    ].filter(Boolean).join('\n');
+
+    const mileageGuide = mileage
+      ? `\n\nMILEAGE DEPRECIATION GUIDE (AU market):
+- Under 80,000 km: premium condition — little to no discount vs median
+- 80,000–130,000 km: normal use — at or near median
+- 130,000–180,000 km: moderate discount (~10–20% below median expected)
+- 180,000–250,000 km: significant discount (~25–40% below median)
+- Over 250,000 km: hard sell — price well below median, expect long time-to-sell`
+      : '';
+
+    const prompt = `You are an expert Australian used-vehicle flipper and assessor. Your goal is conservative, realistic flip analysis — do NOT overestimate profit potential.
+
+VEHICLE DETAILS:
+${vehicleDetails}
+${marketContext}${mileageGuide}
 
 LISTING TITLE: ${title || '(not provided)'}
 DESCRIPTION: ${description || '(not provided)'}
 
 ${vpxStats
-  ? 'Market data is provided above. Use it as your pricing anchor — do NOT invent or override these figures. Your role is condition and risk assessor, not price guesser.'
-  : 'No local market data available — use your knowledge of the AU used-car market to estimate pricing.'}
+  ? 'Market data is provided above. Use it as your primary pricing anchor — do NOT invent or significantly deviate from these figures. Your role is condition and risk assessor. Apply mileage depreciation on top of market median when appropriate.'
+  : 'No local market data available — use your knowledge of the AU used-car market to estimate pricing conservatively. Apply the mileage guide above.'}
+
+Flip guidance: account for selling fees (~8% on Facebook/Gumtree), detailing/minor repairs, and time cost. Only call it a STEAL if the margin is genuinely exceptional after fees.
 
 Respond in this exact JSON format (no markdown, no prose outside JSON):
 {
@@ -2580,7 +2602,7 @@ Respond in this exact JSON format (no markdown, no prose outside JSON):
         if (parsed.estimatedResellLow && parsed.estimatedResellHigh) {
           const aiMedian = (parsed.estimatedResellLow + parsed.estimatedResellHigh) / 2;
           const drift = Math.abs(aiMedian - vpxStats.marketMedian) / vpxStats.marketMedian;
-          if (drift > 0.25) {
+          if (drift > 0.25 && vpxStats.confidence >= 0.65) {
             parsed.estimatedResellLow  = vpxStats.marketLow;
             parsed.estimatedResellHigh = vpxStats.marketHigh;
             parsed._pricingCorrected   = true;
