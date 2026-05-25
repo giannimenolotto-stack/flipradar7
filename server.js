@@ -2288,17 +2288,14 @@ app.get('/prices/vehicle', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── Appraisal route — cache-first, AI fallback ────────────
+// ── Appraisal route — AI only (cache disabled until seed data is ready) ──
 // POST /appraise  { keyword, price, title, description, make?, model?, year?, mileage? }
-// VPX checked first for vehicles; falls back to keyword history then eBay
+// Always tells the frontend to call AI — no cached verdicts until bucket data is proven accurate.
 app.post('/appraise', authMiddleware, async (req, res) => {
   try {
-    const { keyword, price, title, description, make, model, year, mileage } = req.body;
+    const { keyword, price } = req.body;
     if (!keyword || !price) return res.status(400).json({ error: 'keyword and price required' });
 
-    const listingPrice = parsePrice(price);
-
-    // 1. Check appraisal limit (read-only — don't increment yet)
     const user = await _getUserCached(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today = new Date().toISOString().slice(0, 10);
@@ -2307,53 +2304,17 @@ app.post('/appraise', authMiddleware, async (req, res) => {
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
 
-    // 2a. Vehicle path — tiered pricing: bucket → VPX → Carsales → AutoGrab
-    // Vehicles NEVER fall through to eBay or keyword history — those sources mix
-    // unrelated listings and produce garbage verdicts on thin data.
-    // If no confident vehicle data exists, go straight to AI.
-    const isVehicle = !!(make && year);
-    if (isVehicle) {
-      const resolvedModel = model || extractModel(make, title || '');
-      const priceSource = await fetchBestVehiclePrice(make, resolvedModel, year, mileage || null);
-      if (priceSource) {
-        const verdict = buildVehicleVerdict(listingPrice, priceSource);
-        user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-        await saveUser(user);
-        _invalidateUserCache(req.userId);
-        console.log(`[Appraise] ${make} ${resolvedModel} ${year} → ${priceSource.source} (${priceSource.sourceLabel}, conf ${Math.round((priceSource.confidence||0)*100)}%)`);
-        return res.json({ ...verdict, usedCache: true });
-      }
-      // No confident vehicle data — tell frontend to call AI
-      user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-      await saveUser(user);
-      _invalidateUserCache(req.userId);
-      console.log(`[Appraise] ${make} ${resolvedModel} ${year} → no vehicle data, AI required`);
-      return res.json({ found: false, usedCache: false, message: 'No vehicle data yet — use AI appraisal' });
-    }
-
-    // 2b. Non-vehicle keyword — own scan history only (no eBay)
-    // eBay mixes international listings, wrong categories, and wrong price points.
-    const ownPrices = await getOwnPriceRange(keyword);
-    if (ownPrices) {
-      const verdict = buildCacheVerdict(listingPrice, ownPrices);
-      user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-      await saveUser(user);
-      _invalidateUserCache(req.userId);
-      console.log(`[Appraise] "${keyword}" → own history (${ownPrices.count} records)`);
-      return res.json({ ...verdict, usedCache: true });
-    }
-
-    // 3. Non-vehicle, no own history — caller must use AI
+    // Always AI — cache routes disabled until seed data is proven
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
     _invalidateUserCache(req.userId);
-    console.log(`[Appraise] "${keyword}" → no cache, AI required`);
+    console.log(`[Appraise] "${keyword}" → AI only mode`);
     res.json({
-      found:      false,
-      usedCache:  false,
-      message:    'No price data yet — use AI appraisal',
-      used:       user.appraisalsToday,
-      limit:      limit === Infinity ? -1 : limit,
+      found:     false,
+      usedCache: false,
+      message:   'Use AI appraisal',
+      used:      user.appraisalsToday,
+      limit:     limit === Infinity ? -1 : limit,
     });
   } catch (e) { console.error('[Appraise]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
