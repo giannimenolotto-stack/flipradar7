@@ -2290,7 +2290,7 @@ app.get('/prices/vehicle', authMiddleware, async (req, res) => {
 
 // ── Appraisal route — AI only (cache disabled until seed data is ready) ──
 // POST /appraise  { keyword, price, title, description, make?, model?, year?, mileage? }
-// Always tells the frontend to call AI — no cached verdicts until bucket data is proven accurate.
+// Always routes to AI. Bucket/VPX system accumulates in background but is not served yet.
 app.post('/appraise', authMiddleware, async (req, res) => {
   try {
     const { keyword, price } = req.body;
@@ -2304,11 +2304,10 @@ app.post('/appraise', authMiddleware, async (req, res) => {
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
 
-    // Always AI — cache routes disabled until seed data is proven
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
     _invalidateUserCache(req.userId);
-    console.log(`[Appraise] "${keyword}" → AI only mode`);
+    console.log(`[Appraise] "${keyword}" → AI`);
     res.json({
       found:     false,
       usedCache: false,
