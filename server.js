@@ -250,6 +250,20 @@ async function saveUserSeen(userId, seen, { merge = true } = {}) {
 async function storeScanPrice(keyword, listing) {
   if (!listing.price || listing.price <= 0) return;
   if (listing.isOfferPrice) return; // placeholder prices pollute keyword price history
+  // Patch B: only store price history for specific enough keywords.
+  // Single generic words (bmw, ford, iphone, car) produce meaningless mixed medians.
+  // Require either: 2+ words, OR a make+model is detected on the listing.
+  const kwWords = keyword.trim().split(/\s+/).filter(Boolean);
+  const isSpecific = kwWords.length >= 2 || !!(listing.make && listing.model);
+  if (!isSpecific) {
+    // Still feed VPX for vehicles with full make/model — just skip the broad keyword bucket
+    if (listing.make && listing.year) {
+      storeVehiclePrice(listing).catch(e => console.error('[VPX] passive write error:', e.message));
+    }
+    return;
+  }
+  // Patch C: don't store broken/project vehicle prices — they pollute medians
+  if (listing.isBrokenOrProject) return;
   try {
     const existing = await redisGet(K.prices(keyword)) || [];
     if (!existing.find(r => r.id === listing.id)) {
@@ -290,6 +304,14 @@ async function storeVehiclePrice(listing) {
   let { make, model, year, mileage, price, id, location } = listing;
   if (!make || !year || !price || price <= 0) return;
   if (isOfferPrice(price)) return;
+  // Patch F: don't index broken/project vehicles — their prices are not market comps
+  if (listing.isBrokenOrProject) return;
+  // Sanity-check price range for AU vehicles ($500–$500k)
+  if (price > 500000) return;
+  // Always coerce location to a string here — Apify can return objects
+  if (location !== null && location !== undefined && typeof location !== 'string') {
+    location = location.state || location.city || location.name || '';
+  }
 
   // Fall back to extractModel if Apify didn't provide model
   if (!model) model = extractModel(make, listing.title || '');
@@ -445,8 +467,9 @@ async function scrapeCarsalesForModel(make, model, year) {
       if (!price || price < 500 || isOfferPrice(price)) continue;
       const normPrice = normalizePriceToRefKm(price, mileage, makeKey, modelKey);
       samples.push({ id: item.id || item.listingId || String(Math.random()), price, mileage, normPrice, date: new Date().toISOString(), state, source: 'carsales' });
-      // Also write directly into VPX so these samples count toward confidence
-      await storeVehiclePrice({ id: item.id, make, model, year, price, mileage, location: item.location || state || '' }).catch(() => {});
+      // Also write directly into VPX — coerce location to string so extractState never crashes
+      const locationStr = typeof item.location === 'string' ? item.location : (state || '');
+      await storeVehiclePrice({ id: item.id, make, model, year, price, mileage, location: locationStr }).catch(() => {});
     }
     await storeCarsalesCache(makeKey, modelKey, year, samples);
     console.log(`[Carsales] ${make} ${model} ${year} — seeded ${samples.length} listings`);
@@ -803,7 +826,7 @@ async function sendPushover(token, user, title, message, url) {
 // ── Apify ─────────────────────────────────────────────────
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const APIFY_ACTOR        = 'curious_coder~facebook-marketplace';         // cheap — used for everything
-const APIFY_ACTOR_DETAIL = 'data-slayer~facebook-marketplace-details';  // expensive — vehicles only, fallback
+const APIFY_ACTOR_DETAIL = null; // TEMP: disabled for testing — restore to: 'data-slayer~facebook-marketplace-details'
 
 // ── Enrichment dedup cache ────────────────────────────────
 // Prevents data-slayer from re-enriching the same listing on every 30-min scan cycle.
@@ -824,14 +847,16 @@ function shouldEnrich(item) {
 
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
-  // Initial scan looks back 30 days, fetches up to 50, then we trim to the 20 most recent.
-  // Regular scans only look back 1 day and fetch 25.
-  const days      = opts.backfillDays || (opts.backfill ? 30 : (opts.initialScan ? 30 : 1));
-  const maxItems  = opts.initialScan ? 50 : 25;
+  // Initial scan looks back 7 days, fetches up to 25 items.
+  // Regular scans look back 1 day and fetch 25.
+  const days      = opts.backfillDays || (opts.backfill ? 7 : (opts.initialScan ? 7 : 1));
+  const maxItems  = 25;
   // Use isVehicleKeyword (keyword only) — not isVehicleListing which checks descriptions
   // This prevents "callaway golf clubs" triggering vehicle mode
   const vehicleMode    = isVehicleKeyword(keyword);
-  const includeDetails = vehicleMode; // full details only for vehicle keywords
+  // includeDetails costs 3–5x more per run and was mainly needed for data-slayer's
+  // vehicle_odometer_data field. custom_sub_titles (mileage chips) come back without it.
+  const includeDetails = false;
   console.log(`[Apify] "${keyword}" — vehicle:${vehicleMode} includeDetails:${includeDetails}`);
 
   // Use exact phrase matching — wrap multi-word keywords in quotes so
@@ -860,7 +885,7 @@ async function scrapeKeyword(keyword, opts = {}) {
     // Step 1: restore Redis-cached enrichment data (survives restarts, 7-day TTL).
     // Step 2: only call data-slayer for listings still missing metadata after cache restore.
     // Step 3: store fresh data-slayer results to Redis for future scans.
-    if (vehicleMode && items.length > 0) {
+    if (vehicleMode && items.length > 0 && APIFY_ACTOR_DETAIL) {
       // Restore Redis-cached enrichment in parallel for all listings
       const redisEnriched = await Promise.all(
         items.map(item => {
@@ -868,7 +893,19 @@ async function scrapeKeyword(keyword, opts = {}) {
           return id ? redisGet(K.enrich(id)).catch(() => null) : Promise.resolve(null);
         })
       );
-      items = items.map((item, i) => redisEnriched[i] ? { ...item, ...redisEnriched[i] } : item);
+      // Merge Redis enrichment: only overwrite fields that are currently null/undefined on the item.
+      // This preserves valid curious_coder fields (e.g. custom_sub_titles with mileage chips)
+      // that would otherwise be wiped if the slim object has null for those keys.
+      items = items.map((item, i) => {
+        const enriched = redisEnriched[i];
+        if (!enriched) return item;
+        const merged = { ...item };
+        for (const [k, v] of Object.entries(enriched)) {
+          if (v != null && merged[k] == null) merged[k] = v;  // only fill gaps, never overwrite
+          else if (v != null) merged[k] = v;                   // non-null always wins
+        }
+        return merged;
+      });
 
       // Only escalate to data-slayer when metadata is still genuinely missing
       const toEnrich = items.filter(item => {
@@ -889,7 +926,7 @@ async function scrapeKeyword(keyword, opts = {}) {
         return !hasOdo || !hasYear || !hasTrans;
       });
 
-      if (toEnrich.length > 0) {
+      if (toEnrich.length > 0 && APIFY_ACTOR_DETAIL) {
         console.log(`[Apify] "${keyword}" — enriching ${toEnrich.length}/${items.length} via data-slayer (${items.length - toEnrich.length} already complete)`);
         try {
           const batchSize = 5;
@@ -909,18 +946,22 @@ async function scrapeKeyword(keyword, opts = {}) {
                 if (rows[0]) {
                   detailMap[listingId] = rows[0];
                   _enrichCache.set(listingId, { ts: Date.now() });
-                  // Persist slim enrichment fields to Redis — survives restarts for 7 days
-                  const slim = {
-                    vehicle_odometer_data:   rows[0].vehicle_odometer_data   || null,
-                    vehicle_transmission_type: rows[0].vehicle_transmission_type || null,
-                    vehicle_info:            rows[0].vehicle_info || rows[0].vehicleInfo || rows[0].listing_vehicle_data || null,
-                    custom_sub_titles:       rows[0].custom_sub_titles || null,
-                    odometer:  rows[0].odometer  || null,
-                    mileage:   rows[0].mileage   || null,
-                    year:      rows[0].year      || null,
-                    make:      rows[0].make      || null,
-                    model:     rows[0].model     || null,
-                  };
+                  // Persist slim enrichment fields to Redis — survives restarts for 7 days.
+                  // IMPORTANT: only store non-null values. Null entries spread onto fresh
+                  // curious_coder items would overwrite valid fields (e.g. custom_sub_titles
+                  // with mileage chips, top-level mileage). custom_sub_titles is excluded
+                  // entirely — it belongs to curious_coder, not data-slayer.
+                  const slim = {};
+                  const _sv = (k, v) => { if (v != null) slim[k] = v; };
+                  _sv('vehicle_odometer_data',    rows[0].vehicle_odometer_data);
+                  _sv('vehicle_transmission_type',rows[0].vehicle_transmission_type);
+                  _sv('vehicle_info',             rows[0].vehicle_info || rows[0].vehicleInfo || rows[0].listing_vehicle_data);
+                  _sv('odometer',  rows[0].odometer);
+                  _sv('mileage',   rows[0].mileage);
+                  _sv('year',      rows[0].year);
+                  _sv('make',      rows[0].make);
+                  _sv('model',     rows[0].model);
+                  // custom_sub_titles intentionally excluded — curious_coder owns this field
                   redisSet(K.enrich(listingId), slim, ENRICH_REDIS_TTL_SEC).catch(() => {});
                 }
               } catch (e) {
@@ -935,7 +976,13 @@ async function scrapeKeyword(keyword, opts = {}) {
             items = items.map(item => {
               const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
               const detail = detailMap[listingId];
-              return detail ? { ...item, ...detail } : item;
+              if (!detail) return item;
+              // Non-null values from data-slayer win; never overwrite with null
+              const merged = { ...item };
+              for (const [k, v] of Object.entries(detail)) {
+                if (v != null) merged[k] = v;
+              }
+              return merged;
             });
           }
         } catch (detailErr) {
@@ -1136,11 +1183,18 @@ function extractMileageFromVehicleInfo(item) {
   const subArr = Array.isArray(subs) ? subs : String(subs || '').split(/[·|]/);
   for (const chip of subArr) {
     const c = String(chip || '').trim();
+    // "175,000 km" / "175 000 km" / "175000km" / "175000kms"
     const m = c.match(/^(\d{1,3}(?:[,\s]\d{3})+)\s*k(?:m|ms|ilometres?)?$/i)
            || c.match(/^(\d{4,6})\s*k(?:m|ms|ilometres?)?$/i);
     if (m) {
       const val = parseInt(m[1].replace(/[,\s]/g, ''));
       if (val > 1000 && val < 2000000) return val;
+    }
+    // Shorthand chip: "220k" or "85k" — 2–4 digits followed by bare 'k'
+    const shorthand = c.match(/^(\d{2,4})k$/i);
+    if (shorthand) {
+      const val = parseInt(shorthand[1]) * 1000;
+      if (val > 10000 && val < 2000000) return val;
     }
   }
   // Priority 2: data-slayer vehicle_odometer_data — string like "250,000 km"
@@ -1164,15 +1218,16 @@ function extractMileage(title, description) {
 
   // Explicit odometer/odo labels — highest confidence
   const odoPatterns = [
-    /odo(?:meter)?[\s:]*(\d{1,3}(?:,\d{3})+)/,         // odo: 210,000
-    /odo(?:meter)?[\s:]*(\d{4,6})/,                      // odo: 210000
+    /odo(?:meter)?[\s:]*(\d{1,3}(?:,\d{3})+)/,           // odo: 210,000
+    /odo(?:meter)?[\s:]*(\d{4,6})/,                        // odo: 210000
     /odometer[\s:]*(\d{1,3}(?:,\d{3})+)/,
     /odometer[\s:]*(\d{4,6})/,
+    /odo(?:meter)?[\s:]*(\d{1,3}(?:\s\d{3})+)/,           // odo 220 000 (space-sep, no km suffix)
   ];
   for (const p of odoPatterns) {
     const m = text.match(p);
     if (m) {
-      const val = parseInt(m[1].replace(/,/g, ''));
+      const val = parseInt(m[1].replace(/[,\s]/g, ''));
       if (val > 1000 && val < 1000000) return val;
     }
   }
@@ -1312,7 +1367,12 @@ function calcConfidence(source, count = 0) {
 
 function extractState(location) {
   if (!location) return null;
-  const loc = location.toUpperCase();
+  // location can be an object from Apify (e.g. { state: 'VIC', city: 'Melbourne' })
+  // coerce safely — if it's an object with a state string, use that; otherwise stringify
+  const locStr = (typeof location === 'object' && location !== null)
+    ? (location.state || location.city || location.name || JSON.stringify(location))
+    : String(location);
+  const loc = locStr.toUpperCase();
   if (/\bVIC\b|VICTORIA|MELBOURNE/.test(loc))  return 'VIC';
   if (/\bNSW\b|NEW SOUTH WALES|SYDNEY/.test(loc)) return 'NSW';
   if (/\bQLD\b|QUEENSLAND|BRISBANE|GOLD COAST/.test(loc)) return 'QLD';
@@ -1395,7 +1455,7 @@ function isOfferPrice(price) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── Shared scan cache TTL ────────────────────────────────
-const SHARED_SCAN_TTL_MS = 25 * 60 * 1000; // 25 mins — slightly under the 30min scan interval
+const SHARED_SCAN_TTL_MS = 50 * 60 * 1000; // 50 mins — covers both basic (30min) and premium (15min) intervals; halves Apify calls for non-overlapping keywords
 
 // ── Distribute raw listings to a single user ─────────────
 async function distributeListingsToUser(watcher, raw, opts = {}) {
@@ -2357,6 +2417,42 @@ app.get('/push/vapid-key', (req, res) => {
 const GEMINI_API_KEY    = process.env.GEMINI_API_KEY    || null;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
 
+// ── Gemini call helper with retry + text-only fallback ────
+// Retries once on 503/429 (Gemini overload) after a short delay.
+// If an image+text call fails, automatically retries with text-only.
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`;
+async function callGemini(parts, { retries = 2, timeout = 30000 } = {}) {
+  const body = { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } };
+  const url   = `${GEMINI_URL}?key=${GEMINI_API_KEY}`;
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await axios.post(url, body, { headers: { 'Content-Type': 'application/json' }, timeout });
+      const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (!text && attempt < retries) { await sleep(1500); continue; } // empty response — retry
+      return text;
+    } catch (e) {
+      lastErr = e;
+      const status = e.response?.status;
+      if ((status === 503 || status === 429 || status === 500) && attempt < retries) {
+        console.log(`[Gemini] ${status} on attempt ${attempt}, retrying in 2s...`);
+        await sleep(2000);
+        // If this was an image+text call, strip images on the last retry (text-only fallback)
+        if (attempt === retries - 1) {
+          const textOnly = parts.filter(p => p.text != null);
+          if (textOnly.length < parts.length) {
+            console.log('[Gemini] Falling back to text-only parts');
+            body.contents[0].parts = textOnly;
+          }
+        }
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
 // ── Web Push (VAPID) ──────────────────────────────────────
 const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
@@ -2408,27 +2504,43 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
     ].filter(Boolean).join('\n');
 
     const mileageGuide = mileage
-      ? `Mileage context: <80k premium, 80–130k normal, 130–180k ~10–20% below median, 180–250k ~25–40% below, >250k hard sell.`
-      : `Mileage not provided — flag as red flag, widen resell range to reflect uncertainty.`;
+      ? `Mileage context: <80k premium, 80-130k normal, 130-180k ~10-20% below median, 180-250k ~25-40% below, >250k hard sell.`
+      : `Mileage not provided - flag as red flag, widen resell range to reflect uncertainty.`;
+
+    // Patch E: inject FlipRadar's own AU scan data when we have enough samples.
+    // Anchors Gemini to real AU private-sale prices instead of general knowledge.
+    let vpxContext = '';
+    if (make && model && year) {
+      try {
+        const vpx = await getVehiclePriceStats(make, model, parseInt(year), mileage ? parseInt(mileage) : null);
+        if (vpx && vpx.samples >= 10) {
+          const fmtP = n => '$' + (Math.round(n / 500) * 500).toLocaleString();
+          vpxContext = `\nFLIPRADAR AU DATA (${vpx.samples} comparable AU private-sale listings):\n`
+            + `Market median: ${fmtP(vpx.marketMedian)}${vpx.mileageAdjusted ? ' (mileage-adjusted)' : ''}\n`
+            + `Range: ${fmtP(vpx.marketLow)} - ${fmtP(vpx.marketHigh)}\n`
+            + `Use these as your primary pricing anchor. Estimates should be within ~20% of the median unless exceptional reason.`;
+        }
+      } catch (_) {} // VPX lookup is best-effort; never block appraisal
+    }
 
     const prompt = `You are an expert Australian used-vehicle flipper. Analyse conservatively using AU private-sale market knowledge.
 
 VEHICLE:
 ${vehicleDetails}
-${mileageGuide}
+${mileageGuide}${vpxContext}
 
 TITLE: ${title || '(not provided)'}
 DESCRIPTION: ${description || '(not provided)'}
 
 RULES:
-- Deduct ~8% selling fees + $200–500 prep before calculating profit
+- Deduct ~8% selling fees + $200-500 prep before calculating profit
 - STEAL only if margin is genuinely exceptional after all costs
-- Use round numbers ($500 increments) — no fake precision like $11,847
+- Use round numbers ($500 increments) - no fake precision like $11,847
 - If uncertain, use wider resell range and softer wording in whyItsWorth
 - Broken/project (spares, not running, damage, blown HG, needs work, as-is): isBrokenOrProject true, realistic repairEstimate AUD, subtract from profit, cap verdict at FAIR
 
 Respond ONLY with raw JSON (no markdown):
-{"verdict":"STEAL|GOOD DEAL|FAIR|PASS","dealScore":0-100,"oneLiner":"punchy sentence","extractedTitle":"cleaned title","extractedPrice":number,"extractedMileage":number or null,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"roiPercent":number,"timeToSell":"e.g. 1-3 days","demandLevel":"🔥 High or 📈 Moderate or 📉 Low","whyItsWorth":"1-2 sentences","greenFlags":["..."],"redFlags":["..."],"whatToCheckInPerson":["..."],"negotiationScript":"what to say","isBrokenOrProject":false,"repairEstimate":0,"repairNotes":"","aiGenerated":true}`;
+{"verdict":"STEAL|GOOD DEAL|FAIR|PASS","dealScore":0-100,"oneLiner":"punchy sentence","extractedTitle":"cleaned title","extractedPrice":number,"extractedMileage":number or null,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"roiPercent":number,"timeToSell":"e.g. 1-3 days","demandLevel":"High or Moderate or Low","whyItsWorth":"1-2 sentences","greenFlags":["..."],"redFlags":["..."],"whatToCheckInPerson":["..."],"negotiationScript":"what to say","isBrokenOrProject":false,"repairEstimate":0,"repairNotes":"","aiGenerated":true}`;
 
     // Prefer Gemini when image is available, otherwise Claude Haiku
     let text = '';
@@ -2453,19 +2565,9 @@ Respond ONLY with raw JSON (no markdown):
         }
       }
       parts.push({ text: prompt });
-      const geminiRes = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
-      );
-      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      text = await callGemini(parts); // retry + text-only fallback on 503
     } else if (GEMINI_API_KEY) {
-      const geminiRes = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
-      );
-      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      text = await callGemini([{ text: prompt }]);
     } else {
       const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
         model: 'claude-haiku-4-5-20251001',
@@ -2505,12 +2607,7 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     const cr = await consumeAppraisal(req.userId);
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 30000,
-    });
-    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const text = await callGemini(parts); // retry on 503
     res.json({ text });
   } catch (e) {
     console.error('[AI/image]', e.response?.data || e.message);
@@ -2579,12 +2676,7 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
       }
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 30000,
-    });
-    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const text = await callGemini(parts); // retry + text-only fallback on 503
     res.json({ text });
   } catch (e) {
     console.error('[AI/text-image]', e.response?.data || e.message);
