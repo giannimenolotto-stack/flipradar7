@@ -11,23 +11,7 @@ const Stripe = require('stripe');
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const app = express();
-const ALLOWED_ORIGINS = [
-  'https://flipradar.pages.dev',
-  'https://flip-radar.app',
-  'https://www.flip-radar.app',
-  'http://localhost:3000',
-  'http://localhost:8080',
-];
-app.use(cors({
-  origin: function(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    if (/^https:\/\/[\w-]+\.flip-radar\.app$/.test(origin)) return cb(null, true);
-    if (/^https:\/\/[\w-]+\.flipradar\.pages\.dev$/.test(origin)) return cb(null, true);
-    cb(new Error('CORS: ' + origin + ' not allowed'));
-  },
-  credentials: true,
-}));
+app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // ── Upstash Redis ─────────────────────────────────────────
@@ -83,7 +67,6 @@ const K = {
   vpx:   (make, model, year) => `fr:vpx:${make}:${model}:${year}`,
   csales:(make, model, year) => `fr:csales:${make}:${model}:${year}`, // carsales market cache
   agrab: (make, model, year) => `fr:agrab:${make}:${model}:${year}`,  // autograb/redbook cache
-  bucket:(make, model, year, bkt) => `fr:bucket:${make}:${model}:${year}:${bkt}`, // mileage-bucket stats
 };
 
 // ── Auth ──────────────────────────────────────────────────
@@ -124,39 +107,9 @@ const SEEN_MAX_ENTRIES    = 5000;
 const CSALES_TTL_SECS     = 48 * 3600;            // 48 h carsales market cache
 const AGRAB_TTL_SECS      = 30 * 24 * 3600;       // 30 day autograb/redbook cache
 const CARSALES_BIAS       = 0.92;                  // asking-price → cleared-price correction (~8%)
-// ── Mileage bucket settings ───────────────────────────────
-const BUCKET_MIN_SAMPLES  = 3;                     // min samples in a bucket before it's served
-const BUCKET_TTL_SECS     = null;                  // permanent — same policy as VPX
-const MILEAGE_BUCKETS = [
-  { key: 'low',      min: 0,      max: 50000  },
-  { key: 'mid-low',  min: 50000,  max: 100000 },
-  { key: 'mid',      min: 100000, max: 150000 },
-  { key: 'mid-high', min: 150000, max: 200000 },
-  { key: 'high',     min: 200000, max: Infinity },
-];
-function getMileageBucket(km) {
-  if (!km || km <= 0) return null;
-  return MILEAGE_BUCKETS.find(b => km >= b.min && km < b.max)?.key || null;
-}
 const AUTOGRAB_API_KEY    = process.env.AUTOGRAB_API_KEY  || null;
 const AUTOGRAB_BASE_URL   = process.env.AUTOGRAB_BASE_URL || 'https://api.autograb.com.au/v1';
-const CARSALES_APIFY_ACTOR = process.env.CARSALES_APIFY_ACTOR || 'zuzka_k~carsales-scraper';
 
-// Top AU vehicle models to seed on first deploy (make, model, year range)
-const TOP_AU_SEED_MODELS = [
-  ...['2019','2020','2021','2022'].flatMap(y => [
-    {make:'Toyota',model:'Camry',year:parseInt(y)},
-    {make:'Toyota',model:'Hilux',year:parseInt(y)},
-    {make:'Toyota',model:'RAV4',year:parseInt(y)},
-    {make:'Toyota',model:'LandCruiser Prado',year:parseInt(y)},
-    {make:'Mazda',model:'CX-5',year:parseInt(y)},
-    {make:'Ford',model:'Ranger',year:parseInt(y)},
-    {make:'Hyundai',model:'Tucson',year:parseInt(y)},
-    {make:'Mitsubishi',model:'Triton',year:parseInt(y)},
-    {make:'Isuzu',model:'D-MAX',year:parseInt(y)},
-    {make:'Subaru',model:'Forester',year:parseInt(y)},
-  ]),
-];
 
 // ── Owner account — always premium, no payment required ──
 const OWNER_EMAIL = 'giannimenolotto@gmail.com';
@@ -450,11 +403,6 @@ async function storeVehiclePrice(listing) {
 
     await redisSet(key, existing, VPX_TTL_SECS);
     _vpxCache.delete(key); // invalidate hot-cache on write
-
-    // Phase A: feed mileage bucket accumulator passively — fire-and-forget
-    if (mileage && price) {
-      mergeBucketSample(makeKey, modelKey, year, price, mileage).catch(() => {});
-    }
   } catch (e) {
     console.error(`[VPX] storeVehiclePrice error ${make} ${model} ${year}:`, e.message);
   }
@@ -513,100 +461,6 @@ async function storeCarsalesCache(makeKey, modelKey, year, samples) {
     updatedAt: new Date().toISOString(),
   };
   await redisSet(K.csales(makeKey, modelKey, year), doc, CSALES_TTL_SECS);
-  // Phase A: also compute and store per-mileage-bucket stats from these samples
-  await storeBucketStats(makeKey, modelKey, year, samples).catch(e =>
-    console.error(`[Bucket] storeBucketStats error ${makeKey} ${modelKey} ${year}:`, e.message)
-  );
-}
-
-// ── Mileage bucket stats (Phase A) ───────────────────────
-// Derived view of VPX/Carsales samples bucketed by odometer range.
-// Gives fast lookup like "2020 Hilux at 80k km → mid-low bucket median $44,200"
-// without on-the-fly mileage math. Falls back to VPX adjusted median when bucket
-// is sparse (<3 samples). Written permanently — refreshed whenever seed re-runs.
-
-function computeMileageBuckets(samples) {
-  // samples: [{ price, mileage, normPrice, ... }]
-  const groups = {};
-  for (const bkt of MILEAGE_BUCKETS) groups[bkt.key] = [];
-  for (const s of samples) {
-    if (!s.mileage || !s.price || s.price <= 0) continue;
-    const bkt = getMileageBucket(s.mileage);
-    if (!bkt) continue;
-    groups[bkt].push(s.price); // raw listed price, not normPrice — bucket already segments by km
-  }
-  const result = {};
-  for (const bkt of MILEAGE_BUCKETS) {
-    const prices = groups[bkt.key].sort((a, b) => a - b);
-    if (prices.length < BUCKET_MIN_SAMPLES) continue; // skip sparse buckets
-    result[bkt.key] = {
-      count:  prices.length,
-      median: prices[Math.floor(prices.length / 2)],
-      p25:    prices[Math.floor(prices.length * 0.25)],
-      p75:    prices[Math.floor(prices.length * 0.75)],
-      low:    prices[0],
-      high:   prices[prices.length - 1],
-      kmMin:  bkt.min,
-      kmMax:  bkt.max === Infinity ? null : bkt.max,
-    };
-  }
-  return result; // { 'mid-low': { count, median, p25, p75, ... }, ... }
-}
-
-async function storeBucketStats(makeKey, modelKey, year, samples) {
-  const buckets = computeMileageBuckets(samples);
-  const keys = Object.keys(buckets);
-  if (!keys.length) return;
-  await Promise.all(keys.map(bkt =>
-    redisSet(K.bucket(makeKey, modelKey, year, bkt), {
-      ...buckets[bkt],
-      updatedAt: new Date().toISOString(),
-      source: 'seed',
-    }, BUCKET_TTL_SECS)
-  ));
-  console.log(`[Bucket] Stored ${keys.length} bucket(s) for ${makeKey} ${modelKey} ${year}: ${keys.join(', ')}`);
-}
-
-// Merge new samples into existing bucket stats without overwriting prior data.
-// Called by storeVehiclePrice when a cohort accumulates 10+ new FB samples.
-async function mergeBucketSample(makeKey, modelKey, year, price, mileage) {
-  if (!mileage || !price || price <= 0) return;
-  const bkt = getMileageBucket(mileage);
-  if (!bkt) return;
-  const key = K.bucket(makeKey, modelKey, year, bkt);
-  const existing = await redisGet(key);
-  // Build a lightweight running stats update — store last 100 raw prices per bucket
-  const prices = existing?._raw ? [...existing._raw, price] : [price];
-  const trimmed = prices.slice(-100).sort((a, b) => a - b);
-  if (trimmed.length < BUCKET_MIN_SAMPLES) {
-    // Not enough yet — store raw accumulator only, don't publish stats
-    await redisSet(key, { _raw: trimmed, updatedAt: new Date().toISOString() }, BUCKET_TTL_SECS);
-    return;
-  }
-  await redisSet(key, {
-    count:     trimmed.length,
-    median:    trimmed[Math.floor(trimmed.length / 2)],
-    p25:       trimmed[Math.floor(trimmed.length * 0.25)],
-    p75:       trimmed[Math.floor(trimmed.length * 0.75)],
-    low:       trimmed[0],
-    high:      trimmed[trimmed.length - 1],
-    kmMin:     MILEAGE_BUCKETS.find(b => b.key === bkt)?.min,
-    kmMax:     MILEAGE_BUCKETS.find(b => b.key === bkt)?.max === Infinity ? null : MILEAGE_BUCKETS.find(b => b.key === bkt)?.max,
-    _raw:      trimmed,
-    updatedAt: new Date().toISOString(),
-    source:    'passive',
-  }, BUCKET_TTL_SECS);
-}
-
-async function getBucketStats(makeKey, modelKey, year, mileage) {
-  if (!mileage || mileage <= 0) return null;
-  const bkt = getMileageBucket(mileage);
-  if (!bkt) return null;
-  const doc = await redisGet(K.bucket(makeKey, modelKey, year, bkt));
-  // Reject if unpublished accumulator (no median yet) or too sparse
-  if (!doc || doc._raw && !doc.median) return null;
-  if (doc.count < BUCKET_MIN_SAMPLES) return null;
-  return { ...doc, bucket: bkt, mileage };
 }
 
 // ── AutoGrab / RedBook cache ──────────────────────────────
@@ -640,74 +494,12 @@ async function fetchAutoGrabLive(make, model, year) {
   }
 }
 
-// ── Carsales Apify seeding — scrape active listings, write to VPX + cache ──
-async function scrapeCarsalesForModel(make, model, year) {
-  if (!APIFY_TOKEN) return 0;
-  const makeKey  = make.toLowerCase().trim();
-  const modelKey = model.toLowerCase().trim().replace(/\s+/g, '-');
-  try {
-    console.log(`[Carsales] Seeding ${make} ${model} ${year}...`);
-    const res = await axios.post(
-      `https://api.apify.com/v2/acts/${CARSALES_APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { make, model, yearFrom: year, yearTo: year, maxItems: 40 },
-      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
-    );
-    const items = Array.isArray(res.data) ? res.data.filter(i => i && !i.error) : [];
-    if (!items.length) { console.log(`[Carsales] No results for ${make} ${model} ${year}`); return 0; }
-
-    const samples = [];
-    for (const item of items) {
-      const price   = parsePrice(item.price || item.priceValue || 0);
-      const mileage = item.odometer || item.mileage || item.kilometres || null;
-      const state   = item.state || item.location?.state || extractState(item.location || '');
-      if (!price || price < 500 || isOfferPrice(price)) continue;
-      const normPrice = normalizePriceToRefKm(price, mileage, makeKey, modelKey);
-      samples.push({ id: item.id || item.listingId || String(Math.random()), price, mileage, normPrice, date: new Date().toISOString(), state, source: 'carsales' });
-      // Also write directly into VPX so these samples count toward confidence
-      await storeVehiclePrice({ id: item.id, make, model, year, price, mileage, location: item.location || state || '' }).catch(() => {});
-    }
-    await storeCarsalesCache(makeKey, modelKey, year, samples);
-    console.log(`[Carsales] ${make} ${model} ${year} — seeded ${samples.length} listings`);
-    return samples.length;
-  } catch (e) {
-    console.error(`[Carsales] Seed error ${make} ${model} ${year}:`, e.response?.status || e.message);
-    return 0;
-  }
-}
-
 // ── Tiered vehicle pricing orchestrator ──────────────────
 // Checks all cached sources in parallel, fetches live on cache miss.
 // Returns the highest-confidence priced source, or null if none available.
 async function fetchBestVehiclePrice(make, model, year, mileage) {
   const makeKey  = (make  || '').toLowerCase().trim();
   const modelKey = (model || '').toLowerCase().trim().replace(/\s+/g, '-');
-
-  // Phase B — Tier 0: mileage-bucket lookup (fastest, most literal — real prices at this km range)
-  // Only used when mileage is known and bucket has ≥3 real samples at that range.
-  if (mileage && mileage > 0) {
-    const bucketDoc = await getBucketStats(makeKey, modelKey, year, mileage);
-    if (bucketDoc && bucketDoc.count >= BUCKET_MIN_SAMPLES) {
-      const sampleLabel = `${bucketDoc.count} AU listing${bucketDoc.count !== 1 ? 's' : ''}`;
-      const kmLabel = bucketDoc.kmMax
-        ? `${(bucketDoc.kmMin/1000).toFixed(0)}–${(bucketDoc.kmMax/1000).toFixed(0)}k km`
-        : `${(bucketDoc.kmMin/1000).toFixed(0)}k+ km`;
-      const conf = Math.min(0.88, 0.50 + bucketDoc.count * 0.022);
-      console.log(`[Bucket] ${makeKey} ${modelKey} ${year} bucket:${bucketDoc.bucket} → median $${bucketDoc.median} (${sampleLabel})`);
-      return {
-        marketMedian:    Math.round(bucketDoc.median  * CARSALES_BIAS),
-        marketLow:       Math.round(bucketDoc.p25     * CARSALES_BIAS),
-        marketHigh:      Math.round(bucketDoc.p75     * CARSALES_BIAS),
-        samples:         bucketDoc.count,
-        mileageAdjusted: true,
-        source:          'bucket',
-        sourceLabel:     `AU market · ${sampleLabel} at ${kmLabel}`,
-        confidence:      conf,
-        make, model, year,
-        bucketKey:       bucketDoc.bucket,
-        updatedAt:       bucketDoc.updatedAt,
-      };
-    }
-  }
 
   // Tier 1–3: all cache reads in parallel (~50ms)
   const [vpxStats, csalesDoc, agrabDoc] = await Promise.all([
@@ -2304,14 +2096,17 @@ app.get('/prices/vehicle', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// ── Appraisal route — AI only (cache disabled until seed data is ready) ──
+// ── Appraisal route — cache-first, AI fallback ────────────
 // POST /appraise  { keyword, price, title, description, make?, model?, year?, mileage? }
-// Always routes to AI. Bucket/VPX system accumulates in background but is not served yet.
+// VPX checked first for vehicles; falls back to keyword history then eBay
 app.post('/appraise', authMiddleware, async (req, res) => {
   try {
-    const { keyword, price } = req.body;
+    const { keyword, price, title, description, make, model, year, mileage } = req.body;
     if (!keyword || !price) return res.status(400).json({ error: 'keyword and price required' });
 
+    const listingPrice = parsePrice(price);
+
+    // 1. Check appraisal limit (read-only — don't increment yet)
     const user = await _getUserCached(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     const today = new Date().toISOString().slice(0, 10);
@@ -2320,16 +2115,42 @@ app.post('/appraise', authMiddleware, async (req, res) => {
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
 
+    // 2a. Vehicle path — tiered pricing: VPX → Carsales → AutoGrab (most accurate for cars)
+    if (make && year) {
+      const resolvedModel = model || extractModel(make, title || '');
+      const priceSource = await fetchBestVehiclePrice(make, resolvedModel, year, mileage || null);
+      if (priceSource) {
+        const verdict = buildVehicleVerdict(listingPrice, priceSource);
+        user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+        await saveUser(user);
+        _invalidateUserCache(req.userId);
+        console.log(`[Appraise] ${make} ${resolvedModel} ${year} → ${priceSource.source} (${priceSource.sourceLabel}, conf ${Math.round((priceSource.confidence||0)*100)}%)`);
+        return res.json({ ...verdict, usedCache: true });
+      }
+    }
+
+    // 2b. Keyword price history / eBay fallback
+    const priceData = await getPriceCacheForKeyword(keyword);
+    if (priceData) {
+      const verdict = buildCacheVerdict(listingPrice, priceData);
+      user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+      await saveUser(user);
+      _invalidateUserCache(req.userId);
+      console.log(`[Appraise] "${keyword}" → served from ${verdict.source} cache (no AI used)`);
+      return res.json({ ...verdict, usedCache: true });
+    }
+
+    // 3. Not enough price data — caller (frontend) must use AI directly
     user.appraisalsToday = (user.appraisalsToday || 0) + 1;
     await saveUser(user);
     _invalidateUserCache(req.userId);
-    console.log(`[Appraise] "${keyword}" → AI`);
+    console.log(`[Appraise] "${keyword}" → no cache, AI required`);
     res.json({
-      found:     false,
-      usedCache: false,
-      message:   'Use AI appraisal',
-      used:      user.appraisalsToday,
-      limit:     limit === Infinity ? -1 : limit,
+      found:      false,
+      usedCache:  false,
+      message:    'No price data yet — use AI appraisal',
+      used:       user.appraisalsToday,
+      limit:      limit === Infinity ? -1 : limit,
     });
   } catch (e) { console.error('[Appraise]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
@@ -2558,28 +2379,6 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
 const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
 const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
-
-// POST /seed/vehicles — owner-only: triggers Carsales seeding for all TOP_AU_SEED_MODELS
-app.post('/seed/vehicles', authMiddleware, async (req, res) => {
-  try {
-    const user = await getUser(req.userId);
-    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
-    const total = TOP_AU_SEED_MODELS.length;
-    res.json({ ok: true, message: `Seeding ${total} vehicle cohorts in background` });
-    (async () => {
-      let seeded = 0;
-      for (const { make, model, year } of TOP_AU_SEED_MODELS) {
-        try {
-          const n = await scrapeCarsalesForModel(make, model, year);
-          if (n > 0) seeded++;
-          console.log(`[Seed/vehicles] ${make} ${model} ${year} → ${n} samples`);
-        } catch (e) { console.error(`[Seed/vehicles] ${make} ${model} ${year}:`, e.message); }
-        await sleep(2000);
-      }
-      console.log(`[Seed/vehicles] Done — ${seeded}/${total} cohorts seeded`);
-    })();
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
 
 // Redis key for push subscriptions
 const K_push = userId => `fr:push:${userId}`;
@@ -2859,38 +2658,4 @@ app.listen(PORT, async () => {
   console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
   await loadAllWatches();
   console.log('[Ready] Server fully loaded');
-
-  // ── Auto-seed vehicle market data on first boot ───────────
-  // Checks a permanent Redis flag before doing anything — safe to redeploy as many
-  // times as you like, the seed only ever runs once unless you delete fr:seed:done.
-  if (APIFY_TOKEN) {
-    (async () => {
-      try {
-        const already = await redisGet('fr:seed:done');
-        if (already) {
-          console.log(`[AutoSeed] Skipping — already seeded on ${already.seededAt}`);
-          return;
-        }
-        console.log(`[AutoSeed] First boot detected — seeding ${TOP_AU_SEED_MODELS.length} vehicle cohorts in background...`);
-        let seeded = 0, failed = 0;
-        for (const { make, model, year } of TOP_AU_SEED_MODELS) {
-          try {
-            const n = await scrapeCarsalesForModel(make, model, year);
-            if (n > 0) seeded++;
-            else failed++;
-          } catch (e) {
-            console.error(`[AutoSeed] ${make} ${model} ${year}:`, e.message);
-            failed++;
-          }
-          await sleep(2000); // stay polite to Apify + Carsales
-        }
-        await redisSet('fr:seed:done', { seededAt: new Date().toISOString(), seeded, failed });
-        console.log(`[AutoSeed] Done — ${seeded} cohorts seeded, ${failed} failed`);
-      } catch (e) {
-        console.error('[AutoSeed] Fatal error:', e.message);
-      }
-    })();
-  } else {
-    console.log('[AutoSeed] Skipping — no APIFY_TOKEN set');
-  }
 });
