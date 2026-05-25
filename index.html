@@ -852,6 +852,19 @@ var VD = {
   'PASS':     {e:'🚫',c:'#ff4f4f',bg:'#180a0a',bo:'rgba(255,79,79,0.2)',g:'rgba(255,79,79,0.1)'}
 };
 
+// Clamp appraisal results for offer/placeholder price listings.
+// ROI and profit figures are meaningless when the listed price is fake ($1, $1234, $9999, etc.).
+// Verdict forced to 'OFFER PRICE' so VD fallback yields neutral yellow styling.
+function normalizeOfferPriceResult(r) {
+  r.verdict             = 'OFFER PRICE';
+  r.dealScore           = Math.min(r.dealScore || 0, 35);
+  r.roiPercent          = 0;
+  r.estimatedProfit     = 0;
+  if (r.median) r.recommendedOffer = Math.round(r.median * 0.85); // market-based, not placeholder
+  r.isOfferPriceListing = true;
+  return r;
+}
+
 // ── Sell Scanner ──────────────────────────────────────────
 var _sellPhotoBase64 = null;
 var _sellPrices = [];
@@ -1769,6 +1782,7 @@ function parseAPIResponse(res) {
 // ── Render results ───────────────────────────────────────
 function render(r) {
   var v = VD[r.verdict] || VD['FAIR'];
+  if (r.isOfferPriceListing) v = VD['FAIR']; // never green/rainbow for placeholder prices
   var el = document.getElementById('vc');
   el.style.cssText = '--vc:' + v.c + ';--vg:' + v.g + ';background:' + v.bg + ';border:1px solid ' + v.bo;
   document.getElementById('rE').textContent = v.e;
@@ -3504,6 +3518,7 @@ function autoAppraise(items) {
           ratings = ratings.map(function(r) {
             var listing = batch[r.idx];
             if (!listing || !listing.price || r.relevant === false) return r;
+            if (listing.isOfferPrice) return r; // placeholder — never compute ROI from fake price
             var median = priceData.median;
             var roi = Math.round(((median - listing.price) / listing.price) * 100);
             var rating, reason;
@@ -3899,6 +3914,7 @@ function appraiseListing(listing) {
           whatToCheckInPerson: [],
           whyItsWorth:         ''
         }, r);
+        if (listing.isOfferPrice) normalizeOfferPriceResult(r);
         var entry = { id: Date.now(), title: r.extractedTitle, price: r.extractedPrice || listing.price, image: listing.image || null, url: listing.url || null, result: r, date: new Date().toLocaleDateString('en-AU') };
         hist.unshift(entry); sv(); updatePill();
         setTimeout(function() { showResult(r); }, 400);
@@ -3915,6 +3931,7 @@ function appraiseListing(listing) {
     callAI_text(txt, keyword).then(function(r) {
       clearInterval(stepTimer);
       for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
+      if (listing.isOfferPrice) normalizeOfferPriceResult(r);
       var entry = { id: Date.now(), title: r.extractedTitle || listing.title, price: r.extractedPrice || listing.price, image: listing.image || null, url: listing.url || null, result: r, date: new Date().toLocaleDateString('en-AU') };
       hist.unshift(entry); sv(); updatePill();
       setTimeout(function() { showResult(r); }, 400);
