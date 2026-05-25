@@ -1783,6 +1783,15 @@ function parseAPIResponse(res) {
 function render(r) {
   var v = VD[r.verdict] || VD['FAIR'];
   if (r.isOfferPriceListing) v = VD['FAIR']; // never green/rainbow for placeholder prices
+  // Confidence-based border cap: don't show rainbow/green when data quality is too weak
+  var hasMarketAnchor = r.confidence != null && r.confidence > 0;
+  if (r.aiGenerated && !hasMarketAnchor) {
+    // Pure AI guess with no market data anchor — cap positive verdicts to neutral yellow
+    if (r.verdict === 'STEAL' || r.verdict === 'GOOD DEAL') v = VD['FAIR'];
+  } else if (r.confidence != null && r.confidence < 0.45 && r.verdict === 'STEAL') {
+    // Explicit low confidence — downgrade STEAL one level
+    v = VD['GOOD DEAL'];
+  }
   var el = document.getElementById('vc');
   el.style.cssText = '--vc:' + v.c + ';--vg:' + v.g + ';background:' + v.bg + ';border:1px solid ' + v.bo;
   document.getElementById('rE').textContent = v.e;

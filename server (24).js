@@ -63,6 +63,7 @@ const K = {
   ebay:        kw  => `fr:ebay:${kw.toLowerCase().trim()}`,
   prices:      kw  => `fr:prices:${kw.toLowerCase().trim()}`,
   sharedScan:  kw  => `fr:scan:${kw.toLowerCase().trim()}`,  // shared scan cache across all users
+  enrich:      id  => `fr:enrich:${id}`,                     // slim enrichment data per listing (7-day TTL)
   blocked:     uid => `fr:blocked:${uid}`,
   vpx:   (make, model, year) => `fr:vpx:${make}:${model}:${year}`,
   csales:(make, model, year) => `fr:csales:${make}:${model}:${year}`, // carsales market cache
@@ -899,7 +900,8 @@ const APIFY_ACTOR_DETAIL = 'data-slayer~facebook-marketplace-details';  // expen
 // Prevents data-slayer from re-enriching the same listing on every 30-min scan cycle.
 // Key = listingId, value = { ts }. TTL matches the shared scan cache (30 min).
 const _enrichCache = new Map();
-const ENRICH_CACHE_TTL_MS = 30 * 60 * 1000;
+const ENRICH_CACHE_TTL_MS  = 6 * 60 * 60 * 1000;  // 6 hours — mileage/year/transmission don't change
+const ENRICH_REDIS_TTL_SEC = 7 * 24 * 3600;        // 7 days — persists across restarts
 
 // Types that look like vehicles in keywords/titles but don't need odometer enrichment
 const NON_VEHICLE_TYPES = ['scooter','e-bike','ebike','electric bike','electric scooter',
@@ -946,23 +948,40 @@ async function scrapeKeyword(keyword, opts = {}) {
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
 
     // ── Vehicle keywords: enrich with data-slayer ─────────
-    // Per-listing check: only call data-slayer when year/odometer/transmission are missing.
-    // Skip listings recently enriched (in-memory cache) and non-vehicle types (scooters, etc.).
+    // Step 1: restore Redis-cached enrichment data (survives restarts, 7-day TTL).
+    // Step 2: only call data-slayer for listings still missing metadata after cache restore.
+    // Step 3: store fresh data-slayer results to Redis for future scans.
     if (vehicleMode && items.length > 0) {
+      // Restore Redis-cached enrichment in parallel for all listings
+      const redisEnriched = await Promise.all(
+        items.map(item => {
+          const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
+          return id ? redisGet(K.enrich(id)).catch(() => null) : Promise.resolve(null);
+        })
+      );
+      items = items.map((item, i) => redisEnriched[i] ? { ...item, ...redisEnriched[i] } : item);
+
+      // Only escalate to data-slayer when metadata is still genuinely missing
       const toEnrich = items.filter(item => {
         const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
         if (!listingId) return false;
-        const cached = _enrichCache.get(listingId);
-        if (cached && (Date.now() - cached.ts) < ENRICH_CACHE_TTL_MS) return false;
+        const inMem = _enrichCache.get(listingId);
+        if (inMem && (Date.now() - inMem.ts) < ENRICH_CACHE_TTL_MS) return false;
         if (!shouldEnrich(item)) return false;
-        const hasOdo   = !!(item.vehicle_odometer_data || item.odometer || item.mileage);
-        const hasYear  = !!(item.vehicle_info?.year || item.listing_vehicle_data?.year || item.vehicleInfo?.year || item.year);
-        const hasTrans = !!(item.vehicle_transmission_type || item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission);
+        // Use extraction functions so subtitle chips and regex count before deciding to enrich
+        const rawTitle    = item.marketplace_listing_title || item.custom_title || item.title || '';
+        const description = item.redacted_description?.text || item.description || null;
+        const hasOdo   = !!(extractMileageFromVehicleInfo(item) || extractMileage(rawTitle, description));
+        const hasYear  = !!(item.vehicle_info?.year || item.listing_vehicle_data?.year ||
+                            item.vehicleInfo?.year  || item.year || extractYear(rawTitle, description));
+        const hasTrans = !!(item.vehicle_transmission_type ||
+                            item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission ||
+                            extractTransmission(rawTitle, description));
         return !hasOdo || !hasYear || !hasTrans;
       });
 
       if (toEnrich.length > 0) {
-        console.log(`[Apify] "${keyword}" — enriching ${toEnrich.length}/${items.length} listing(s) via data-slayer`);
+        console.log(`[Apify] "${keyword}" — enriching ${toEnrich.length}/${items.length} via data-slayer (${items.length - toEnrich.length} already complete)`);
         try {
           const batchSize = 5;
           const detailMap = {};
@@ -981,6 +1000,19 @@ async function scrapeKeyword(keyword, opts = {}) {
                 if (rows[0]) {
                   detailMap[listingId] = rows[0];
                   _enrichCache.set(listingId, { ts: Date.now() });
+                  // Persist slim enrichment fields to Redis — survives restarts for 7 days
+                  const slim = {
+                    vehicle_odometer_data:   rows[0].vehicle_odometer_data   || null,
+                    vehicle_transmission_type: rows[0].vehicle_transmission_type || null,
+                    vehicle_info:            rows[0].vehicle_info || rows[0].vehicleInfo || rows[0].listing_vehicle_data || null,
+                    custom_sub_titles:       rows[0].custom_sub_titles || null,
+                    odometer:  rows[0].odometer  || null,
+                    mileage:   rows[0].mileage   || null,
+                    year:      rows[0].year      || null,
+                    make:      rows[0].make      || null,
+                    model:     rows[0].model     || null,
+                  };
+                  redisSet(K.enrich(listingId), slim, ENRICH_REDIS_TTL_SEC).catch(() => {});
                 }
               } catch (e) {
                 console.error(`[DataSlayer] Failed for listingId ${listingId}:`, e.message);
