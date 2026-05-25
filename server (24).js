@@ -100,6 +100,8 @@ const VPX_REF_KM          = 100000;               // mileage reference for price
 const VPX_MIN_SAMPLES     = 5;                    // samples needed to use VPX instead of AI
 const VPX_SAMPLE_CAP      = 150;                  // max samples stored per vehicle cohort
 const VPX_TTL_SECS        = 14 * 24 * 3600;      // 14 days TTL on vehicle price index keys
+const SEEN_TTL_MS         = 48 * 60 * 60 * 1000; // listings stay "seen" for 48 hours
+const SEEN_MAX_ENTRIES    = 5000;                  // per-user cap — 5k handles 20 keywords comfortably
 
 // ── Owner account — always premium, no payment required ──
 const OWNER_EMAIL = 'giannimenolotto@gmail.com';
@@ -203,13 +205,23 @@ async function getUserSeen(userId) {
   const s = await redisGet(K.seen(userId));
   return (s && typeof s === 'object' && !Array.isArray(s)) ? s : {};
 }
-async function saveUserSeen(userId, seen) {
+// merge=true (default): re-reads current Redis state and merges before writing.
+// This prevents concurrent keyword-scan calls from overwriting each other's entries —
+// each setInterval fires independently, so two keywords for the same user can race.
+// merge=false: replace entirely (used when clearing seen entries for a keyword).
+async function saveUserSeen(userId, seen, { merge = true } = {}) {
   const cutoff = Date.now() - SEEN_TTL_MS;
+  let base = seen;
+  if (merge) {
+    const current = await getUserSeen(userId);
+    // Local entries win — they carry the freshest timestamps
+    base = { ...current, ...seen };
+  }
   const pruned = Object.fromEntries(
-    Object.entries(seen)
+    Object.entries(base)
       .filter(([, ts]) => ts > cutoff)
-      .sort(([,a],[,b]) => b - a)
-      .slice(0, 2000)
+      .sort(([, a], [, b]) => b - a)
+      .slice(0, SEEN_MAX_ENTRIES)
   );
   await redisSet(K.seen(userId), pruned);
 }
@@ -636,7 +648,6 @@ const PLAN_INTERVALS = {
   basic:   30 * 60 * 1000,
   premium: 15 * 60 * 1000,
 };
-const SEEN_TTL_MS = 48 * 60 * 60 * 1000;
 
 // ── In-memory state ───────────────────────────────────────
 let watchlist     = [];
@@ -1742,7 +1753,7 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
       const prefix = `${item.keyword}:`;
       if (!Object.keys(seen).some(k => k.startsWith(prefix))) return;
       const pruned = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
-      return saveUserSeen(req.userId, pruned);
+      return saveUserSeen(req.userId, pruned, { merge: false }); // replace — we're removing entries
     }).catch(() => {});
     // Initial backfill — runs once when watch is added
     // DO NOT also call /scan/now — that causes a double scan
@@ -1791,7 +1802,7 @@ app.delete('/watchlist/:id', authMiddleware, async (req, res) => {
     const seen = await getUserSeen(req.userId);
     const prefix = `${keyword}:`;
     const prunedSeen = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
-    await saveUserSeen(req.userId, prunedSeen);
+    await saveUserSeen(req.userId, prunedSeen, { merge: false }); // replace — we're removing entries
     const clearedSeen = Object.keys(seen).length - Object.keys(prunedSeen).length;
     console.log(`[Watch] Deleted "${keyword}" — cleared ${blocked.length - remaining.length} blocked, ${clearedSeen} seen entries`);
 
@@ -1822,7 +1833,7 @@ app.get('/listings', authMiddleware, async (req, res) => {
 app.delete('/listings', authMiddleware, async (req, res) => {
   try {
     await saveUserListings(req.userId, []);
-    await saveUserSeen(req.userId, {});
+    await saveUserSeen(req.userId, {}, { merge: false }); // full reset — replace, don't merge
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
