@@ -31,11 +31,12 @@ async function redisGet(key) {
   } catch (e) { console.error('[Redis] GET error:', e.message); return null; }
 }
 
-async function redisSet(key, value) {
+async function redisSet(key, value, ttlSeconds = null) {
   if (!REDIS_URL) return;
   try {
+    const qs = ttlSeconds ? `?ex=${ttlSeconds}` : '';
     await axios.post(
-      `${REDIS_URL}/set/${encodeURIComponent(key)}`,
+      `${REDIS_URL}/set/${encodeURIComponent(key)}${qs}`,
       JSON.stringify(value),
       { headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' } }
     );
@@ -63,6 +64,7 @@ const K = {
   prices:      kw  => `fr:prices:${kw.toLowerCase().trim()}`,
   sharedScan:  kw  => `fr:scan:${kw.toLowerCase().trim()}`,  // shared scan cache across all users
   blocked:     uid => `fr:blocked:${uid}`,                     // listings blocked by filter — user can review
+  vpx: (make, model, year) => `fr:vpx:${make}:${model}:${year}`, // vehicle price index
 };
 
 // ── Auth ──────────────────────────────────────────────────
@@ -94,6 +96,10 @@ const BCRYPT_ROUNDS = 10;
 const EBAY_CACHE_TTL_MS   = 24 * 60 * 60 * 1000; // 24 hours — 1 eBay call per keyword per day max
 const EBAY_MIN_RESULTS    = 5;                     // need at least 5 sold prices to skip AI
 const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
+const VPX_REF_KM          = 100000;               // mileage reference for price normalization
+const VPX_MIN_SAMPLES     = 5;                    // samples needed to use VPX instead of AI
+const VPX_SAMPLE_CAP      = 150;                  // max samples stored per vehicle cohort
+const VPX_TTL_SECS        = 14 * 24 * 3600;      // 14 days TTL on vehicle price index keys
 
 // ── Owner account — always premium, no payment required ──
 const OWNER_EMAIL = 'giannimenolotto@gmail.com';
@@ -297,18 +303,16 @@ async function storeScanPrice(keyword, listing) {
   if (!listing.price || listing.price <= 0) return;
   try {
     const existing = await redisGet(K.prices(keyword)) || [];
-    // Don't duplicate — check if this listing ID already stored
-    if (existing.find(r => r.id === listing.id)) return;
-    existing.unshift({
-      id:    listing.id,
-      price: listing.price,
-      title: listing.title,
-      date:  new Date().toISOString(),
-    });
-    // Keep last 200 per keyword
-    await redisSet(K.prices(keyword), existing.slice(0, 200));
+    if (!existing.find(r => r.id === listing.id)) {
+      existing.unshift({ id: listing.id, price: listing.price, title: listing.title, date: new Date().toISOString() });
+      await redisSet(K.prices(keyword), existing.slice(0, 200));
+    }
   } catch (e) {
     console.error(`[PriceStore] Error for "${keyword}":`, e.message);
+  }
+  // Also feed the vehicle price index when structured vehicle data is present
+  if (listing.make && listing.year) {
+    storeVehiclePrice(listing).catch(e => console.error('[VPX] passive write error:', e.message));
   }
 }
 
@@ -325,6 +329,96 @@ async function getOwnPriceRange(keyword) {
     count:  prices.length,
     source: 'own_history',
   };
+}
+
+// ── Vehicle Price Index (VPX) ─────────────────────────────
+// fr:vpx:<make>:<model>:<year> — mileage-normalised price samples per vehicle cohort.
+// Populated passively from every FB listing; seeded by Carsales scrapes.
+const _vpxCache = new Map();
+const VPX_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min hot-cache — avoids Redis on every appraisal
+
+async function storeVehiclePrice(listing) {
+  let { make, model, year, mileage, price, id, location } = listing;
+  if (!make || !year || !price || price <= 0) return;
+  if (isOfferPrice(price)) return;
+
+  // Fall back to extractModel if Apify didn't provide model
+  if (!model) model = extractModel(make, listing.title || '');
+  if (!model) return; // without model we can't build a meaningful cohort key
+
+  const makeKey  = make.toLowerCase().trim();
+  const modelKey = model.toLowerCase().trim().replace(/\s+/g, '-');
+  const key      = K.vpx(makeKey, modelKey, year);
+
+  try {
+    const existing = await redisGet(key) || { samples: [] };
+    if (existing.samples.find(s => s.id === id)) return; // already stored
+
+    const normPrice = normalizePriceToRefKm(price, mileage, makeKey, modelKey);
+    existing.samples.unshift({
+      id,
+      price,
+      mileage:    mileage || null,
+      normPrice,
+      date:       new Date().toISOString(),
+      state:      extractState(location),
+      source:     'fb',
+    });
+    existing.samples = existing.samples.slice(0, VPX_SAMPLE_CAP);
+
+    // Recompute stats from normalised prices
+    const norm = existing.samples.map(s => s.normPrice).filter(p => p && p > 0).sort((a, b) => a - b);
+    if (norm.length >= 3) {
+      existing.stats = {
+        count:          norm.length,
+        medianAt100k:   norm[Math.floor(norm.length / 2)],
+        p25At100k:      norm[Math.floor(norm.length * 0.25)],
+        p75At100k:      norm[Math.floor(norm.length * 0.75)],
+        lowAt100k:      norm[0],
+        highAt100k:     norm[norm.length - 1],
+        updatedAt:      new Date().toISOString(),
+      };
+    }
+
+    await redisSet(key, existing, VPX_TTL_SECS);
+    _vpxCache.delete(key); // invalidate hot-cache on write
+  } catch (e) {
+    console.error(`[VPX] storeVehiclePrice error ${make} ${model} ${year}:`, e.message);
+  }
+}
+
+async function getVehiclePriceStats(make, model, year, mileage) {
+  if (!make || !model || !year) return null;
+  const makeKey  = make.toLowerCase().trim();
+  const modelKey = model.toLowerCase().trim().replace(/\s+/g, '-');
+  const key      = K.vpx(makeKey, modelKey, year);
+
+  // Hot-cache first
+  const hit = _vpxCache.get(key);
+  if (hit && (Date.now() - hit.ts) < VPX_CACHE_TTL_MS) return hit.data;
+
+  const doc = await redisGet(key);
+  if (!doc || !doc.stats || doc.stats.count < VPX_MIN_SAMPLES) return null;
+
+  const { medianAt100k, p25At100k, p75At100k, lowAt100k, highAt100k, count } = doc.stats;
+
+  // Adjust reference prices to the listing's actual mileage for display
+  const result = {
+    make, model, year,
+    samples:                count,
+    medianAt100k,
+    p25At100k,
+    p75At100k,
+    marketMedian:           mileage ? adjustMarketPriceToMileage(medianAt100k, mileage, makeKey, modelKey) : medianAt100k,
+    marketLow:              mileage ? adjustMarketPriceToMileage(p25At100k,    mileage, makeKey, modelKey) : p25At100k,
+    marketHigh:             mileage ? adjustMarketPriceToMileage(p75At100k,    mileage, makeKey, modelKey) : p75At100k,
+    mileageAdjusted:        !!(mileage),
+    updatedAt:              doc.stats.updatedAt,
+    source:                 'vpx',
+  };
+
+  _vpxCache.set(key, { data: result, ts: Date.now() });
+  return result;
 }
 
 // ── Master price lookup — call this before AI ─────────────
@@ -393,6 +487,55 @@ function buildCacheVerdict(listingPrice, priceData) {
     source,
     low, median, high,
     negotiationScript:   `This is going for around $${median} sold on eBay AU — would you take $${Math.round(listingPrice * 0.85)}?`,
+  };
+}
+
+// Mileage-aware verdict using the Vehicle Price Index.
+// vpxStats is the result of getVehiclePriceStats(); contains mileage-adjusted market prices.
+function buildVehicleVerdict(listingPrice, vpxStats) {
+  const { marketMedian, marketLow, marketHigh, samples, make, model, year, mileageAdjusted } = vpxStats;
+
+  const roi            = marketMedian > 0 ? Math.round(((marketMedian - listingPrice) / listingPrice) * 100) : 0;
+  const estimatedProfit = Math.max(0, Math.round(marketMedian - listingPrice));
+
+  let verdict, oneLiner, dealScore;
+  if (roi >= 50) {
+    verdict = 'STEAL'; dealScore = 95;
+    oneLiner = `Listed ${roi}% below AU market median — exceptional flip potential`;
+  } else if (roi >= 30) {
+    verdict = 'GOOD DEAL'; dealScore = 82;
+    oneLiner = `Listed ${roi}% below market — strong flip potential`;
+  } else if (roi >= 15) {
+    verdict = 'GOOD DEAL'; dealScore = 68;
+    oneLiner = `Priced below market — solid room to profit`;
+  } else if (roi >= 0) {
+    verdict = 'FAIR'; dealScore = 45;
+    oneLiner = `Around market rate — slim margin`;
+  } else {
+    verdict = 'PASS'; dealScore = 18;
+    oneLiner = `Listed ${Math.abs(roi)}% above market — negotiate hard or pass`;
+  }
+
+  const mileageNote = mileageAdjusted ? ' (mileage-adjusted)' : '';
+  const carLabel    = [year, make, model].filter(Boolean).join(' ');
+
+  return {
+    verdict,
+    dealScore,
+    oneLiner,
+    estimatedResellLow:  marketLow,
+    estimatedResellHigh: marketHigh,
+    recommendedOffer:    Math.round(listingPrice * 0.88),
+    walkAwayPrice:       Math.round(marketMedian * 1.05),
+    estimatedProfit,
+    roiPercent:          roi,
+    dataPoints:          samples,
+    source:              'vpx',
+    low:    marketLow,
+    median: marketMedian,
+    high:   marketHigh,
+    negotiationScript: `Similar ${carLabel}s sell for around $${marketMedian.toLocaleString()}${mileageNote} in AU — would you take $${Math.round(listingPrice * 0.88).toLocaleString()}?`,
+    vpxData: vpxStats,
   };
 }
 
@@ -911,6 +1054,104 @@ function normalizeVehicleTitle(rawTitle, year, make) {
   if (year && !title.includes(String(year))) prefix += year + ' ';
   if (make && !lo.includes(make.toLowerCase())) prefix += make + ' ';
   return prefix ? (prefix + title) : title;
+}
+
+// ── AU vehicle depreciation rates ────────────────────────
+// annualRate: fraction lost per year, perKm: $/km additional depreciation vs VPX_REF_KM
+const DEP_TABLE = {
+  toyota:      { annualRate: 0.12, perKm: 0.06 },
+  mazda:       { annualRate: 0.12, perKm: 0.06 },
+  honda:       { annualRate: 0.12, perKm: 0.06 },
+  subaru:      { annualRate: 0.14, perKm: 0.07 },
+  mitsubishi:  { annualRate: 0.14, perKm: 0.07 },
+  hyundai:     { annualRate: 0.16, perKm: 0.08 },
+  kia:         { annualRate: 0.16, perKm: 0.08 },
+  nissan:      { annualRate: 0.16, perKm: 0.08 },
+  volkswagen:  { annualRate: 0.16, perKm: 0.08 },
+  bmw:         { annualRate: 0.20, perKm: 0.12 },
+  mercedes:    { annualRate: 0.20, perKm: 0.12 },
+  'mercedes-benz': { annualRate: 0.20, perKm: 0.12 },
+  audi:        { annualRate: 0.20, perKm: 0.12 },
+  ford:        { annualRate: 0.18, perKm: 0.09 },
+  holden:      { annualRate: 0.18, perKm: 0.09 },
+  jeep:        { annualRate: 0.20, perKm: 0.10 },
+  landrover:   { annualRate: 0.22, perKm: 0.15 },
+  'land rover':{ annualRate: 0.22, perKm: 0.15 },
+  lexus:       { annualRate: 0.14, perKm: 0.07 },
+  volvo:       { annualRate: 0.18, perKm: 0.09 },
+  _default:    { annualRate: 0.16, perKm: 0.08 },
+};
+// Diesel 4WDs hold value significantly better than their make average
+const DIESEL_4WD_MODELS = ['hilux','triton','ranger','bt-50','bt50','colorado','patrol',
+  'landcruiser','land cruiser','pajero','prado','fortuner','d-max','dmax','mux','mu-x'];
+function getDepRates(make, model) {
+  const m = (model || '').toLowerCase();
+  if (DIESEL_4WD_MODELS.some(d => m.includes(d))) return { annualRate: 0.10, perKm: 0.05 };
+  return DEP_TABLE[(make || '').toLowerCase()] || DEP_TABLE._default;
+}
+
+function extractState(location) {
+  if (!location) return null;
+  const loc = location.toUpperCase();
+  if (/\bVIC\b|VICTORIA|MELBOURNE/.test(loc))  return 'VIC';
+  if (/\bNSW\b|NEW SOUTH WALES|SYDNEY/.test(loc)) return 'NSW';
+  if (/\bQLD\b|QUEENSLAND|BRISBANE|GOLD COAST/.test(loc)) return 'QLD';
+  if (/\bWA\b|WESTERN AUSTRALIA|PERTH/.test(loc))  return 'WA';
+  if (/\bSA\b|SOUTH AUSTRALIA|ADELAIDE/.test(loc)) return 'SA';
+  if (/\bTAS\b|TASMANIA|HOBART/.test(loc))  return 'TAS';
+  if (/\bACT\b|CANBERRA/.test(loc))         return 'ACT';
+  if (/\bNT\b|NORTHERN TERRITORY|DARWIN/.test(loc)) return 'NT';
+  return null;
+}
+
+// Fallback model extraction when Apify's structured fields are missing
+function extractModel(make, title) {
+  const MODELS = {
+    toyota:     ['camry','corolla','hilux','rav4','landcruiser','land cruiser','prado','kluger',
+                 'yaris','prius','c-hr','chr','86','gr86','supra','aurion','fortuner','hiace','tarago'],
+    ford:       ['ranger','escape','puma','focus','fiesta','mustang','f-150','transit','everest','mondeo','endura'],
+    holden:     ['commodore','colorado','trax','trailblazer','astra','barina','cruze','captiva','spark'],
+    honda:      ['civic','accord','cr-v','crv','hr-v','hrv','jazz','odyssey','integra','type r'],
+    nissan:     ['navara','patrol','x-trail','xtrail','pathfinder','qashqai','leaf','370z','350z','gt-r','gtr','micra','pulsar'],
+    mitsubishi: ['triton','pajero','outlander','asx','eclipse cross','lancer','galant','colt','mirage'],
+    mazda:      ['cx-5','cx5','cx-3','cx3','cx-30','cx30','cx-9','cx9','mazda3','mazda6','bt-50','bt50','mx-5','mx5','mazda2'],
+    subaru:     ['outback','forester','impreza','wrx','sti','xv','crosstrek','brz','ascent','legacy','liberty'],
+    hyundai:    ['tucson','santa fe','kona','i30','i20','i10','i40','sonata','elantra','veloster','staria','ioniq5','ioniq6','ioniq'],
+    kia:        ['sportage','sorento','cerato','stinger','carnival','niro','seltos','ev6','picanto','rio'],
+    volkswagen: ['golf','polo','passat','tiguan','touareg','amarok','caddy','transporter','t-roc','id4','arteon'],
+    bmw:        ['3 series','5 series','7 series','x3','x5','x1','x7','m3','m5','m4','4 series','1 series','2 series','x6','i4'],
+    mercedes:   ['c-class','e-class','s-class','a-class','b-class','glc','gle','gla','glb','gls','cla','cls'],
+    audi:       ['a3','a4','a5','a6','a7','a8','q3','q5','q7','rs3','rs4','rs6','s3','s4','s5','tt'],
+    isuzu:      ['d-max','dmax','mu-x','mux'],
+    ldv:        ['t60','d90','g10'],
+    gwm:        ['ute','haval h6','haval','jolion'],
+    mg:         ['hs','zs'],
+    lexus:      ['is','es','rx','nx','ux','lx','gx','lc'],
+    jeep:       ['wrangler','cherokee','grand cherokee','compass','renegade','gladiator'],
+    'land rover': ['defender','discovery','range rover','sport','freelander','evoque','velar'],
+    subaru:     ['outback','forester','impreza','wrx','sti','xv','brz'],
+  };
+  const t = (title || '').toLowerCase();
+  const models = MODELS[(make || '').toLowerCase()] || [];
+  for (const model of models) {
+    if (t.includes(model)) return model;
+  }
+  return null;
+}
+
+// Normalize listed price to VPX_REF_KM equivalent for apples-to-apples comparison.
+// Higher-km car listed at $10k → would have been $13k at 100k km → normPrice = $13k.
+function normalizePriceToRefKm(price, mileage, make, model) {
+  if (!price || price <= 0 || !mileage || mileage <= 0) return price;
+  const { perKm } = getDepRates(make, model);
+  return Math.round(price + (mileage - VPX_REF_KM) * perKm);
+}
+
+// Reverse: given median at VPX_REF_KM, what is market value at targetMileage?
+function adjustMarketPriceToMileage(refMedian, targetMileage, make, model) {
+  if (!refMedian || !targetMileage || targetMileage <= 0) return refMedian;
+  const { perKm } = getDepRates(make, model);
+  return Math.round(refMedian - (targetMileage - VPX_REF_KM) * perKm);
 }
 
 function parsePrice(raw) {
@@ -1630,12 +1871,25 @@ app.get('/prices', authMiddleware, async (req, res) => {
   } catch (e) { console.error('[Prices] Error:', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
+// GET /prices/vehicle?make=Toyota&model=Camry&year=2019&mileage=72000
+// Returns VPX market stats for a specific vehicle cohort
+app.get('/prices/vehicle', authMiddleware, async (req, res) => {
+  try {
+    const { make, model, year, mileage } = req.query;
+    if (!make || !year) return res.status(400).json({ error: 'make and year required' });
+    const resolvedModel = model || null;
+    const stats = await getVehiclePriceStats(make, resolvedModel, parseInt(year), mileage ? parseInt(mileage) : null);
+    if (!stats) return res.json({ found: false, make, model, year });
+    res.json({ found: true, ...stats });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
 // ── Appraisal route — cache-first, AI fallback ────────────
-// POST /appraise  { keyword, price, title, description }
-// Returns verdict without using AI if we have enough price data
+// POST /appraise  { keyword, price, title, description, make?, model?, year?, mileage? }
+// VPX checked first for vehicles; falls back to keyword history then eBay
 app.post('/appraise', authMiddleware, async (req, res) => {
   try {
-    const { keyword, price, title, description } = req.body;
+    const { keyword, price, title, description, make, model, year, mileage } = req.body;
     if (!keyword || !price) return res.status(400).json({ error: 'keyword and price required' });
 
     const listingPrice = parsePrice(price);
@@ -1649,7 +1903,21 @@ app.post('/appraise', authMiddleware, async (req, res) => {
     if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
       return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
 
-    // 2. Try price cache first — free, no AI needed
+    // 2a. VPX — vehicle-specific, mileage-adjusted pricing (most accurate for cars)
+    if (make && year) {
+      const resolvedModel = model || extractModel(make, title || '');
+      const vpxStats = await getVehiclePriceStats(make, resolvedModel, year, mileage || null);
+      if (vpxStats) {
+        const verdict = buildVehicleVerdict(listingPrice, vpxStats);
+        user.appraisalsToday = (user.appraisalsToday || 0) + 1;
+        await saveUser(user);
+        _invalidateUserCache(req.userId);
+        console.log(`[Appraise] ${make} ${resolvedModel} ${year} → VPX (${vpxStats.samples} samples, market median $${vpxStats.marketMedian})`);
+        return res.json({ ...verdict, usedCache: true });
+      }
+    }
+
+    // 2b. Keyword price history / eBay fallback
     const priceData = await getPriceCacheForKeyword(keyword);
     if (priceData) {
       const verdict = buildCacheVerdict(listingPrice, priceData);
@@ -1902,6 +2170,137 @@ const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-ra
 
 // Redis key for push subscriptions
 const K_push = userId => `fr:push:${userId}`;
+
+// POST /ai/vehicle — vehicle-specific appraisal with market context injection
+// Body: { make, model, year, mileage, listingPrice, title, description, imageUrl?, imageBase64?, imageMime? }
+// Fetches VPX stats, builds a structured market-context prompt, calls Gemini Flash.
+// AI role is condition/risk assessor, not price guesser — reduces hallucination.
+app.post('/ai/vehicle', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
+
+    const { make, model, year, mileage, listingPrice, title, description, imageUrl, imageBase64, imageMime } = req.body;
+    if (!listingPrice) return res.status(400).json({ error: 'listingPrice required' });
+
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    // Build market context block from VPX
+    let marketContext = '';
+    let vpxStats = null;
+    if (make && year) {
+      const resolvedModel = model || extractModel(make, title || '');
+      vpxStats = await getVehiclePriceStats(make, resolvedModel, year, mileage || null);
+    }
+    if (vpxStats) {
+      const adj        = vpxStats.mileageAdjusted ? ` (adjusted for ${(mileage || 0).toLocaleString()}km)` : '';
+      const pricedAt   = Number(listingPrice);
+      const discountPct = vpxStats.marketMedian > 0
+        ? Math.round(((vpxStats.marketMedian - pricedAt) / pricedAt) * 100) : 0;
+      marketContext = `\n\nMARKET DATA (${vpxStats.samples} AU samples${adj}):
+- Market median: $${vpxStats.marketMedian.toLocaleString()}
+- Typical range: $${vpxStats.marketLow.toLocaleString()} – $${vpxStats.marketHigh.toLocaleString()}
+- Listing price: $${pricedAt.toLocaleString()}
+- ${discountPct >= 0 ? `${discountPct}% below` : `${Math.abs(discountPct)}% above`} market median`;
+    }
+
+    const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
+    const prompt = `You are an expert Australian used-vehicle flipper and assessor.
+Assess ${carLabel} listed at $${Number(listingPrice).toLocaleString()}${mileage ? `, ${Number(mileage).toLocaleString()}km` : ''}.
+${marketContext}
+
+LISTING TITLE: ${title || '(not provided)'}
+DESCRIPTION: ${description || '(not provided)'}
+
+${vpxStats
+  ? 'Market data is provided above. Do NOT invent or override the pricing data — use it as your anchor.'
+  : 'No local market data available — use your knowledge of AU used-car market pricing.'}
+
+Respond in this exact JSON format (no markdown, no prose outside JSON):
+{
+  "verdict": "STEAL|GOOD DEAL|FAIR|PASS",
+  "dealScore": 0-100,
+  "oneLiner": "one punchy sentence",
+  "estimatedResellLow": number,
+  "estimatedResellHigh": number,
+  "recommendedOffer": number,
+  "walkAwayPrice": number,
+  "estimatedProfit": number,
+  "roiPercent": number,
+  "conditionFlags": ["list any red flags from description"],
+  "repairRisks": ["mechanical/cosmetic risks worth investigating"],
+  "negotiationScript": "what to say to the seller",
+  "aiGenerated": true
+}`;
+
+    // Prefer Gemini when image is available, otherwise Claude Haiku
+    let text = '';
+    const hasImage = !!(imageBase64 || imageUrl);
+
+    if (GEMINI_API_KEY && hasImage) {
+      const parts = [];
+      if (imageBase64 && imageMime) {
+        parts.push({ inline_data: { mime_type: imageMime, data: imageBase64 } });
+      } else if (imageUrl) {
+        try {
+          const imgRes = await axios.get(imageUrl, {
+            responseType: 'arraybuffer', timeout: 10000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+          });
+          parts.push({ inline_data: { mime_type: imgRes.headers['content-type'] || 'image/jpeg', data: Buffer.from(imgRes.data).toString('base64') } });
+        } catch (_) {}
+      }
+      parts.push({ text: prompt });
+      const geminiRes = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts }] },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
+      );
+      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else if (GEMINI_API_KEY) {
+      const geminiRes = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts: [{ text: prompt }] }] },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
+      );
+      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else {
+      const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1500,
+        messages: [{ role: 'user', content: prompt }],
+      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 60000 });
+      text = claudeRes.data?.content?.[0]?.text || '';
+    }
+
+    // Parse structured JSON from AI response
+    let parsed = null;
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
+    } catch (_) {}
+
+    if (parsed) {
+      // If VPX data exists and AI drifted on pricing, trust VPX median over AI estimate
+      if (vpxStats && parsed.estimatedResellLow && parsed.estimatedResellHigh) {
+        const aiMedian = (parsed.estimatedResellLow + parsed.estimatedResellHigh) / 2;
+        const drift = Math.abs(aiMedian - vpxStats.marketMedian) / vpxStats.marketMedian;
+        if (drift > 0.25) {
+          parsed.estimatedResellLow  = vpxStats.marketLow;
+          parsed.estimatedResellHigh = vpxStats.marketHigh;
+          parsed._pricingCorrected   = true;
+        }
+      }
+      if (vpxStats) parsed.vpxData = vpxStats;
+      res.json({ ...parsed, text, usedCache: false });
+    } else {
+      res.json({ text, usedCache: false, vpxData: vpxStats || null });
+    }
+  } catch (e) {
+    console.error('[AI/vehicle]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
 
 // POST /ai/image — image scan via Gemini Flash
 // Body: { parts: [ { inline_data: { mime_type, data } }, { text: prompt } ] }
