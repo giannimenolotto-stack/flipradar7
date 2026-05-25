@@ -826,7 +826,7 @@ async function sendPushover(token, user, title, message, url) {
 // ── Apify ─────────────────────────────────────────────────
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const APIFY_ACTOR        = 'curious_coder~facebook-marketplace';         // cheap — used for everything
-const APIFY_ACTOR_DETAIL = null; // TEMP: disabled for testing — restore to: 'data-slayer~facebook-marketplace-details'
+const APIFY_ACTOR_DETAIL = 'data-slayer~facebook-marketplace-details';  // expensive — vehicles only, on-demand
 
 // ── Enrichment dedup cache ────────────────────────────────
 // Prevents data-slayer from re-enriching the same listing on every 30-min scan cycle.
@@ -839,10 +839,31 @@ const ENRICH_REDIS_TTL_SEC = 7 * 24 * 3600;        // 7 days — persists across
 const NON_VEHICLE_TYPES = ['scooter','e-bike','ebike','electric bike','electric scooter',
   'golf cart','golf buggy','push bike','bicycle','mobility scooter'];
 
+// Parts/accessories keywords that appear in vehicle keyword searches but aren't vehicles
+const NON_VEHICLE_PARTS = ['floor mat','floor liner','seat cover','car cover','car manual',
+  'workshop manual','service manual','repair manual','parts only','wrecking','dismantling',
+  'engine only','gearbox only','diff only','body kit','spoiler kit','accessory','toy car',
+  'model car','diecast','hot wheels','matchbox','poster','book','magazine'];
+
 function shouldEnrich(item) {
-  const text = ((item.marketplace_listing_title || item.title || '') + ' ' +
-                (item.redacted_description?.text || item.description || '')).toLowerCase();
-  return !NON_VEHICLE_TYPES.some(t => text.includes(t));
+  const title = (item.marketplace_listing_title || item.title || '').toLowerCase();
+  const desc  = (item.redacted_description?.text || item.description || '').toLowerCase();
+  const text  = title + ' ' + desc;
+
+  // Skip non-vehicle types (scooters, e-bikes etc)
+  if (NON_VEHICLE_TYPES.some(t => text.includes(t))) return false;
+
+  // Skip parts/accessories/manuals — these appear in vehicle keyword results but aren't vehicles
+  if (NON_VEHICLE_PARTS.some(p => title.includes(p))) return false;
+
+  // Skip suspiciously cheap listings (< $300) — likely accessories, not vehicles
+  const price = parsePrice(
+    item.listing_price?.amount || item.listing_price?.formatted_amount ||
+    item.formatted_price || item.price
+  );
+  if (price > 0 && price < 300) return false;
+
+  return true;
 }
 
 async function scrapeKeyword(keyword, opts = {}) {
@@ -953,14 +974,19 @@ async function scrapeKeyword(keyword, opts = {}) {
                   // entirely — it belongs to curious_coder, not data-slayer.
                   const slim = {};
                   const _sv = (k, v) => { if (v != null) slim[k] = v; };
-                  _sv('vehicle_odometer_data',    rows[0].vehicle_odometer_data);
-                  _sv('vehicle_transmission_type',rows[0].vehicle_transmission_type);
-                  _sv('vehicle_info',             rows[0].vehicle_info || rows[0].vehicleInfo || rows[0].listing_vehicle_data);
-                  _sv('odometer',  rows[0].odometer);
-                  _sv('mileage',   rows[0].mileage);
-                  _sv('year',      rows[0].year);
-                  _sv('make',      rows[0].make);
-                  _sv('model',     rows[0].model);
+                  const vi = rows[0].vehicle_info || rows[0].vehicleInfo || rows[0].listing_vehicle_data || {};
+                  _sv('vehicle_odometer_data',     rows[0].vehicle_odometer_data);
+                  _sv('vehicle_transmission_type', rows[0].vehicle_transmission_type);
+                  _sv('vehicle_info',              vi);
+                  _sv('odometer',   rows[0].odometer);
+                  _sv('mileage',    rows[0].mileage);
+                  _sv('year',       rows[0].year   || vi.year);
+                  _sv('make',       rows[0].make   || vi.make);
+                  _sv('model',      rows[0].model  || vi.model);
+                  _sv('fuelType',   rows[0].vehicle_fuel_type || vi.fuel_type || vi.fuelType || rows[0].fuel_type);
+                  _sv('bodyStyle',  vi.body_style  || rows[0].body_style || rows[0].bodyStyle);
+                  _sv('trim',       vi.trim        || rows[0].trim || vi.trim_level);
+                  _sv('drivetrain', vi.drivetrain  || vi.drive_type || rows[0].drivetrain);
                   // custom_sub_titles intentionally excluded — curious_coder owns this field
                   redisSet(K.enrich(listingId), slim, ENRICH_REDIS_TTL_SEC).catch(() => {});
                 }
@@ -1112,6 +1138,16 @@ async function scrapeKeyword(keyword, opts = {}) {
         bodyStyle:     isVehicle ? (
                          item.vehicle_info?.body_style || item.listing_vehicle_data?.body_style ||
                          item.vehicleInfo?.body_style || item.body_style || item.bodyStyle || null
+                       ) : null,
+        trim:          isVehicle ? (
+                         item.vehicle_info?.trim || item.listing_vehicle_data?.trim ||
+                         item.vehicleInfo?.trim || item.trim || item.trim_level ||
+                         item.vehicle_info?.trim_level || null
+                       ) : null,
+        drivetrain:    isVehicle ? (
+                         item.vehicle_info?.drivetrain || item.listing_vehicle_data?.drivetrain ||
+                         item.vehicleInfo?.drivetrain || item.drivetrain ||
+                         item.vehicle_info?.drive_type || item.drive_type || null
                        ) : null,
         sellerType:    isVehicle ? (item.vehicle_seller_type || null) : null,
         condition:     item.condition || null,
@@ -2537,13 +2573,14 @@ app.post('/seed/vehicles', authMiddleware, async (req, res) => {
 // Redis key for push subscriptions
 const K_push = userId => `fr:push:${userId}`;
 
-// POST /ai/vehicle — vehicle-specific AI appraisal (pure AI, no market data lookup)
-// Body: { make, model, year, mileage, listingPrice, title, description, imageUrl?, imageBase64?, imageMime? }
+// POST /ai/vehicle — vehicle-specific AI appraisal
+// Body: { make, model, year, mileage, transmission, fuelType, bodyStyle, trim, drivetrain, condition, sellerType, listingPrice, title, description, imageUrl?, imageBase64?, imageMime? }
 app.post('/ai/vehicle', authMiddleware, async (req, res) => {
   try {
     if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
 
-    const { make, model, year, mileage, transmission, listingPrice, title, description, imageUrl, imageBase64, imageMime } = req.body;
+    const { make, model, year, mileage, transmission, fuelType, bodyStyle, trim, drivetrain,
+            condition, sellerType, listingPrice, title, description, imageUrl, imageBase64, imageMime } = req.body;
     if (!listingPrice) return res.status(400).json({ error: 'listingPrice required' });
 
     const cr = await consumeAppraisal(req.userId);
@@ -2568,10 +2605,16 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
 
     const vehicleDetails = [
       `Make/Model/Year: ${carLabel}`,
+      trim        ? `Variant/Trim: ${trim}` : null,
       effectiveMileage
         ? `Mileage: ${effectiveMileage.toLocaleString()} km${mileageIsEstimate ? ' (estimated from age — actual unknown)' : ''}`
         : null,
       transmission ? `Transmission: ${transmission}` : null,
+      fuelType     ? `Fuel: ${fuelType}` : null,
+      drivetrain   ? `Drivetrain: ${drivetrain}` : null,
+      bodyStyle    ? `Body: ${bodyStyle}` : null,
+      condition    ? `Condition: ${condition}` : null,
+      sellerType   ? `Seller: ${sellerType}` : null,
       `Listing Price: $${Number(listingPrice).toLocaleString()}`,
       vehicleCategory ? `Vehicle type: ${vehicleCategory}` : null,
     ].filter(Boolean).join('\n');
