@@ -2478,15 +2478,15 @@ Respond in this exact JSON format (no markdown, no prose outside JSON):
       parts.push({ text: prompt });
       const geminiRes = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts }] },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
+        { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
       );
       text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else if (GEMINI_API_KEY) {
       const geminiRes = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts: [{ text: prompt }] }] },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
       );
       text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else {
@@ -2549,9 +2549,9 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }] }, {
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
       headers: { 'Content-Type': 'application/json' },
-      timeout: 60000,
+      timeout: 30000,
     });
     const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     res.json({ text });
@@ -2623,9 +2623,9 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
     }
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }] }, {
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
       headers: { 'Content-Type': 'application/json' },
-      timeout: 60000,
+      timeout: 30000,
     });
     const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     res.json({ text });

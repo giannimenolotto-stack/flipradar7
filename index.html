@@ -3786,11 +3786,11 @@ function appraiseListing(listing) {
       return;
     }
 
-    // ── Wait for image proxy then call AI ──
-    imageProxyPromise.then(function() {
-      if (window._appraisalContext.proxyFailed) {
-        toast('⚠️ Listing image expired — appraising from text only');
-      }
+    // ── Race image proxy vs 1.5s timeout — don't block AI for a slow/expired image ──
+    Promise.race([
+      imageProxyPromise,
+      new Promise(function(resolve) { setTimeout(resolve, 1500); })
+    ]).then(function() {
 
       // Vehicle path — /ai/vehicle with mileage/year/make context + image if available
       if (listing.make && listing.year && backendUrl) {
