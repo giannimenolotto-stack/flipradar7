@@ -318,9 +318,18 @@ body{font-family:'DM Sans',sans-serif;color:var(--tx);display:flex;flex-directio
     <div class="vt"><div class="ve" id="rE">🔥</div><div><div style="display:flex;align-items:baseline;gap:10px"><div class="vl" id="rL">—</div><div id="rPrice" style="font-family:'Bebas Neue',sans-serif;font-size:24px;color:var(--mu);line-height:1"></div></div><div class="vti" id="rT"></div><div class="vo" id="rO"></div></div></div>
     <div class="sr"><div class="str"><div class="sf" id="sf" style="width:0%"></div></div><div class="sn" id="sn">0/100</div></div>
   </div>
-  <!-- eBay sold price stats — shown when cache data is available -->
+  <!-- Market Intelligence — shown when cached price data is available -->
   <div id="rEbayStats" style="display:none;background:rgba(0,136,255,.07);border:1px solid rgba(0,136,255,.25);border-radius:14px;padding:14px;margin-bottom:8px">
-    <div style="font-size:10px;color:#4db8ff;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;margin-bottom:10px">📊 eBay Sold Data <span id="rEbayCount" style="font-weight:400;opacity:.7"></span></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <div style="font-size:10px;color:#4db8ff;letter-spacing:1.5px;text-transform:uppercase;font-weight:700">📊 Market Intelligence <span id="rEbayCount" style="font-weight:400;opacity:.7"></span></div>
+      <div id="rConfWrap" style="display:none;align-items:center;gap:6px">
+        <div style="font-size:9px;color:var(--mu);text-transform:uppercase;letter-spacing:1px">Conf.</div>
+        <div style="width:52px;height:4px;background:rgba(255,255,255,.1);border-radius:2px;overflow:hidden">
+          <div id="rConfBar" style="height:100%;background:#00ff88;border-radius:2px;transition:width .4s;width:0%"></div>
+        </div>
+        <div id="rConfPct" style="font-size:10px;font-weight:700;color:#00ff88">0%</div>
+      </div>
+    </div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
       <div style="text-align:center">
         <div style="font-size:9px;color:var(--mu);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Low</div>
@@ -1790,17 +1799,45 @@ function render(r) {
   } else {
     miCard.style.display = 'none';
   }
-  // ── eBay sold data block ──────────────────────────────
+  // ── Market Intelligence block ─────────────────────────
   var ebayEl = document.getElementById('rEbayStats');
   if (ebayEl) {
-    if (r.low && r.median && r.high) {
-      document.getElementById('rEbayLow').textContent    = '$' + r.low.toLocaleString();
-      document.getElementById('rEbayMedian').textContent = '$' + r.median.toLocaleString();
-      document.getElementById('rEbayHigh').textContent   = '$' + r.high.toLocaleString();
-      document.getElementById('rEbayCount').textContent  = r.dataPoints ? '· ' + r.dataPoints + ' sold' : '';
-      document.getElementById('rEbaySource').textContent = r.source === 'own_history'
-        ? '📈 Based on FlipRadar price history'
-        : '📦 Based on eBay AU sold listings';
+    var mLow = r.low || r.marketLow, mMed = r.median || r.marketMedian, mHi = r.high || r.marketHigh;
+    if (mLow && mMed && mHi) {
+      document.getElementById('rEbayLow').textContent    = '$' + mLow.toLocaleString();
+      document.getElementById('rEbayMedian').textContent = '$' + mMed.toLocaleString();
+      document.getElementById('rEbayHigh').textContent   = '$' + mHi.toLocaleString();
+      var dpLabel = '';
+      if (r.dataPoints) {
+        var unitWord = (r.source === 'vpx' || r.source === 'csales') ? ' comparable' + (r.dataPoints !== 1 ? 's' : '') : ' sold';
+        dpLabel = '· ' + r.dataPoints + unitWord;
+      }
+      document.getElementById('rEbayCount').textContent = dpLabel;
+      var srcEl = document.getElementById('rEbaySource');
+      if (r.sourceLabel) {
+        srcEl.textContent = r.sourceLabel;
+      } else if (r.source === 'own_history') {
+        srcEl.textContent = '📈 FlipRadar price history';
+      } else if (r.source === 'autograb') {
+        srcEl.textContent = '🚗 RedBook valuation (AutoGrab)';
+      } else if (r.source === 'vpx') {
+        srcEl.textContent = '📊 FlipRadar AU vehicle index';
+      } else if (r.source === 'csales') {
+        srcEl.textContent = '🏷️ Carsales AU market data';
+      } else {
+        srcEl.textContent = '📦 eBay AU sold listings';
+      }
+      var confWrap = document.getElementById('rConfWrap');
+      if (confWrap && r.confidence) {
+        var confPct = Math.round(r.confidence * 100);
+        var confBar = document.getElementById('rConfBar');
+        confBar.style.width = confPct + '%';
+        confBar.style.background = confPct >= 75 ? '#00ff88' : confPct >= 50 ? 'var(--gold)' : '#ff6b6b';
+        document.getElementById('rConfPct').textContent = confPct + '%';
+        confWrap.style.display = 'flex';
+      } else if (confWrap) {
+        confWrap.style.display = 'none';
+      }
       ebayEl.style.display = 'block';
     } else {
       ebayEl.style.display = 'none';
@@ -3749,7 +3786,16 @@ function appraiseListing(listing) {
     ? fetch(backendUrl + '/appraise', {
         method: 'POST',
         headers: authHeaders(),
-        body: JSON.stringify({ keyword: keyword, price: listing.price, title: listing.title, description: listing.description || '' })
+        body: JSON.stringify({
+          keyword: keyword,
+          price: listing.price,
+          title: listing.title,
+          description: listing.description || '',
+          make: listing.make || null,
+          model: listing.model || null,
+          year: listing.year || null,
+          mileage: listing.mileage || null
+        })
       }).then(function(r) { return r.json(); }).catch(function() { return null; })
     : Promise.resolve(null);
 
@@ -3818,7 +3864,54 @@ function appraiseListing(listing) {
       return;
     }
 
-    // ── Cache miss — call AI (eBay context injected inside callAI_text) ──
+    // ── Cache miss — vehicle uses /ai/vehicle; non-vehicle uses callAI_text ──
+    if (listing.make && listing.year && backendUrl) {
+      var vehiclePayload = {
+        make: listing.make,
+        model: listing.model || '',
+        year: listing.year,
+        mileage: listing.mileage || null,
+        listingPrice: listing.price,
+        title: listing.title,
+        description: listing.description || ''
+      };
+      var imgCtx = window._appraisalContext;
+      if (imgCtx && imgCtx.imageB64 && !imgCtx.proxyFailed) {
+        vehiclePayload.imageBase64 = imgCtx.imageB64;
+        vehiclePayload.imageMime   = imgCtx.mediaType || 'image/jpeg';
+      }
+      fetch(backendUrl + '/ai/vehicle', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(vehiclePayload)
+      }).then(function(resp) { return resp.json(); })
+      .then(function(r) {
+        clearInterval(stepTimer);
+        for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
+        r = Object.assign({
+          extractedTitle:      listing.title,
+          extractedPrice:      listing.price || 0,
+          extractedMileage:    listing.mileage || null,
+          timeToSell:          '—',
+          demandLevel:         '—',
+          greenFlags:          [],
+          redFlags:            [],
+          whatToCheckInPerson: [],
+          whyItsWorth:         ''
+        }, r);
+        var entry = { id: Date.now(), title: r.extractedTitle, price: r.extractedPrice || listing.price, image: listing.image || null, url: listing.url || null, result: r, date: new Date().toLocaleDateString('en-AU') };
+        hist.unshift(entry); sv(); updatePill();
+        setTimeout(function() { showResult(r); }, 400);
+      }).catch(function(e) {
+        clearInterval(stepTimer);
+        document.getElementById('lw').classList.remove('on');
+        document.getElementById('scrScan').classList.add('on');
+        showErr('Error: ' + e.message);
+      });
+      return;
+    }
+
+    // Non-vehicle — call AI with eBay context injection
     callAI_text(txt, keyword).then(function(r) {
       clearInterval(stepTimer);
       for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
