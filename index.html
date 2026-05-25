@@ -1604,7 +1604,7 @@ function callAI_text(txt, keyword) {
       var imagePayload = ctx
         ? (ctx.imageB64 ? { imageB64: ctx.imageB64, mediaType: ctx.mediaType } : {})
         : { imageUrl: window._currentListingImage || null };
-      var prompt = 'You are an expert Australian Facebook Marketplace flipper. Give a sharp appraisal based on Australian resale market pricing. For vehicles, mileage/odometer is critical.\n\nLISTING:\n"""\n' + txt + '\n"""' + ebayContext + '\n\nReturn ONLY valid JSON:\n{"extractedTitle":string,"extractedPrice":number,"extractedMileage":number or null,"verdict":"STEAL" or "GOOD DEAL" or "FAIR" or "PASS","dealScore":number 0-100,"roiPercent":number,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"timeToSell":string,"demandLevel":string,"oneLiner":string,"whyItsWorth":string,"greenFlags":["string"],"redFlags":["string"],"whatToCheckInPerson":["string"],"negotiationScript":string}';
+      var prompt = 'You are an expert Australian Facebook Marketplace flipper. Give a sharp appraisal based on Australian resale market pricing. For vehicles, mileage/odometer is critical. If the item is broken, "for parts", "not working", "as-is", or needs significant repair, set isBrokenOrProject true and estimate repairEstimate in AUD — subtract it from estimatedProfit and cap the verdict at FAIR unless margins after full repairs are exceptional.\n\nLISTING:\n"""\n' + txt + '\n"""' + ebayContext + '\n\nReturn ONLY valid JSON:\n{"extractedTitle":string,"extractedPrice":number,"extractedMileage":number or null,"verdict":"STEAL" or "GOOD DEAL" or "FAIR" or "PASS","dealScore":number 0-100,"roiPercent":number,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"timeToSell":string,"demandLevel":string,"oneLiner":string,"whyItsWorth":string,"greenFlags":["string"],"redFlags":["string"],"whatToCheckInPerson":["string"],"negotiationScript":string,"isBrokenOrProject":false,"repairEstimate":0}';
       return callBackendAI('/ai/text-image', Object.assign({ prompt: prompt }, imagePayload))
         .then(function(r) {
           if (!r || typeof r !== 'object' || !r.verdict) {
@@ -1646,7 +1646,7 @@ function callAI_text(txt, keyword) {
         });
     }
 
-    var prompt = 'You are an expert Australian Facebook Marketplace flipper. Give a sharp appraisal based on Australian resale market pricing. For vehicles, mileage/odometer is critical.\n\nLISTING:\n"""\n' + txt + '\n"""' + ebayContext + '\n\nReturn ONLY valid JSON:\n{"extractedTitle":string,"extractedPrice":number,"extractedMileage":number or null,"verdict":"STEAL" or "GOOD DEAL" or "FAIR" or "PASS","dealScore":number 0-100,"roiPercent":number,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"timeToSell":string,"demandLevel":string,"oneLiner":string,"whyItsWorth":string,"greenFlags":["string"],"redFlags":["string"],"whatToCheckInPerson":["string"],"negotiationScript":string}';
+    var prompt = 'You are an expert Australian Facebook Marketplace flipper. Give a sharp appraisal based on Australian resale market pricing. For vehicles, mileage/odometer is critical. If the item is broken, "for parts", "not working", "as-is", or needs significant repair, set isBrokenOrProject true and estimate repairEstimate in AUD — subtract it from estimatedProfit and cap the verdict at FAIR unless margins after full repairs are exceptional.\n\nLISTING:\n"""\n' + txt + '\n"""' + ebayContext + '\n\nReturn ONLY valid JSON:\n{"extractedTitle":string,"extractedPrice":number,"extractedMileage":number or null,"verdict":"STEAL" or "GOOD DEAL" or "FAIR" or "PASS","dealScore":number 0-100,"roiPercent":number,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"timeToSell":string,"demandLevel":string,"oneLiner":string,"whyItsWorth":string,"greenFlags":["string"],"redFlags":["string"],"whatToCheckInPerson":["string"],"negotiationScript":string,"isBrokenOrProject":false,"repairEstimate":0}';
 
     var imgUrl = window._currentListingImage || null;
 
@@ -1695,10 +1695,10 @@ function callAI_image() {
   var extraText = (document.getElementById('imgExtra').value || '').trim();
 
   return Promise.all(imgFiles.map(compressImageForAI)).then(function(imageBlocks) {
-    var textPrompt = 'You are an expert Australian Facebook Marketplace flipper.\n\nAnalyse the listing screenshot(s) provided. Read ALL visible text carefully — title, asking price, condition, location, description, seller notes. For vehicles, look carefully for odometer/mileage/km readings — they are critical to the valuation.\n' +
+    var textPrompt = 'You are an expert Australian Facebook Marketplace flipper.\n\nAnalyse the listing screenshot(s) provided. Read ALL visible text carefully — title, asking price, condition, location, description, seller notes. For vehicles, look carefully for odometer/mileage/km readings — they are critical to the valuation. If the item is broken, "for parts", "not working", "as-is", or needs significant repair, set isBrokenOrProject true and estimate repairEstimate in AUD — subtract it from estimatedProfit and cap the verdict at FAIR unless margins after full repairs are exceptional.\n' +
       (extraText ? '\nExtra context:\n"""\n' + extraText + '\n"""\n' : '') +
       '\nRespond with ONLY a raw JSON object. No explanation. No markdown. No code fences. Start your response with { and end with }.\n\n' +
-      '{"extractedTitle":string,"extractedPrice":number,"extractedMileage":number or null,"verdict":"STEAL" or "GOOD DEAL" or "FAIR" or "PASS","dealScore":number 0-100,"roiPercent":number,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"timeToSell":string,"demandLevel":string,"oneLiner":string,"whyItsWorth":string,"greenFlags":["string"],"redFlags":["string"],"whatToCheckInPerson":["string"],"negotiationScript":string}';
+      '{"extractedTitle":string,"extractedPrice":number,"extractedMileage":number or null,"verdict":"STEAL" or "GOOD DEAL" or "FAIR" or "PASS","dealScore":number 0-100,"roiPercent":number,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"timeToSell":string,"demandLevel":string,"oneLiner":string,"whyItsWorth":string,"greenFlags":["string"],"redFlags":["string"],"whatToCheckInPerson":["string"],"negotiationScript":string,"isBrokenOrProject":false,"repairEstimate":0}';
 
     // ── Backend proxy path (preferred — keys on server) ───
     if (getBackendUrl()) {
@@ -1783,6 +1783,7 @@ function parseAPIResponse(res) {
 function render(r) {
   var v = VD[r.verdict] || VD['FAIR'];
   if (r.isOfferPriceListing) v = VD['FAIR']; // never green/rainbow for placeholder prices
+  if (r.isBrokenOrProject) v = VD['FAIR'];   // broken/project items never get rainbow/green
   // Confidence-based border cap: don't show rainbow/green when data quality is too weak
   var hasMarketAnchor = r.confidence != null && r.confidence > 0;
   if (r.aiGenerated && !hasMarketAnchor) {
@@ -1869,6 +1870,9 @@ function render(r) {
   var gr = r.greenFlags || [];
   document.getElementById('rGr').innerHTML = gr.length ? gr.map(function(f) { return '<div class="fi"><span style="color:var(--g);flex-shrink:0">▸</span>' + f + '</div>'; }).join('') : '<div class="fi" style="color:var(--mu)"><span>▸</span>None found</div>';
   var rd = r.redFlags || [];
+  if (r.isBrokenOrProject && r.repairEstimate > 0) {
+    rd = ['⚠️ Broken/project item — est. repair cost $' + r.repairEstimate.toLocaleString() + (r.repairNotes ? ' · ' + r.repairNotes : '')].concat(rd);
+  }
   document.getElementById('rRd').innerHTML = rd.length ? rd.map(function(f) { return '<div class="fi"><span style="color:var(--red);flex-shrink:0">▸</span>' + f + '</div>'; }).join('') : '<div class="fi" style="color:var(--mu)"><span>▸</span>None found</div>';
   var ch = r.whatToCheckInPerson || [];
   document.getElementById('rCh').innerHTML = ch.map(function(c, i) { return '<div class="ci"><div class="cn">' + (i+1) + '</div><div class="ct">' + c + '</div></div>'; }).join('');
@@ -3667,15 +3671,13 @@ function renderListingsFeed(items, ratingMap) {
     html += badgeHtml;
     html += '<div style="font-size:12px;font-weight:600;color:#fff;line-height:1.3;margin-bottom:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">' + l.title + '</div>';
     html += '<div style="font-family:Bebas Neue,sans-serif;font-size:20px;color:var(--g);line-height:1;margin-bottom:3px">' + priceStr + '</div>';
-    html += '<div style="font-size:10px;color:var(--mu);margin-bottom:4px">' + timeAgo + (l.location ? ' · ' + l.location : '') + '</div>';
+    html += '<div style="font-size:10px;color:var(--mu);margin-bottom:4px">' + timeAgo + (l.location && typeof l.location === 'string' ? ' · ' + l.location : '') + '</div>';
     // Vehicle meta row: mileage + year/make/model chips
     var metaChips = '';
     if (l.mileage) metaChips += '<span style="background:rgba(0,255,136,.1);border:1px solid rgba(0,255,136,.2);border-radius:6px;padding:2px 7px;font-size:10px;color:var(--g);font-weight:600">🔢 ' + l.mileage.toLocaleString() + ' km</span>';
     if (l.year)         metaChips += '<span style="background:rgba(255,255,255,.06);border:1px solid var(--bd);border-radius:6px;padding:2px 7px;font-size:10px;color:var(--mu)">' + l.year + '</span>';
     if (l.make)         metaChips += '<span style="background:rgba(255,255,255,.06);border:1px solid var(--bd);border-radius:6px;padding:2px 7px;font-size:10px;color:var(--mu)">' + l.make + '</span>';
     if (l.transmission) metaChips += '<span style="background:rgba(255,255,255,.06);border:1px solid var(--bd);border-radius:6px;padding:2px 7px;font-size:10px;color:var(--mu)">⚙️ ' + l.transmission + '</span>';
-    if (l.fuelType)     metaChips += '<span style="background:rgba(255,255,255,.06);border:1px solid var(--bd);border-radius:6px;padding:2px 7px;font-size:10px;color:var(--mu)">⛽ ' + l.fuelType + '</span>';
-    if (l.exteriorColor)metaChips += '<span style="background:rgba(255,255,255,.06);border:1px solid var(--bd);border-radius:6px;padding:2px 7px;font-size:10px;color:var(--mu)">🎨 ' + l.exteriorColor + '</span>';
     if (l.bodyStyle)    metaChips += '<span style="background:rgba(255,255,255,.06);border:1px solid var(--bd);border-radius:6px;padding:2px 7px;font-size:10px;color:var(--mu)">' + l.bodyStyle + '</span>';
     if (metaChips) html += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px">' + metaChips + '</div>';
     else html += '<div style="margin-bottom:4px"></div>';

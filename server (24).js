@@ -698,12 +698,13 @@ function buildCacheVerdict(listingPrice, priceData) {
 }
 
 // Mileage-aware verdict using the unified priceSource format from fetchBestVehiclePrice.
-function buildVehicleVerdict(listingPrice, priceSource) {
+function buildVehicleVerdict(listingPrice, priceSource, mileage) {
   const { marketMedian, marketLow, marketHigh, samples, make, model, year, mileageAdjusted,
           source, sourceLabel, confidence } = priceSource;
 
-  const roi             = marketMedian > 0 ? Math.round(((marketMedian - listingPrice) / listingPrice) * 100) : 0;
-  const estimatedProfit = Math.max(0, Math.round(marketMedian - listingPrice));
+  const feeAdj          = marketMedian * 0.92;  // ~8% selling fees (FB/Gumtree)
+  const roi             = marketMedian > 0 ? Math.round(((feeAdj - listingPrice) / listingPrice) * 100) : 0;
+  const estimatedProfit = Math.max(0, Math.round(feeAdj - listingPrice));
 
   let verdict, oneLiner, dealScore;
   if (roi >= 50) {
@@ -738,6 +739,10 @@ function buildVehicleVerdict(listingPrice, priceSource) {
   if (!mileageAdjusted) {
     dealScore = Math.max(0, dealScore - 8);
   }
+  // Extra penalty for very high mileage — hard sell regardless of price
+  if (mileage && mileage > 200000) {
+    dealScore = Math.max(0, dealScore - 5);
+  }
 
   const mileageNote = mileageAdjusted ? ' (mileage-adjusted)' : '';
   const carLabel    = [year, make, model].filter(Boolean).join(' ');
@@ -756,8 +761,8 @@ function buildVehicleVerdict(listingPrice, priceSource) {
     estimatedMarketValue: marketMedian,
     estimatedResellLow:   marketLow,
     estimatedResellHigh:  marketHigh,
-    recommendedOffer:     Math.round(listingPrice * 0.88),
-    walkAwayPrice:        Math.round(marketMedian * 1.05),
+    recommendedOffer:     Math.round(listingPrice * 0.82),
+    walkAwayPrice:        Math.round(marketMedian * 0.95),
     estimatedProfit,
     roiPercent:           roi,
     timeToSell,
@@ -773,7 +778,7 @@ function buildVehicleVerdict(listingPrice, priceSource) {
     low:    marketLow,
     median: marketMedian,
     high:   marketHigh,
-    negotiationScript: `Similar ${carLabel}s sell for around $${marketMedian.toLocaleString()}${mileageNote} in AU — would you take $${Math.round(listingPrice * 0.88).toLocaleString()}?`,
+    negotiationScript: `Similar ${carLabel}s sell for around $${marketMedian.toLocaleString()}${mileageNote} in AU — would you take $${Math.round(listingPrice * 0.82).toLocaleString()}?`,
     vpxData: priceSource,
   };
 }
@@ -2239,7 +2244,7 @@ app.post('/appraise', authMiddleware, async (req, res) => {
       const resolvedModel = model || extractModel(make, title || '');
       const priceSource = await fetchBestVehiclePrice(make, resolvedModel, year, mileage || null);
       if (priceSource) {
-        const verdict = buildVehicleVerdict(listingPrice, priceSource);
+        const verdict = buildVehicleVerdict(listingPrice, priceSource, mileage || null);
         user.appraisalsToday = (user.appraisalsToday || 0) + 1;
         await saveUser(user);
         _invalidateUserCache(req.userId);
@@ -2591,7 +2596,9 @@ ${vpxStats
   ? 'Market data is provided above. Use it as your primary pricing anchor — do NOT invent or significantly deviate from these figures. Your role is condition and risk assessor. Apply mileage depreciation on top of market median when appropriate.'
   : 'No local market data available — use your knowledge of the AU used-car market to estimate pricing conservatively. Apply the mileage guide above.'}
 
-Flip guidance: account for selling fees (~8% on Facebook/Gumtree), detailing/minor repairs, and time cost. Only call it a STEAL if the margin is genuinely exceptional after fees.
+Flip guidance: account for selling fees (~8% on Facebook/Gumtree), detailing/minor repairs (~$200–500), and time cost. Only call it a STEAL if the margin is genuinely exceptional after all these costs.
+
+Broken/project car detection: If the listing mentions "spares or repairs", "project car", "not running", "blown head gasket", "engine out", "accident damage", "needs work", "as-is", or similar, set isBrokenOrProject to true and provide a realistic repairEstimate in AUD. Subtract repairEstimate from estimatedProfit. A broken car's maximum verdict should be FAIR unless the margin after full repairs is truly exceptional (30%+ net ROI). Be conservative — buyers often underestimate repair bills.
 
 Respond in this exact JSON format (no markdown, no prose outside JSON):
 {
@@ -2614,6 +2621,9 @@ Respond in this exact JSON format (no markdown, no prose outside JSON):
   "redFlags": ["concerns or risks from listing"],
   "whatToCheckInPerson": ["inspection checklist items"],
   "negotiationScript": "what to say to the seller",
+  "isBrokenOrProject": false,
+  "repairEstimate": 0,
+  "repairNotes": "",
   "aiGenerated": true
 }`;
 
