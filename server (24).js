@@ -104,6 +104,9 @@ const AGRAB_TTL_SECS      = 30 * 24 * 3600;       // 30 day autograb/redbook cac
 const CARSALES_BIAS       = 0.92;                  // asking-price → cleared-price correction (~8%)
 const AUTOGRAB_API_KEY    = process.env.AUTOGRAB_API_KEY  || null;
 const AUTOGRAB_BASE_URL   = process.env.AUTOGRAB_BASE_URL || 'https://api.autograb.com.au/v1';
+const BRIGHTDATA_API_KEY    = process.env.BRIGHTDATA_API_KEY    || null;
+const BRIGHTDATA_BASE_URL   = process.env.BRIGHTDATA_BASE_URL   || 'https://api.brightdata.com/datasets/v3';
+const BRIGHTDATA_DATASET_ID = process.env.BRIGHTDATA_DATASET_ID || null;
 const CARSALES_APIFY_ACTOR = process.env.CARSALES_APIFY_ACTOR || 'zuzka_k~carsales-scraper';
 
 // Top AU vehicle models to seed on first deploy (make, model, year range)
@@ -822,7 +825,78 @@ function shouldEnrich(item) {
   return !NON_VEHICLE_TYPES.some(t => text.includes(t));
 }
 
+async function brightDataKeywordScan(keyword, opts = {}) {
+  if (!BRIGHTDATA_API_KEY) return [];
+  try {
+    const cap = opts.initialScan ? 25 : 15;
+    const res = await axios.post(
+      `${BRIGHTDATA_BASE_URL}/scrape?dataset_id=${BRIGHTDATA_DATASET_ID}&include_errors=true`,
+      { input: [{ keyword }] },
+      {
+        headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' },
+        timeout: 120000,
+      }
+    );
+    const raw = (res.data || []).filter(r => !r.error).slice(0, cap);
+    return raw.map(item => {
+      const id = item.product_id || (() => {
+        const m = (item.url || '').match(/\/item\/(\d+)\//);
+        return m ? m[1] : null;
+      })();
+      const rawTitle    = item.title || '';
+      const description = item.description || null;
+      const rawPrice    = parsePrice(item.price);
+      const year        = item.year  || extractYear(rawTitle, description);
+      const make        = item.make  || extractMake(keyword, rawTitle);
+      const model       = item.model || extractModel(make, rawTitle);
+      const title       = normalizeVehicleTitle(rawTitle, year, make);
+      let listedAt, listedAtUnknown = false;
+      try {
+        const d = item.listing_date ? new Date(item.listing_date) : null;
+        if (!d || isNaN(d.getTime())) throw new Error();
+        listedAt = d.toISOString();
+      } catch (_) {
+        listedAt = new Date().toISOString();
+        listedAtUnknown = true;
+      }
+      return {
+        id,
+        title,
+        price:         rawPrice,
+        isOfferPrice:  isOfferPrice(rawPrice),
+        url:           item.url || `https://www.facebook.com/marketplace/item/${id}/`,
+        image:         item.image || null,
+        location:      typeof item.location === 'string' ? item.location : null,
+        description,
+        keyword,
+        listedAt,
+        listedAtUnknown,
+        foundAt:       new Date().toISOString(),
+        mileage:       extractMileage(rawTitle, description),
+        year,
+        make,
+        model,
+        transmission:  item.transmission || extractTransmission(rawTitle, description),
+        fuelType:      item.fuel_type || item.fuelType || null,
+        exteriorColor: item.exterior_color || item.color || null,
+        interiorColor: item.interior_color || null,
+        bodyStyle:     item.body_style || item.bodyStyle || null,
+        trim:          item.trim || null,
+        drivetrain:    item.drivetrain || item.drive_type || null,
+        sellerType:    item.seller_type || null,
+        condition:     item.condition || null,
+      };
+    }).filter(l => l.id);
+  } catch (e) {
+    console.error(`[BrightData] Error for "${keyword}":`, e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message);
+    return [];
+  }
+}
+
 async function scrapeKeyword(keyword, opts = {}) {
+  if (isVehicleKeyword(keyword)) {
+    return brightDataKeywordScan(keyword, opts);
+  }
   if (!APIFY_TOKEN) return [];
   // Initial scan looks back 30 days, fetches up to 50, then we trim to the 20 most recent.
   // Regular scans only look back 1 day and fetch 25.
