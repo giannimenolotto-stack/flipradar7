@@ -584,7 +584,6 @@ async function scrapeKeyword(keyword, opts = {}) {
       } else {
         console.log(`[Apify] "${keyword}" — all ${items.length} vehicle listing(s) complete or cached, skipping enrichment`);
       }
-      }
     }
     return items.map(item => {
       const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
