@@ -776,7 +776,7 @@ async function brightDataKeywordScan(keyword, opts = {}) {
   try {
     const res = await axios.post(
       'https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lvt9iwuh6fbcwmx1a&custom_output_fields=title,initial_price,final_price,currency,product_id,condition,description,location,country_code,root_category,images,seller_description,color,brand,listing_date,car_miles,timestamp,url,breadcrumbs,videos,profile_id,input,discovery_input,error,error_code,warning,warning_code,vehicle_year,vehicle_make,vehicle_model,vehicle_transmission,vehicle_fuel_type,vehicle_odometer_data,vehicle_info,exterior_color,interior_color,body_style,trim,drivetrain,seller_type,custom_sub_titles,listing_subtitle,subtitle&notify=false&include_errors=true&type=discover_new&discover_by=keyword',
-      { input: [{ keyword }] },
+      { input: [{ keyword, city: normaliseCityForBrightData(opts.city) }] },
       {
         headers: { 'Authorization': 'Bearer e7687dd0-2f08-4677-a915-57ceef4dc867', 'Content-Type': 'application/json' },
         timeout: 120000,
@@ -1180,7 +1180,51 @@ function isOfferPrice(price) {
   if (s.length >= 3 && s.split('').every(c => c === s[0])) return true;
   return false;
 }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// ── Normalise user-entered location to BrightData city format ──
+// BrightData requires a non-empty city string. Maps common AU inputs to
+// "City,State,Australia" format. Falls back to Sydney if unrecognised.
+function normaliseCityForBrightData(location) {
+  if (!location) return 'Sydney,New South Wales,Australia';
+  const loc = location.trim().toLowerCase().replace(/[.,]/g, ' ').replace(/\s+/g, ' ');
+
+  const AU_CITIES = [
+    // Sydney
+    { patterns: ['sydney', 'nsw', 'new south wales', 'parramatta', 'newcastle', 'wollongong', 'central coast'],
+      city: 'Sydney,New South Wales,Australia' },
+    // Melbourne
+    { patterns: ['melbourne', 'vic', 'victoria', 'geelong', 'ballarat', 'bendigo', 'dandenong', 'frankston'],
+      city: 'Melbourne,Victoria,Australia' },
+    // Brisbane
+    { patterns: ['brisbane', 'qld', 'queensland', 'gold coast', 'sunshine coast', 'ipswich', 'toowoomba'],
+      city: 'Brisbane,Queensland,Australia' },
+    // Perth
+    { patterns: ['perth', 'wa', 'western australia', 'fremantle', 'mandurah', 'joondalup'],
+      city: 'Perth,Western Australia,Australia' },
+    // Adelaide
+    { patterns: ['adelaide', 'sa', 'south australia', 'mount barker', 'gawler'],
+      city: 'Adelaide,South Australia,Australia' },
+    // Canberra
+    { patterns: ['canberra', 'act', 'australian capital territory'],
+      city: 'Canberra,Australian Capital Territory,Australia' },
+    // Darwin
+    { patterns: ['darwin', 'nt', 'northern territory'],
+      city: 'Darwin,Northern Territory,Australia' },
+    // Hobart
+    { patterns: ['hobart', 'tas', 'tasmania', 'launceston'],
+      city: 'Hobart,Tasmania,Australia' },
+  ];
+
+  for (const entry of AU_CITIES) {
+    if (entry.patterns.some(p => loc.includes(p))) return entry.city;
+  }
+
+  // Unknown location — return as-is and hope BrightData accepts it,
+  // or fall back to Sydney so we never send an empty/invalid value
+  const cleaned = location.trim();
+  return cleaned || 'Sydney,New South Wales,Australia';
+}
+
+
 
 // ── Shared scan cache TTL ────────────────────────────────
 const SHARED_SCAN_TTL_MS = 25 * 60 * 1000; // 25 mins — slightly under the 30min scan interval
