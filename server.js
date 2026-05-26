@@ -776,7 +776,7 @@ async function brightDataKeywordScan(keyword, opts = {}) {
   try {
     const res = await axios.post(
       'https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lvt9iwuh6fbcwmx1a&custom_output_fields=title,initial_price,final_price,currency,product_id,condition,description,location,country_code,root_category,images,seller_description,color,brand,listing_date,car_miles,timestamp,url,breadcrumbs,videos,profile_id,input,discovery_input,error,error_code,warning,warning_code,vehicle_year,vehicle_make,vehicle_model,vehicle_transmission,vehicle_fuel_type,vehicle_odometer_data,vehicle_info,exterior_color,interior_color,body_style,trim,drivetrain,seller_type,custom_sub_titles,listing_subtitle,subtitle&notify=false&include_errors=true&type=discover_new&discover_by=keyword',
-      { input: [{ keyword, city: '', date_listed: '' }] },
+      { input: [{ keyword }] },
       {
         headers: { 'Authorization': 'Bearer e7687dd0-2f08-4677-a915-57ceef4dc867', 'Content-Type': 'application/json' },
         timeout: 120000,
