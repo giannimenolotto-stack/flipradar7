@@ -811,8 +811,8 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
 
     const params = {
       query:     keyword,
-      latitude:  coords.latitude,
-      longitude: coords.longitude,
+      lat:       coords.latitude,
+      lng:       coords.longitude,
       radius_km: opts.radius || 50,
     };
 
