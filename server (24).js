@@ -775,10 +775,10 @@ async function brightDataKeywordScan(keyword, opts = {}) {
   const cap = opts.initialScan ? 25 : 15;
   try {
     const res = await axios.post(
-      `${BRIGHTDATA_BASE_URL}/scrape?dataset_id=${BRIGHTDATA_DATASET_ID}&include_errors=true`,
-      { input: [{ keyword }] },
+      'https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lvt9iwuh6fbcwmx1a&custom_output_fields=title,initial_price,final_price,currency,product_id,condition,description,location,country_code,root_category,images,seller_description,color,brand,listing_date,car_miles,timestamp,url,breadcrumbs,videos,profile_id,input,discovery_input,error,error_code,warning,warning_code&notify=false&include_errors=true&type=discover_new&discover_by=keyword',
+      { input: [{ keyword, city: '', date_listed: '' }] },
       {
-        headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' },
+        headers: { 'Authorization': 'Bearer e7687dd0-2f08-4677-a915-57ceef4dc867', 'Content-Type': 'application/json' },
         timeout: 120000,
       }
     );
@@ -835,7 +835,7 @@ async function brightDataKeywordScan(keyword, opts = {}) {
         price:         rawPrice,
         isOfferPrice:  isOfferPrice(rawPrice),
         url:           item.url || `https://www.facebook.com/marketplace/item/${id}/`,
-        image:         item.image || null,
+        image:         (Array.isArray(item.images) ? item.images[0] : item.images) || item.image || null,
         location:      typeof item.location === 'string' ? item.location : (item.location?.city || null),
         description,
         keyword,
@@ -843,7 +843,7 @@ async function brightDataKeywordScan(keyword, opts = {}) {
         listedAtUnknown,
         foundAt:       new Date().toISOString(),
         // Vehicle-specific
-        mileage:       isVehicle ? (extractMileage(rawTitle, description)) : null,
+        mileage:       isVehicle ? (item.car_miles || extractMileage(rawTitle, description)) : null,
         year,
         make,
         model,
