@@ -803,19 +803,20 @@ async function resolveCity(city) {
 async function sociaVaultKeywordScan(keyword, opts = {}) {
   if (!SOCIAVAULT_API_KEY) return [];
   const t0  = Date.now();
-  const cap = opts.initialScan ? 10 : 10;
+  const cap = opts.initialScan ? 50 : 96;  // 50 on first seed, max on ongoing
   try {
     // Resolve city to coordinates
     const city   = opts.city || 'Melbourne';
     const coords = await resolveCity(city) || { latitude: -37.8136, longitude: 144.9631 }; // Melbourne fallback
 
     const params = {
-      query:     keyword,
-      lat:       coords.latitude,
-      lng:       coords.longitude,
-      radius_km: opts.radius || 50,
-      limit:     10,  // most recent 10 listings only
-      sort_by:   'creation_time_descend',  // newest first
+      query:       keyword,
+      lat:         coords.latitude,
+      lng:         coords.longitude,
+      radius_km:   opts.radius || 50,
+      count:       cap,
+      sort_by:     'creation_time_descend',  // newest first
+      ...(opts.initialScan ? { date_listed: 'last_7_days' } : {}),  // seed with last 7 days, recurring just gets newest
     };
 
     const res = await axios.get(`${SOCIAVAULT_BASE}/search`, {
