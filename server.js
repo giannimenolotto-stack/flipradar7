@@ -1722,23 +1722,10 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     startWatchTimer(item);
     console.log(`[Watch] Added "${item.keyword}" for user ${req.userId}`);
     res.json(item);
-    // Clear seen entries FIRST, then scan — order matters to avoid race condition
-    // where the initial scan marks listings as seen before the clear runs
-    (async () => {
-      try {
-        const seen = await getUserSeen(req.userId);
-        const prefix = `${item.keyword}:`;
-        const pruned = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
-        await saveUserSeen(req.userId, pruned, { merge: false });
-        const cleared = Object.keys(seen).length - Object.keys(pruned).length;
-        if (cleared > 0) console.log(`[AddWatch] Cleared ${cleared} stale seen entries for "${item.keyword}"`);
-      } catch (e) { console.error('[AddWatch] seen clear error:', e.message); }
-      // Initial backfill — runs once when watch is added
-      // DO NOT also call /scan/now — that causes a double scan
-      scanWatchItem(item, { initialScan: true })
-        .then(n => console.log(`[InitialScan] "${item.keyword}" → ${n} listing(s)`))
-        .catch(e => console.error(`[InitialScan] Error:`, e.message));
-    })();
+    // Initial backfill — runs once when watch is added
+    scanWatchItem(item, { initialScan: true })
+      .then(n => console.log(`[InitialScan] "${item.keyword}" → ${n} listing(s)`))
+      .catch(e => console.error(`[InitialScan] Error:`, e.message));
   } catch (e) { console.error('[AddWatch]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
