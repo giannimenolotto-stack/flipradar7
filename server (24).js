@@ -107,7 +107,6 @@ const AUTOGRAB_BASE_URL   = process.env.AUTOGRAB_BASE_URL || 'https://api.autogr
 const BRIGHTDATA_API_KEY    = process.env.BRIGHTDATA_API_KEY    || null;
 const BRIGHTDATA_BASE_URL   = process.env.BRIGHTDATA_BASE_URL   || 'https://api.brightdata.com/datasets/v3';
 const BRIGHTDATA_DATASET_ID = process.env.BRIGHTDATA_DATASET_ID || null;
-const CARSALES_APIFY_ACTOR = process.env.CARSALES_APIFY_ACTOR || 'zuzka_k~carsales-scraper';
 
 // Top AU vehicle models to seed on first deploy (make, model, year range)
 const TOP_AU_SEED_MODELS = [
@@ -294,7 +293,6 @@ async function storeVehiclePrice(listing) {
   if (!make || !year || !price || price <= 0) return;
   if (isOfferPrice(price)) return;
 
-  // Fall back to extractModel if Apify didn't provide model
   if (!model) model = extractModel(make, listing.title || '');
   if (!model) return; // without model we can't build a meaningful cohort key
 
@@ -425,40 +423,6 @@ async function fetchAutoGrabLive(make, model, year) {
   }
 }
 
-// ── Carsales Apify seeding — scrape active listings, write to VPX + cache ──
-async function scrapeCarsalesForModel(make, model, year) {
-  if (!APIFY_TOKEN) return 0;
-  const makeKey  = make.toLowerCase().trim();
-  const modelKey = model.toLowerCase().trim().replace(/\s+/g, '-');
-  try {
-    console.log(`[Carsales] Seeding ${make} ${model} ${year}...`);
-    const res = await axios.post(
-      `https://api.apify.com/v2/acts/${CARSALES_APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { make, model, yearFrom: year, yearTo: year, maxItems: 40 },
-      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
-    );
-    const items = Array.isArray(res.data) ? res.data.filter(i => i && !i.error) : [];
-    if (!items.length) { console.log(`[Carsales] No results for ${make} ${model} ${year}`); return 0; }
-
-    const samples = [];
-    for (const item of items) {
-      const price   = parsePrice(item.price || item.priceValue || 0);
-      const mileage = item.odometer || item.mileage || item.kilometres || null;
-      const state   = item.state || item.location?.state || extractState(item.location || '');
-      if (!price || price < 500 || isOfferPrice(price)) continue;
-      const normPrice = normalizePriceToRefKm(price, mileage, makeKey, modelKey);
-      samples.push({ id: item.id || item.listingId || String(Math.random()), price, mileage, normPrice, date: new Date().toISOString(), state, source: 'carsales' });
-      // Also write directly into VPX so these samples count toward confidence
-      await storeVehiclePrice({ id: item.id, make, model, year, price, mileage, location: item.location || state || '' }).catch(() => {});
-    }
-    await storeCarsalesCache(makeKey, modelKey, year, samples);
-    console.log(`[Carsales] ${make} ${model} ${year} — seeded ${samples.length} listings`);
-    return samples.length;
-  } catch (e) {
-    console.error(`[Carsales] Seed error ${make} ${model} ${year}:`, e.response?.status || e.message);
-    return 0;
-  }
-}
 
 // ── Tiered vehicle pricing orchestrator ──────────────────
 // Checks all cached sources in parallel, fetches live on cache miss.
@@ -803,32 +767,13 @@ async function sendPushover(token, user, title, message, url) {
   } catch (e) { console.error('[Pushover] Error:', e.message); }
 }
 
-// ── Apify ─────────────────────────────────────────────────
-const APIFY_TOKEN = process.env.APIFY_TOKEN;
-const APIFY_ACTOR        = 'curious_coder~facebook-marketplace';         // cheap — used for everything
-const APIFY_ACTOR_DETAIL = 'data-slayer~facebook-marketplace-details';  // expensive — vehicles only, fallback
-
-// ── Enrichment dedup cache ────────────────────────────────
-// Prevents data-slayer from re-enriching the same listing on every 30-min scan cycle.
-// Key = listingId, value = { ts }. TTL matches the shared scan cache (30 min).
-const _enrichCache = new Map();
-const ENRICH_CACHE_TTL_MS  = 6 * 60 * 60 * 1000;  // 6 hours — mileage/year/transmission don't change
-const ENRICH_REDIS_TTL_SEC = 7 * 24 * 3600;        // 7 days — persists across restarts
-
-// Types that look like vehicles in keywords/titles but don't need odometer enrichment
-const NON_VEHICLE_TYPES = ['scooter','e-bike','ebike','electric bike','electric scooter',
-  'golf cart','golf buggy','push bike','bicycle','mobility scooter'];
-
-function shouldEnrich(item) {
-  const text = ((item.marketplace_listing_title || item.title || '') + ' ' +
-                (item.redacted_description?.text || item.description || '')).toLowerCase();
-  return !NON_VEHICLE_TYPES.some(t => text.includes(t));
-}
+// ── BrightData ────────────────────────────────────────────
 
 async function brightDataKeywordScan(keyword, opts = {}) {
   if (!BRIGHTDATA_API_KEY) return [];
+  const t0  = Date.now();
+  const cap = opts.initialScan ? 25 : 15;
   try {
-    const cap = opts.initialScan ? 25 : 15;
     const res = await axios.post(
       `${BRIGHTDATA_BASE_URL}/scrape?dataset_id=${BRIGHTDATA_DATASET_ID}&include_errors=true`,
       { input: [{ keyword }] },
@@ -837,19 +782,43 @@ async function brightDataKeywordScan(keyword, opts = {}) {
         timeout: 120000,
       }
     );
-    const raw = (res.data || []).filter(r => !r.error).slice(0, cap);
+    const elapsed = Date.now() - t0;
+    const allRows = Array.isArray(res.data) ? res.data : [];
+    const errCount = allRows.filter(r => r.error).length;
+    const raw = allRows.filter(r => !r.error).slice(0, cap);
+    console.log(`[BrightData] "${keyword}" → ${raw.length}/${allRows.length} items in ${elapsed}ms (${errCount} errors)`);
+
     return raw.map(item => {
       const id = item.product_id || (() => {
         const m = (item.url || '').match(/\/item\/(\d+)\//);
         return m ? m[1] : null;
       })();
+
       const rawTitle    = item.title || '';
       const description = item.description || null;
       const rawPrice    = parsePrice(item.price);
-      const year        = item.year  || extractYear(rawTitle, description);
-      const make        = item.make  || extractMake(keyword, rawTitle);
-      const model       = item.model || extractModel(make, rawTitle);
-      const title       = normalizeVehicleTitle(rawTitle, year, make);
+
+      // Decide if this listing is vehicle-like
+      const isVehicle = isVehicleKeyword(keyword) || isVehicleListing(keyword, rawTitle, description);
+
+      // ── Layered field extraction ─────────────────────────
+      // Vehicle-specific fields
+      const year  = isVehicle ? (item.year  || extractYear(rawTitle, description))  : null;
+      const make  = isVehicle ? (item.make  || extractMake(keyword, rawTitle))       : null;
+      const model = isVehicle ? (item.model || extractModel(make, rawTitle))         : null;
+      const title = isVehicle ? normalizeVehicleTitle(rawTitle, year, make) : rawTitle;
+
+      // Log missing structured fields so we can spot BrightData gaps
+      if (isVehicle) {
+        const missing = [];
+        if (!item.year)         missing.push('year');
+        if (!item.make)         missing.push('make');
+        if (!item.model)        missing.push('model');
+        if (!item.transmission) missing.push('transmission');
+        if (missing.length) console.log(`[BrightData] id:${id} missing structured: ${missing.join(', ')} — used regex fallback`);
+      }
+
+      // Date parsing
       let listedAt, listedAtUnknown = false;
       try {
         const d = item.listing_date ? new Date(item.listing_date) : null;
@@ -859,6 +828,7 @@ async function brightDataKeywordScan(keyword, opts = {}) {
         listedAt = new Date().toISOString();
         listedAtUnknown = true;
       }
+
       return {
         id,
         title,
@@ -866,319 +836,42 @@ async function brightDataKeywordScan(keyword, opts = {}) {
         isOfferPrice:  isOfferPrice(rawPrice),
         url:           item.url || `https://www.facebook.com/marketplace/item/${id}/`,
         image:         item.image || null,
-        location:      typeof item.location === 'string' ? item.location : null,
+        location:      typeof item.location === 'string' ? item.location : (item.location?.city || null),
         description,
         keyword,
         listedAt,
         listedAtUnknown,
         foundAt:       new Date().toISOString(),
-        mileage:       extractMileage(rawTitle, description),
+        // Vehicle-specific
+        mileage:       isVehicle ? (extractMileage(rawTitle, description)) : null,
         year,
         make,
         model,
-        transmission:  item.transmission || extractTransmission(rawTitle, description),
-        fuelType:      item.fuel_type || item.fuelType || null,
-        exteriorColor: item.exterior_color || item.color || null,
-        interiorColor: item.interior_color || null,
-        bodyStyle:     item.body_style || item.bodyStyle || null,
-        trim:          item.trim || null,
-        drivetrain:    item.drivetrain || item.drive_type || null,
-        sellerType:    item.seller_type || null,
+        transmission:  isVehicle ? (item.transmission || extractTransmission(rawTitle, description)) : null,
+        fuelType:      isVehicle ? (item.fuel_type || item.fuelType || null) : null,
+        exteriorColor: isVehicle ? (item.exterior_color || item.color || null) : null,
+        interiorColor: isVehicle ? (item.interior_color || null) : null,
+        bodyStyle:     isVehicle ? (item.body_style || item.bodyStyle || null) : null,
+        trim:          isVehicle ? (item.trim || null) : null,
+        drivetrain:    isVehicle ? (item.drivetrain || item.drive_type || null) : null,
+        sellerType:    isVehicle ? (item.seller_type || null) : null,
+        // General marketplace fields
         condition:     item.condition || null,
+        brand:         !isVehicle ? (item.brand || item.manufacturer || null) : null,
+        size:          !isVehicle ? (item.size || null) : null,
+        category:      item.category || item.product_category || null,
       };
     }).filter(l => l.id);
   } catch (e) {
-    console.error(`[BrightData] Error for "${keyword}":`, e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message);
+    console.error(`[BrightData] Error for "${keyword}" (${Date.now()-t0}ms):`, e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message);
     return [];
   }
 }
 
 async function scrapeKeyword(keyword, opts = {}) {
-  if (isVehicleKeyword(keyword)) {
-    return brightDataKeywordScan(keyword, opts);
-  }
-  if (!APIFY_TOKEN) return [];
-  // Initial scan looks back 30 days, fetches up to 50, then we trim to the 20 most recent.
-  // Regular scans only look back 1 day and fetch 25.
-  const days      = opts.backfillDays || (opts.backfill ? 30 : (opts.initialScan ? 30 : 1));
-  const maxItems  = opts.initialScan ? 50 : 25;
-  // Use isVehicleKeyword (keyword only) — not isVehicleListing which checks descriptions
-  // This prevents "callaway golf clubs" triggering vehicle mode
-  const vehicleMode    = isVehicleKeyword(keyword);
-  const includeDetails = vehicleMode; // full details only for vehicle keywords
-  console.log(`[Apify] "${keyword}" — vehicle:${vehicleMode} includeDetails:${includeDetails}`);
-
-  // Use exact phrase matching — wrap multi-word keywords in quotes so
-  // "electric scooter" doesn't return plain "scooter" listings
-  const searchQuery = keyword.includes(' ') ? `"${keyword}"` : keyword;
-
-  let fbUrl;
-  if (opts.lat && opts.lng) {
-    fbUrl = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(searchQuery)}&latitude=${opts.lat}&longitude=${opts.lng}&radius=${opts.radius||50}&sortBy=creation_time_descend&daysSinceListed=${days}`;
-  } else {
-    const city = (opts.city || 'melbourne').toLowerCase().replace(/\s+/g, '');
-    fbUrl = `https://www.facebook.com/marketplace/${city}/search/?query=${encodeURIComponent(searchQuery)}&sortBy=creation_time_descend&daysSinceListed=${days}`;
-  }
-  try {
-    const res = await axios.post(
-      `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [fbUrl], maxItems, includeDetails, maxRequestRetries: 1, maxPagesPerUrl: 1 },
-      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-    );
-    // Slice to maxItems — actor ignores cap when includeDetails:true
-    const allItems = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
-    let items      = allItems.slice(0, maxItems);
-    console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
-
-    // ── Vehicle keywords: enrich with data-slayer ─────────
-    // Step 1: restore Redis-cached enrichment data (survives restarts, 7-day TTL).
-    // Step 2: only call data-slayer for listings still missing metadata after cache restore.
-    // Step 3: store fresh data-slayer results to Redis for future scans.
-    if (vehicleMode && items.length > 0) {
-      // Restore Redis-cached enrichment in parallel for all listings
-      const redisEnriched = await Promise.all(
-        items.map(item => {
-          const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
-          return id ? redisGet(K.enrich(id)).catch(() => null) : Promise.resolve(null);
-        })
-      );
-      items = items.map((item, i) => redisEnriched[i] ? { ...item, ...redisEnriched[i] } : item);
-
-      // Only escalate to data-slayer when metadata is still genuinely missing
-      const toEnrich = items.filter(item => {
-        const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
-        if (!listingId) return false;
-        const inMem = _enrichCache.get(listingId);
-        if (inMem && (Date.now() - inMem.ts) < ENRICH_CACHE_TTL_MS) return false;
-        if (!shouldEnrich(item)) return false;
-        // Use extraction functions so subtitle chips and regex count before deciding to enrich
-        const rawTitle    = item.marketplace_listing_title || item.custom_title || item.title || '';
-        const description = item.redacted_description?.text || item.description || null;
-        const hasOdo   = !!(extractMileageFromVehicleInfo(item) || extractMileage(rawTitle, description));
-        const hasYear  = !!(item.vehicle_info?.year || item.listing_vehicle_data?.year ||
-                            item.vehicleInfo?.year  || item.year || extractYear(rawTitle, description));
-        const hasTrans = !!(item.vehicle_transmission_type ||
-                            item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission ||
-                            extractTransmission(rawTitle, description));
-        return !hasOdo || !hasYear || !hasTrans;
-      });
-
-      if (toEnrich.length > 0) {
-        console.log(`[Apify] "${keyword}" — enriching ${toEnrich.length}/${items.length} via data-slayer (${items.length - toEnrich.length} already complete)`);
-        try {
-          const batchSize = 5;
-          const detailMap = {};
-          for (let b = 0; b < toEnrich.length; b += batchSize) {
-            const batch = toEnrich.slice(b, b + batchSize);
-            await Promise.all(batch.map(async item => {
-              const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
-              if (!listingId) return;
-              try {
-                const r = await axios.post(
-                  `https://api.apify.com/v2/acts/${APIFY_ACTOR_DETAIL}/run-sync-get-dataset-items`,
-                  { listingId },
-                  { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 45000 }
-                );
-                const rows = Array.isArray(r.data) ? r.data.filter(x => !x.error) : [];
-                if (rows[0]) {
-                  detailMap[listingId] = rows[0];
-                  _enrichCache.set(listingId, { ts: Date.now() });
-                  // Persist slim enrichment fields to Redis — survives restarts for 7 days
-                  const slim = {
-                    vehicle_odometer_data:   rows[0].vehicle_odometer_data   || null,
-                    vehicle_transmission_type: rows[0].vehicle_transmission_type || null,
-                    vehicle_info:            rows[0].vehicle_info || rows[0].vehicleInfo || rows[0].listing_vehicle_data || null,
-                    custom_sub_titles:       rows[0].custom_sub_titles || null,
-                    odometer:  rows[0].odometer  || null,
-                    mileage:   rows[0].mileage   || null,
-                    year:      rows[0].year      || null,
-                    make:      rows[0].make      || null,
-                    model:     rows[0].model     || null,
-                  };
-                  redisSet(K.enrich(listingId), slim, ENRICH_REDIS_TTL_SEC).catch(() => {});
-                }
-              } catch (e) {
-                console.error(`[DataSlayer] Failed for listingId ${listingId}:`, e.message);
-              }
-            }));
-            if (b + batchSize < toEnrich.length) await sleep(500);
-          }
-          const enriched = Object.keys(detailMap).length;
-          console.log(`[DataSlayer] Enriched ${enriched}/${toEnrich.length} listing(s)`);
-          if (enriched > 0) {
-            items = items.map(item => {
-              const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
-              const detail = detailMap[listingId];
-              return detail ? { ...item, ...detail } : item;
-            });
-          }
-        } catch (detailErr) {
-          console.error(`[DataSlayer] Batch error for "${keyword}":`, detailErr.message);
-        }
-      } else {
-        console.log(`[Apify] "${keyword}" — all ${items.length} vehicle listing(s) complete or cached, skipping data-slayer`);
-      }
-    }
-    return items.map(item => {
-      const id = item.id || item.listingId || String(item.marketplace_listing_id || '');
-
-      // ── Robust listedAt parsing ───────────────────────────
-      // Apify returns dates in multiple formats; we try each in order of reliability
-      let listedAt = null;
-
-      // 1. Numeric unix timestamp — check if seconds or milliseconds
-      const tsRaw = item.creation_time || item.listed_at || item.listingCreationTime
-        || item.listing_creation_time || item.created_time || null;
-      if (tsRaw && typeof tsRaw === 'number') {
-        // Timestamps < 1e10 are seconds, >= 1e10 are milliseconds
-        const ms = tsRaw < 1e10 ? tsRaw * 1000 : tsRaw;
-        const d = new Date(ms);
-        if (d.getFullYear() >= 2020 && d <= new Date()) listedAt = d.toISOString();
-      }
-
-      // 2. String date field
-      if (!listedAt) {
-        const strRaw = item.date || item.listed_at_text || null;
-        if (strRaw && typeof strRaw === 'string') {
-          const d = new Date(strRaw);
-          if (!isNaN(d.getTime()) && d.getFullYear() >= 2020) listedAt = d.toISOString();
-        }
-      }
-
-      // 3. Parse relative time string from custom_sub_titles e.g. "Listed 3 hours ago", "Listed 2 days ago"
-      if (!listedAt) {
-        const subtitles = item.custom_sub_titles || item.subtitle || item.listing_subtitle || '';
-        const subText = Array.isArray(subtitles) ? subtitles.join(' ') : String(subtitles || '');
-        const relMatch = subText.match(/(\d+)\s*(second|minute|hour|day|week|month)s?\s*ago/i);
-        if (relMatch) {
-          const amt  = parseInt(relMatch[1]);
-          const unit = relMatch[2].toLowerCase();
-          const msMap = { second: 1000, minute: 60000, hour: 3600000, day: 86400000, week: 604800000, month: 2592000000 };
-          listedAt = new Date(Date.now() - amt * (msMap[unit] || 86400000)).toISOString();
-        }
-      }
-
-      // 4. Last resort — use foundAt (now). Flag it so we know it's unreliable.
-      const listedAtUnknown = !listedAt;
-      if (!listedAt) listedAt = new Date().toISOString();
-
-      const rawTitle    = item.marketplace_listing_title || item.custom_title || item.title || keyword;
-      const description = item.redacted_description?.text || item.description || null;
-      const isVehicle   = isVehicleListing(keyword, rawTitle, description);
-      const rawPrice = parsePrice(
-        item.listing_price?.amount || item.listing_price?.formatted_amount ||
-        item.formatted_price || item.price
-      );
-
-      // Extract structured fields before building title so we can inject missing make/year
-      const year = isVehicle ? (
-        item.vehicle_info?.year || item.listing_vehicle_data?.year ||
-        item.vehicleInfo?.year || item.year ||
-        extractYear(rawTitle, description)
-      ) : null;
-      const make = isVehicle ? (
-        item.vehicle_make_display_name ||
-        item.vehicle_info?.make || item.listing_vehicle_data?.make ||
-        item.vehicleInfo?.make || item.make ||
-        extractMake(keyword, rawTitle)
-      ) : null;
-      const title = isVehicle ? normalizeVehicleTitle(rawTitle, year, make) : rawTitle;
-
-      return {
-        id,
-        title,
-        price:       rawPrice,
-        isOfferPrice: isOfferPrice(rawPrice),
-        url:         item.share_uri || item.listingUrl || item.url || `https://www.facebook.com/marketplace/item/${id}/`,
-        image:       item.primary_listing_photo_url || item.primary_listing_photo?.image?.uri || null,
-        location:    item.location_text || (typeof item.location === 'string' ? item.location : (item.location?.reverse_geocode?.city || null)),
-        description,
-        keyword,
-        listedAt,
-        listedAtUnknown,
-        foundAt:  new Date().toISOString(),
-        mileage:       isVehicle ? (extractMileageFromVehicleInfo(item) || extractMileage(rawTitle, description)) : null,
-        year,
-        make,
-        model:         isVehicle ? (
-                         item.vehicle_model_display_name ||
-                         item.vehicle_info?.model || item.listing_vehicle_data?.model ||
-                         item.vehicleInfo?.model || item.model || null
-                       ) : null,
-        transmission:  isVehicle ? (
-                         item.vehicle_transmission_type ||
-                         item.vehicle_info?.transmission || item.listing_vehicle_data?.transmission ||
-                         item.vehicleInfo?.transmission || item.transmission ||
-                         (() => {
-                           const subs = item.custom_sub_titles || item.listing_subtitle || item.subtitle || [];
-                           const arr = Array.isArray(subs) ? subs : String(subs || '').split(/[·|]/);
-                           for (const c of arr) {
-                             const t = String(c || '').toLowerCase().trim();
-                             if (t === 'automatic' || t === 'auto') return 'Automatic';
-                             if (t === 'manual') return 'Manual';
-                           }
-                           return null;
-                         })() ||
-                         extractTransmission(rawTitle, description)
-                       ) : null,
-        fuelType:      isVehicle ? (
-                         item.vehicle_fuel_type ||
-                         item.vehicle_info?.fuel_type || item.listing_vehicle_data?.fuel_type ||
-                         item.vehicle_info?.fuelType || item.vehicleInfo?.fuel_type ||
-                         item.fuel_type || item.fuelType || null
-                       ) : null,
-        exteriorColor: isVehicle ? (
-                         item.vehicle_exterior_color ||
-                         item.vehicle_info?.exterior_color || item.listing_vehicle_data?.exterior_color ||
-                         item.vehicleInfo?.exterior_color || item.exterior_color || item.color || null
-                       ) : null,
-        interiorColor: isVehicle ? (
-                         item.vehicle_info?.interior_color || item.listing_vehicle_data?.interior_color ||
-                         item.vehicleInfo?.interior_color || item.interior_color || null
-                       ) : null,
-        bodyStyle:     isVehicle ? (
-                         item.vehicle_info?.body_style || item.listing_vehicle_data?.body_style ||
-                         item.vehicleInfo?.body_style || item.body_style || item.bodyStyle || null
-                       ) : null,
-        sellerType:    isVehicle ? (item.vehicle_seller_type || null) : null,
-        condition:     item.condition || null,
-      };
-    }).filter(l => l.id);
-  } catch (e) {
-    console.error(`[Apify] Error for "${keyword}":`, e.response ? JSON.stringify(e.response.data).slice(0,200) : e.message);
-    return [];
-  }
+  return brightDataKeywordScan(keyword, opts);
 }
 
-async function scrapeListingDetail(listingUrl) {
-  if (!APIFY_TOKEN) return null;
-  try {
-    const res = await axios.post(
-      `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items`,
-      { urls: [listingUrl], maxItems: 1, includeDetails: true },
-      { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
-    );
-    const items = Array.isArray(res.data) ? res.data.filter(i => !i.error) : [];
-    if (!items.length) return null;
-    const item = items[0];
-    const desc  = item.redacted_description?.text || item.description || null;
-    const title = item.marketplace_listing_title || item.title || '';
-    const vehicleInfo = item.vehicle_info || item.vehicleInfo || item.listing_vehicle_data || {};
-    const mileageRaw = vehicleInfo.odometer || vehicleInfo.mileage || vehicleInfo.kilometers
-      || item.odometer || item.mileage || null;
-    const mileage = mileageRaw
-      ? (typeof mileageRaw === 'number' ? mileageRaw : parsePrice(String(mileageRaw)))
-      : extractMileage(title, desc);
-    const year  = vehicleInfo.year || vehicleInfo.model_year || extractYear(title, desc);
-    const make  = vehicleInfo.make || vehicleInfo.brand || extractMake('', title);
-    const model = vehicleInfo.model || null;
-    console.log(`[DetailScrape] ${listingUrl} → mileage:${mileage} year:${year} make:${make}`);
-    return { mileage, year, make, model };
-  } catch (e) {
-    console.error('[DetailScrape] Error:', e.message);
-    return null;
-  }
-}
 
 // ── Vehicle helpers ───────────────────────────────────────
 const VEHICLE_KEYWORDS = ['car','ute','van','truck','motorcycle','suv','4wd','wagon',
@@ -1203,7 +896,7 @@ function isVehicleListing(keyword, title, description) {
   return VEHICLE_KEYWORDS.some(kw => text.includes(kw));
 }
 
-// Extract mileage from Apify's structured vehicle_info block (more accurate than regex)
+// Extract mileage from structured vehicle_info block (more accurate than regex)
 function extractMileageFromVehicleInfo(item) {
   // Priority 1: subtitle chips — FB returns ["2005", "175,000 km", "Automatic"] here
   const subs = item.custom_sub_titles || item.listing_subtitle || item.subtitle || [];
@@ -1217,7 +910,7 @@ function extractMileageFromVehicleInfo(item) {
       if (val > 1000 && val < 2000000) return val;
     }
   }
-  // Priority 2: data-slayer vehicle_odometer_data — string like "250,000 km"
+  // Priority 2: vehicle_odometer_data — string like "250,000 km"
   const odoData = item.vehicle_odometer_data;
   if (odoData) {
     const parsed = parseInt(String(odoData).replace(/[^0-9]/g, ''));
@@ -1398,7 +1091,7 @@ function extractState(location) {
   return null;
 }
 
-// Fallback model extraction when Apify's structured fields are missing
+// Fallback model extraction when structured fields are missing
 function extractModel(make, title) {
   const MODELS = {
     toyota:     ['camry','corolla','hilux','rav4','landcruiser','land cruiser','prado','kluger',
@@ -1632,7 +1325,7 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     // Backfill already covered everything older — this blocks old listings
     // from trickling in on subsequent 30-min scans.
     if (initialScanCutoff && !opts.initialScan && !opts.backfill) {
-      // listedAtUnknown means Apify couldn't parse the date, so listedAt was set to
+      // listedAtUnknown means the listing date couldn't be parsed, so listedAt was set to
       // the current scrape time — it always passes the cutoff check even for old listings.
       // Treat these conservatively: mark seen and skip rather than risking a flood.
       if (listing.listedAtUnknown) {
@@ -1691,7 +1384,7 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
 }
 
 // ── Per-watch scan — shared cache across all users ────────
-// If two users watch "mercedes benz", only ONE Apify call is made per 25 mins
+// If two users watch "mercedes benz", only ONE BrightData call is made per 25 mins
 // Both users get results from the shared cache — huge cost saving
 async function scanWatchItem(watcher, opts = {}) {
   const keyword = watcher.keyword.toLowerCase();
@@ -1702,19 +1395,16 @@ async function scanWatchItem(watcher, opts = {}) {
   if (!opts.initialScan && cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
     // Serve from cache — slice to regular scan limit
     raw = (cached.listings || []).slice(0, 25);
-    console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no Apify call)`);
+    console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no BrightData call)`);
   } else {
-    // ── No cache — run Apify scan and cache results ───────
     raw = await scrapeKeyword(keyword, {
       city: watcher.location, lat: watcher.lat, lng: watcher.lng,
       radius: watcher.radius, initialScan: opts.initialScan || false
     });
-    // Save to shared cache so other users watching same keyword skip Apify
     await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
     console.log(`[SharedCache] "${keyword}" → cached ${raw.length} listings`);
 
     // ── Also distribute to ALL other users watching this keyword ──
-    // So when user 2's timer fires, they already have the results without an Apify call
     const otherWatchers = watchlist.filter(w =>
       w.keyword.toLowerCase() === keyword &&
       w.userId !== watcher.userId &&
@@ -1746,43 +1436,6 @@ async function scanWatchItem(watcher, opts = {}) {
   }
 
   const { newCount, userListings } = await distributeListingsToUser(watcher, raw, opts);
-
-  // ── Vehicle detail fallback ───────────────────────────────
-  // Only for non-vehicle keywords where includeDetails was false
-  const kwIsVehicle = isVehicleKeyword(keyword);
-  const needsDetail = !kwIsVehicle ? userListings.filter(l =>
-    l.keyword === keyword &&
-    isVehicleListing(keyword, l.title, l.description) &&
-    l.mileage === null &&
-    l.url &&
-    (Date.now() - new Date(l.foundAt).getTime()) < 2 * 60 * 1000
-  ) : [];
-
-  if (needsDetail.length > 0) {
-    console.log(`[DetailScrape] ${needsDetail.length} vehicle listing(s) under non-vehicle keyword "${keyword}"`);
-    const chunks = [];
-    for (let i = 0; i < needsDetail.length; i += 5) chunks.push(needsDetail.slice(i, i + 5));
-    let detailUpdated = false;
-    for (const chunk of chunks) {
-      const results = await Promise.all(chunk.map(l => scrapeListingDetail(l.url)));
-      results.forEach((detail, idx) => {
-        if (!detail) return;
-        const listing = chunk[idx];
-        const idx2 = userListings.findIndex(l => l.id === listing.id);
-        if (idx2 === -1) return;
-        if (detail.mileage) { userListings[idx2].mileage = detail.mileage; detailUpdated = true; }
-        if (detail.year)    { userListings[idx2].year    = detail.year;    detailUpdated = true; }
-        if (detail.make)    { userListings[idx2].make    = detail.make;    detailUpdated = true; }
-        if (detail.model)   { userListings[idx2].model   = detail.model;   detailUpdated = true; }
-      });
-      await sleep(500);
-    }
-    if (detailUpdated) {
-      const uid = watcher.userId;
-      await saveUserListings(uid, userListings);
-      console.log(`[DetailScrape] Updated ${needsDetail.length} listing(s) with vehicle details`);
-    }
-  }
 
   // Mark initial scan complete — regular scans will filter by listedAt after this timestamp
   if (opts.initialScan) {
@@ -1863,9 +1516,8 @@ if (SELF_URL) {
 // ── Routes ────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'ok',
-  apify:  APIFY_TOKEN ? 'connected' : 'NO APIFY_TOKEN SET',
+  brightdata: BRIGHTDATA_API_KEY ? 'connected' : 'NO BRIGHTDATA_API_KEY SET',
   redis:  REDIS_URL   ? 'connected' : 'not set',
-  ebay:   EBAY_APP_ID ? 'connected' : 'NO EBAY_APP_ID SET',
   watches: watchlist.length,
   timers:  Object.keys(watchTimers).length,
   lastScan: lastScanTime,
@@ -2436,27 +2088,6 @@ const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
 const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
 
-// POST /seed/vehicles — owner-only: triggers Carsales seeding for all TOP_AU_SEED_MODELS
-app.post('/seed/vehicles', authMiddleware, async (req, res) => {
-  try {
-    const user = await getUser(req.userId);
-    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
-    const total = TOP_AU_SEED_MODELS.length;
-    res.json({ ok: true, message: `Seeding ${total} vehicle cohorts in background` });
-    (async () => {
-      let seeded = 0;
-      for (const { make, model, year } of TOP_AU_SEED_MODELS) {
-        try {
-          const n = await scrapeCarsalesForModel(make, model, year);
-          if (n > 0) seeded++;
-          console.log(`[Seed/vehicles] ${make} ${model} ${year} → ${n} samples`);
-        } catch (e) { console.error(`[Seed/vehicles] ${make} ${model} ${year}:`, e.message); }
-        await sleep(2000);
-      }
-      console.log(`[Seed/vehicles] Done — ${seeded}/${total} cohorts seeded`);
-    })();
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
 
 // Redis key for push subscriptions
 const K_push = userId => `fr:push:${userId}`;
@@ -2729,8 +2360,8 @@ app.post('/dev/set-plan', authMiddleware, async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`FlipRadar backend on port ${PORT}`);
-  console.log(`Apify:      ${APIFY_TOKEN     ? 'set' : 'NO TOKEN'}`);
-  console.log(`Redis:      ${REDIS_URL        ? 'connected' : 'NOT SET'}`);
+  console.log(`BrightData: ${BRIGHTDATA_API_KEY ? 'set' : 'NO TOKEN'}`);
+  console.log(`Redis:      ${REDIS_URL           ? 'connected' : 'NOT SET'}`);
   console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
   console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
   await loadAllWatches();
