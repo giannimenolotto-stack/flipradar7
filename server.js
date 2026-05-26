@@ -1338,11 +1338,9 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     const key    = `${keyword}:${listing.id}`;
     const seenTs = seen[key];
     if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS) {
-      // During initial scan: refresh the timestamp so 48h TTL restarts from now.
-      // Prevents entries from expiring and trickling back in on future scans.
-      if (opts.initialScan) { seen[key] = Date.now(); seenModified = true; }
-      seenSkipped++;
-      continue;
+      // Initial scan always lets listings through — seen may have been populated
+      // by the recurring timer firing in the gap between watch creation and initial scan.
+      if (!opts.initialScan) { seenSkipped++; continue; }
     }
     if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
     if (watcher.minPrice && listing.price < watcher.minPrice) continue;
