@@ -1426,9 +1426,9 @@ async function scanWatchItem(watcher, opts = {}) {
   let raw;
   const cached = await redisGet(K.sharedScan(keyword));
   if (!opts.initialScan && cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
-    // Serve from cache — slice to regular scan limit
-    raw = (cached.listings || []).slice(0, 25);
-    console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no BrightData call)`);
+    // Serve from cache — no limit, serve everything cached
+    raw = cached.listings || [];
+    console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no SociaVault call)`);
   } else {
     raw = await scrapeKeyword(keyword, {
       city: watcher.location, lat: watcher.lat, lng: watcher.lng,
@@ -1722,18 +1722,23 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     startWatchTimer(item);
     console.log(`[Watch] Added "${item.keyword}" for user ${req.userId}`);
     res.json(item);
-    // Clear any stale seen entries for this keyword so the initial scan delivers fresh results
-    getUserSeen(req.userId).then(seen => {
-      const prefix = `${item.keyword}:`;
-      if (!Object.keys(seen).some(k => k.startsWith(prefix))) return;
-      const pruned = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
-      return saveUserSeen(req.userId, pruned, { merge: false }); // replace — we're removing entries
-    }).catch(() => {});
-    // Initial backfill — runs once when watch is added
-    // DO NOT also call /scan/now — that causes a double scan
-    scanWatchItem(item, { initialScan: true })
-      .then(n => console.log(`[InitialScan] "${item.keyword}" → ${n} listing(s)`))
-      .catch(e => console.error(`[InitialScan] Error:`, e.message));
+    // Clear seen entries FIRST, then scan — order matters to avoid race condition
+    // where the initial scan marks listings as seen before the clear runs
+    (async () => {
+      try {
+        const seen = await getUserSeen(req.userId);
+        const prefix = `${item.keyword}:`;
+        const pruned = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
+        await saveUserSeen(req.userId, pruned, { merge: false });
+        const cleared = Object.keys(seen).length - Object.keys(pruned).length;
+        if (cleared > 0) console.log(`[AddWatch] Cleared ${cleared} stale seen entries for "${item.keyword}"`);
+      } catch (e) { console.error('[AddWatch] seen clear error:', e.message); }
+      // Initial backfill — runs once when watch is added
+      // DO NOT also call /scan/now — that causes a double scan
+      scanWatchItem(item, { initialScan: true })
+        .then(n => console.log(`[InitialScan] "${item.keyword}" → ${n} listing(s)`))
+        .catch(e => console.error(`[InitialScan] Error:`, e.message));
+    })();
   } catch (e) { console.error('[AddWatch]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
