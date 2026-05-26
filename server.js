@@ -815,7 +815,7 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
       lng:       coords.longitude,
       radius_km: opts.radius || 50,
       limit:     10,  // most recent 10 listings only
-      sort_by:   'date_listed_desc',  // newest first
+      sort_by:   'creation_time_descend',  // newest first
     };
 
     const res = await axios.get(`${SOCIAVAULT_BASE}/search`, {
