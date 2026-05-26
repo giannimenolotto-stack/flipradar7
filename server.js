@@ -831,6 +831,8 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
     const allRows  = Object.values(listings);
     const raw      = allRows.filter(r => !r.is_sold && r.is_live !== false).slice(0, cap);
     console.log(`[SociaVault] "${keyword}" → ${raw.length}/${allRows.length} items in ${elapsed}ms`);
+    const withDesc = raw.filter(r => r.description && r.description.trim().length > 0).length;
+    console.log(`[SociaVault] "${keyword}" → ${withDesc}/${raw.length} items have description in search results`);
 
     return raw.map(item => {
       const id = item.id || (() => {
@@ -896,6 +898,38 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
 
 async function scrapeKeyword(keyword, opts = {}) {
   return sociaVaultKeywordScan(keyword, opts);
+}
+
+// Fetch full listing details from SociaVault item endpoint (1 credit)
+// Returns enriched fields: description, creation_time, all photos, attributes (condition)
+async function fetchListingDetails(listingId, listingUrl) {
+  if (!SOCIAVAULT_API_KEY || (!listingId && !listingUrl)) return null;
+  try {
+    const params = listingId ? { id: listingId } : { url: listingUrl };
+    const res = await axios.get(`${SOCIAVAULT_BASE}/item`, {
+      params,
+      headers: { 'x-api-key': SOCIAVAULT_API_KEY },
+      timeout: 15000,
+    });
+    const d = res.data?.data;
+    if (!d) return null;
+    // Extract condition from attributes array/object
+    const attrs = d.attributes ? Object.values(d.attributes) : [];
+    const conditionAttr = attrs.find(a => a.attribute_name === 'Condition');
+    // Extract all photo URLs
+    const photos = d.photos ? Object.values(d.photos).map(p => p.url).filter(Boolean) : [];
+    return {
+      description:  d.description  || null,
+      creationTime: d.creation_time || null,
+      condition:    conditionAttr?.label || null,
+      photos,
+      locationText: d.location_text || null,
+      sellerName:   d.seller?.name  || null,
+    };
+  } catch (e) {
+    console.error(`[SociaVault] fetchListingDetails error (${listingId || listingUrl}):`, e.message);
+    return null;
+  }
 }
 
 
@@ -2136,17 +2170,36 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
   try {
     if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
 
-    const { make, model, year, mileage, transmission, listingPrice, title, description, imageUrl, imageBase64, imageMime } = req.body;
+    const { make, model, year, mileage, transmission, listingPrice, title, description,
+            imageUrl, imageBase64, imageMime, listingId, listingUrl } = req.body;
     if (!listingPrice) return res.status(400).json({ error: 'listingPrice required' });
 
     const cr = await consumeAppraisal(req.userId);
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    // Fetch full listing details from SociaVault to get real description, condition, photos
+    let fullDescription = description || '';
+    let condition = null;
+    let additionalPhotos = [];
+    if (listingId || listingUrl) {
+      const details = await fetchListingDetails(listingId, listingUrl);
+      if (details) {
+        // Prefer the full scraped description over the search-result stub
+        if (details.description && details.description.length > (fullDescription?.length || 0)) {
+          fullDescription = details.description;
+        }
+        condition     = details.condition || null;
+        additionalPhotos = details.photos || [];
+        console.log(`[AI/vehicle] Fetched full details for ${listingId || listingUrl} — desc: ${fullDescription.length} chars, condition: ${condition}`);
+      }
+    }
 
     const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
     const vehicleDetails = [
       `Make/Model/Year: ${carLabel}`,
       mileage ? `Mileage: ${Number(mileage).toLocaleString()} km` : null,
       transmission ? `Transmission: ${transmission}` : null,
+      condition ? `Condition: ${condition}` : null,
       `Listing Price: $${Number(listingPrice).toLocaleString()}`,
     ].filter(Boolean).join('\n');
 
@@ -2168,7 +2221,7 @@ ${mileageGuide}
 LISTING TITLE: ${title || '(not provided)'}
 FULL LISTING DESCRIPTION:
 """
-${description || '(not provided)'}
+${fullDescription || '(not provided)'}
 """
 
 CRITICAL — READ THE DESCRIPTION CAREFULLY AND EXTRACT ALL SIGNALS BEFORE VALUING:
