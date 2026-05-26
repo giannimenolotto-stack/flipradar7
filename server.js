@@ -768,56 +768,72 @@ async function sendPushover(token, user, title, message, url) {
 }
 
 // ── BrightData ────────────────────────────────────────────
-// Pending async jobs: snapshotId → { resolve, reject, keyword, cap, timeout }
-const _bdPending = new Map();
 
-// Called by POST /brightdata/webhook when BrightData finishes a job
-function resolveBrightDataJob(snapshotId, rows) {
-  const job = _bdPending.get(snapshotId);
-  if (!job) return;
-  clearTimeout(job.timeout);
-  _bdPending.delete(snapshotId);
-  job.resolve(rows);
+// Maps common AU city/region strings → "City,State,Australia" format required by BrightData.
+// Unmapped values are passed through as-is (handles edge cases like manual city entry).
+const BD_CITY_MAP = {
+  // New South Wales
+  'sydney':          'Sydney,New South Wales,Australia',
+  'newcastle':       'Newcastle,New South Wales,Australia',
+  'wollongong':      'Wollongong,New South Wales,Australia',
+  'central coast':   'Central Coast,New South Wales,Australia',
+  // Victoria
+  'melbourne':       'Melbourne,Victoria,Australia',
+  'geelong':         'Geelong,Victoria,Australia',
+  'ballarat':        'Ballarat,Victoria,Australia',
+  'bendigo':         'Bendigo,Victoria,Australia',
+  // Queensland
+  'brisbane':        'Brisbane,Queensland,Australia',
+  'gold coast':      'Gold Coast,Queensland,Australia',
+  'sunshine coast':  'Sunshine Coast,Queensland,Australia',
+  'cairns':          'Cairns,Queensland,Australia',
+  'townsville':      'Townsville,Queensland,Australia',
+  'toowoomba':       'Toowoomba,Queensland,Australia',
+  // Western Australia
+  'perth':           'Perth,Western Australia,Australia',
+  'bunbury':         'Bunbury,Western Australia,Australia',
+  'geraldton':       'Geraldton,Western Australia,Australia',
+  // South Australia
+  'adelaide':        'Adelaide,South Australia,Australia',
+  // Tasmania
+  'hobart':          'Hobart,Tasmania,Australia',
+  'launceston':      'Launceston,Tasmania,Australia',
+  // ACT
+  'canberra':        'Canberra,Australian Capital Territory,Australia',
+  // Northern Territory
+  'darwin':          'Darwin,Northern Territory,Australia',
+};
+
+function normaliseCityForBrightData(city) {
+  if (!city) return 'Melbourne,Victoria,Australia'; // sensible AU default
+  const key = city.toLowerCase().trim();
+  return BD_CITY_MAP[key] || city; // pass through if not in map
 }
 
 async function brightDataKeywordScan(keyword, opts = {}) {
   if (!BRIGHTDATA_API_KEY) return [];
   const t0  = Date.now();
   const cap = opts.initialScan ? 25 : 15;
-  const webhookUrl = (process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || '').replace(/\/$/, '') + '/brightdata/webhook';
-
-  // This dataset only accepts keyword — city, radius, date_listed, price filters
-  // are all rejected by the API despite appearing in the BrightData UI
-  const bdInput = { keyword };
-
   try {
-    // Trigger async job — BrightData returns a snapshot_id immediately
-    const triggerRes = await axios.post(
-      `https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lvt9iwuh6fbcwmx1a&custom_output_fields=title,initial_price,final_price,currency,product_id,condition,description,location,country_code,root_category,images,seller_description,color,brand,listing_date,car_miles,timestamp,url,breadcrumbs,videos,profile_id,input,discovery_input,error,error_code,warning,warning_code&notify=url&endpoint=${encodeURIComponent(webhookUrl)}&include_errors=true&type=discover_new&discover_by=keyword`,
+    const bdInput = {
+      keyword,
+      city:        normaliseCityForBrightData(opts.city || null),
+      radius:      opts.radius || 50,
+      date_listed: '',
+    };
+    const res = await axios.post(
+      'https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lvt9iwuh6fbcwmx1a&custom_output_fields=title,initial_price,final_price,currency,product_id,condition,description,location,country_code,root_category,images,seller_description,color,brand,listing_date,car_miles,timestamp,url,breadcrumbs,videos,profile_id,input,discovery_input,error,error_code,warning,warning_code&notify=false&include_errors=true&type=discover_new&discover_by=keyword',
       { input: [bdInput] },
       {
-        headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' },
-        timeout: 30000,
+        headers: { 'Authorization': 'Bearer e7687dd0-2f08-4677-a915-57ceef4dc867', 'Content-Type': 'application/json' },
+        timeout: 120000,
       }
     );
-
-    const snapshotId = triggerRes.data?.snapshot_id;
-    if (!snapshotId) throw new Error('No snapshot_id returned from BrightData');
-    console.log(`[BrightData] "${keyword}" → job started, snapshot_id: ${snapshotId}`);
-
-    // Wait for webhook to deliver results (up to 3 minutes)
-    const rows = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        _bdPending.delete(snapshotId);
-        reject(new Error(`BrightData webhook timeout for snapshot ${snapshotId}`));
-      }, 180000);
-      _bdPending.set(snapshotId, { resolve, reject, keyword, cap, timeout });
-    });
-
     const elapsed = Date.now() - t0;
-    const errCount = rows.filter(r => r.error).length;
-    const raw = rows.filter(r => !r.error).slice(0, cap);
-    console.log(`[BrightData] "${keyword}" → ${raw.length}/${rows.length} items in ${elapsed}ms (${errCount} errors)`);
+    const allRows = Array.isArray(res.data) ? res.data : [];
+    const errCount = allRows.filter(r => r.error).length;
+    const raw = allRows.filter(r => !r.error).slice(0, cap);
+    console.log(`[BrightData] "${keyword}" → ${raw.length}/${allRows.length} items in ${elapsed}ms (${errCount} errors)`);
 
     return raw.map(item => {
       const id = item.product_id || (() => {
@@ -833,31 +849,20 @@ async function brightDataKeywordScan(keyword, opts = {}) {
       const isVehicle = isVehicleKeyword(keyword) || isVehicleListing(keyword, rawTitle, description);
 
       // ── Layered field extraction ─────────────────────────
-      // Vehicle-specific fields — BrightData only returns base fields for this dataset;
-      // structured vehicle_ fields don't exist in the schema so we extract from title/description
-      const year  = isVehicle ? extractYear(rawTitle, description)          : null;
-      const make  = isVehicle ? extractMake(keyword, rawTitle)               : null;
-      const model = isVehicle ? extractModel(make, rawTitle)                 : null;
-      const title = isVehicle ? normalizeVehicleTitle(rawTitle, year, make)  : rawTitle;
+      // Vehicle-specific fields
+      const year  = isVehicle ? (item.year  || extractYear(rawTitle, description))  : null;
+      const make  = isVehicle ? (item.make  || extractMake(keyword, rawTitle))       : null;
+      const model = isVehicle ? (item.model || extractModel(make, rawTitle))         : null;
+      const title = isVehicle ? normalizeVehicleTitle(rawTitle, year, make) : rawTitle;
 
-      // ── Layered mileage extraction ────────────────────────
-      // Layer 1: car_miles (the one structured field BrightData does return for this dataset)
-      // Layer 2: extractMileageFromVehicleInfo checks subtitle chips / odometer blocks in item
-      // Layer 3: regex/NLP over title + description
-      let mileage = null;
+      // Log missing structured fields so we can spot BrightData gaps
       if (isVehicle) {
-        if (item.car_miles) {
-          const parsed = parseInt(String(item.car_miles).replace(/[^0-9]/g, ''));
-          if (parsed > 1000 && parsed < 2000000) mileage = parsed;
-        }
-        if (!mileage) mileage = extractMileageFromVehicleInfo(item);
-        if (!mileage) mileage = extractMileage(rawTitle, description);
-
-        if (!mileage) {
-          console.log(`[Mileage] MISSING id:${id} — car_miles:${item.car_miles||'null'} title:"${rawTitle.slice(0,80)}"`);
-        } else {
-          console.log(`[Mileage] id:${id} — ${mileage.toLocaleString()} km`);
-        }
+        const missing = [];
+        if (!item.year)         missing.push('year');
+        if (!item.make)         missing.push('make');
+        if (!item.model)        missing.push('model');
+        if (!item.transmission) missing.push('transmission');
+        if (missing.length) console.log(`[BrightData] id:${id} missing structured: ${missing.join(', ')} — used regex fallback`);
       }
 
       // Date parsing
@@ -885,7 +890,7 @@ async function brightDataKeywordScan(keyword, opts = {}) {
         listedAtUnknown,
         foundAt:       new Date().toISOString(),
         // Vehicle-specific
-        mileage,
+        mileage:       isVehicle ? (item.car_miles || extractMileage(rawTitle, description)) : null,
         year,
         make,
         model,
@@ -1201,51 +1206,7 @@ function isOfferPrice(price) {
   if (s.length >= 3 && s.split('').every(c => c === s[0])) return true;
   return false;
 }
-// ── Normalise user-entered location to BrightData city format ──
-// BrightData requires a non-empty city string. Maps common AU inputs to
-// "City,State,Australia" format. Falls back to Sydney if unrecognised.
-function normaliseCityForBrightData(location) {
-  if (!location) return 'Sydney,New South Wales,Australia';
-  const loc = location.trim().toLowerCase().replace(/[.,]/g, ' ').replace(/\s+/g, ' ');
-
-  const AU_CITIES = [
-    // Sydney
-    { patterns: ['sydney', 'nsw', 'new south wales', 'parramatta', 'newcastle', 'wollongong', 'central coast'],
-      city: 'Sydney,New South Wales,Australia' },
-    // Melbourne
-    { patterns: ['melbourne', 'vic', 'victoria', 'geelong', 'ballarat', 'bendigo', 'dandenong', 'frankston'],
-      city: 'Melbourne,Victoria,Australia' },
-    // Brisbane
-    { patterns: ['brisbane', 'qld', 'queensland', 'gold coast', 'sunshine coast', 'ipswich', 'toowoomba'],
-      city: 'Brisbane,Queensland,Australia' },
-    // Perth
-    { patterns: ['perth', 'wa', 'western australia', 'fremantle', 'mandurah', 'joondalup'],
-      city: 'Perth,Western Australia,Australia' },
-    // Adelaide
-    { patterns: ['adelaide', 'sa', 'south australia', 'mount barker', 'gawler'],
-      city: 'Adelaide,South Australia,Australia' },
-    // Canberra
-    { patterns: ['canberra', 'act', 'australian capital territory'],
-      city: 'Canberra,Australian Capital Territory,Australia' },
-    // Darwin
-    { patterns: ['darwin', 'nt', 'northern territory'],
-      city: 'Darwin,Northern Territory,Australia' },
-    // Hobart
-    { patterns: ['hobart', 'tas', 'tasmania', 'launceston'],
-      city: 'Hobart,Tasmania,Australia' },
-  ];
-
-  for (const entry of AU_CITIES) {
-    if (entry.patterns.some(p => loc.includes(p))) return entry.city;
-  }
-
-  // Unknown location — return as-is and hope BrightData accepts it,
-  // or fall back to Sydney so we never send an empty/invalid value
-  const cleaned = location.trim();
-  return cleaned || 'Sydney,New South Wales,Australia';
-}
-
-
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── Shared scan cache TTL ────────────────────────────────
 const SHARED_SCAN_TTL_MS = 25 * 60 * 1000; // 25 mins — slightly under the 30min scan interval
@@ -1484,11 +1445,7 @@ async function scanWatchItem(watcher, opts = {}) {
     console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no BrightData call)`);
   } else {
     raw = await scrapeKeyword(keyword, {
-      city:      watcher.location,
-      lat:       watcher.lat,
-      lng:       watcher.lng,
-      maxPrice:  watcher.maxPrice || null,
-      minPrice:  watcher.minPrice || null,
+      city: watcher.location, lat: watcher.lat, lng: watcher.lng,
       radius: watcher.radius, initialScan: opts.initialScan || false
     });
     await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
@@ -1614,25 +1571,7 @@ app.get('/', (req, res) => res.json({
   lastScanNewListings: lastScanCount,
 }));
 
-// ── BrightData webhook — receives async scrape results ────
-// BrightData POSTs here when a snapshot_id job completes
-app.post('/brightdata/webhook', express.json({ limit: '50mb' }), (req, res) => {
-  res.sendStatus(200); // acknowledge immediately
-  try {
-    const snapshotId = req.query.snapshot_id || req.body?.snapshot_id;
-    const rows = Array.isArray(req.body) ? req.body : (req.body?.data || []);
-    if (!snapshotId) {
-      console.warn('[BrightData] Webhook received with no snapshot_id');
-      return;
-    }
-    console.log(`[BrightData] Webhook received snapshot_id:${snapshotId} rows:${rows.length}`);
-    resolveBrightDataJob(snapshotId, rows);
-  } catch (e) {
-    console.error('[BrightData] Webhook error:', e.message);
-  }
-});
-
-
+// ── Auth routes ───────────────────────────────────────────
 app.post('/auth/signup', async (req, res) => {
   try {
     const { email, password, name } = req.body;
@@ -2211,14 +2150,6 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
 
     const cr = await consumeAppraisal(req.userId);
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
-
-    // Fetch VPX market data to anchor AI output (best-effort — never blocks appraisal)
-    let vpxStats = null;
-    if (make && year) {
-      try {
-        vpxStats = await fetchBestVehiclePrice(make, model || null, parseInt(year), mileage ? parseInt(mileage) : null);
-      } catch (_) {}
-    }
 
     const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
     const vehicleDetails = [
