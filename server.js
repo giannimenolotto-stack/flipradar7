@@ -78,16 +78,21 @@ const PRICE_IDS = {
   basic_weekly:    'price_1Ta7LcPDjYUYNInHPy2AMqba',
   basic_monthly:   'price_1Ta7MLPDjYUYNInHYru4vO5M',
   basic_yearly:    'price_1Ta7MdPDjYUYNInHu5k5kiOU',
+  pro_weekly:      'price_pro_weekly_placeholder',    // TODO: replace with real Stripe price ID
+  pro_monthly:     'price_pro_monthly_placeholder',   // TODO: replace with real Stripe price ID
+  pro_yearly:      'price_pro_yearly_placeholder',    // TODO: replace with real Stripe price ID
   premium_weekly:  'price_1Ta7PsPDjYUYNInHMvbMiWvV',
   premium_monthly: 'price_1Ta7QDPDjYUYNInHDQTp70Mt',
   premium_yearly:  'price_1Ta7QSPDjYUYNInHLG2F4aT3',
 };
 const PRICE_TO_PLAN = {};
 Object.entries(PRICE_IDS).forEach(([key, priceId]) => {
-  PRICE_TO_PLAN[priceId] = key.startsWith('basic') ? 'basic' : 'premium';
+  if (key.startsWith('basic'))   PRICE_TO_PLAN[priceId] = 'basic';
+  else if (key.startsWith('pro')) PRICE_TO_PLAN[priceId] = 'pro';
+  else                            PRICE_TO_PLAN[priceId] = 'premium';
 });
-const PLAN_APPRAISAL_LIMITS = { free: 999, basic: 999, premium: 999 }; // TEMP — reset before launch
-const PLAN_WATCHLIST_LIMITS = { free: 5, basic: 5, premium: 5 }; // TEMP — reset before launch
+const PLAN_APPRAISAL_LIMITS = { free: 999, basic: 999, pro: 999, premium: 999 }; // TEMP — reset before launch
+const PLAN_WATCHLIST_LIMITS = { free: 0, basic: 2, pro: 2, premium: 5 };
 const FROM_EMAIL    = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.com>';
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
@@ -748,8 +753,9 @@ function verificationEmail(name, email, code) {
 // ── Scan intervals per plan ───────────────────────────────
 const PLAN_INTERVALS = {
   free:    null,
-  basic:   30 * 60 * 1000,
-  premium: 15 * 60 * 1000,
+  basic:   60 * 60 * 1000,  // 60 min
+  pro:     15 * 60 * 1000,  // 15 min
+  premium:  1 * 60 * 1000,  // 1 min
 };
 
 // ── In-memory state ───────────────────────────────────────
@@ -767,145 +773,84 @@ async function sendPushover(token, user, title, message, url) {
   } catch (e) { console.error('[Pushover] Error:', e.message); }
 }
 
-// ── BrightData ────────────────────────────────────────────
+// ── SociaVault ────────────────────────────────────────────
+const SOCIAVAULT_API_KEY = process.env.SOCIAVAULT_API_KEY || null;
+const SOCIAVAULT_BASE    = 'https://api.sociavault.com/v1/scrape/facebook-marketplace';
 
-// Maps common AU city/region strings → "City,State,Australia" format required by BrightData.
-// Unmapped values are passed through as-is (handles edge cases like manual city entry).
-const BD_CITY_MAP = {
-  // New South Wales
-  'sydney':          'Sydney,New South Wales,Australia',
-  'newcastle':       'Newcastle,New South Wales,Australia',
-  'wollongong':      'Wollongong,New South Wales,Australia',
-  'central coast':   'Central Coast,New South Wales,Australia',
-  // Victoria
-  'melbourne':       'Melbourne,Victoria,Australia',
-  'geelong':         'Geelong,Victoria,Australia',
-  'ballarat':        'Ballarat,Victoria,Australia',
-  'bendigo':         'Bendigo,Victoria,Australia',
-  // Queensland
-  'brisbane':        'Brisbane,Queensland,Australia',
-  'gold coast':      'Gold Coast,Queensland,Australia',
-  'sunshine coast':  'Sunshine Coast,Queensland,Australia',
-  'cairns':          'Cairns,Queensland,Australia',
-  'townsville':      'Townsville,Queensland,Australia',
-  'toowoomba':       'Toowoomba,Queensland,Australia',
-  // Western Australia
-  'perth':           'Perth,Western Australia,Australia',
-  'bunbury':         'Bunbury,Western Australia,Australia',
-  'geraldton':       'Geraldton,Western Australia,Australia',
-  // South Australia
-  'adelaide':        'Adelaide,South Australia,Australia',
-  // Tasmania
-  'hobart':          'Hobart,Tasmania,Australia',
-  'launceston':      'Launceston,Tasmania,Australia',
-  // ACT
-  'canberra':        'Canberra,Australian Capital Territory,Australia',
-  // Northern Territory
-  'darwin':          'Darwin,Northern Territory,Australia',
-};
+// Cache city → {latitude, longitude} to avoid repeated location lookups
+const _cityCoordCache = new Map();
 
-function normaliseCityForBrightData(city) {
-  if (!city) return 'Melbourne,Victoria,Australia'; // sensible AU default
-  const key = city.toLowerCase().trim();
-  return BD_CITY_MAP[key] || city; // pass through if not in map
+async function resolveCity(city) {
+  const key = (city || 'Melbourne').toLowerCase().trim();
+  if (_cityCoordCache.has(key)) return _cityCoordCache.get(key);
+  try {
+    const res = await axios.get(`${SOCIAVAULT_BASE}/location-search`, {
+      params: { query: city || 'Melbourne, Australia' },
+      headers: { 'x-api-key': SOCIAVAULT_API_KEY },
+      timeout: 10000,
+    });
+    const loc = (res.data?.locations || [])[0];
+    if (!loc) return null;
+    const coords = { latitude: loc.latitude, longitude: loc.longitude };
+    _cityCoordCache.set(key, coords);
+    return coords;
+  } catch (e) {
+    console.error('[SociaVault] Location lookup failed:', e.message);
+    return null;
+  }
 }
 
-async function brightDataKeywordScan(keyword, opts = {}) {
-  if (!BRIGHTDATA_API_KEY) return [];
+async function sociaVaultKeywordScan(keyword, opts = {}) {
+  if (!SOCIAVAULT_API_KEY) return [];
   const t0  = Date.now();
   const cap = opts.initialScan ? 25 : 15;
   try {
-    const bdInput = {
-      keyword,
-      city:        normaliseCityForBrightData(opts.city || null),
-      radius:      opts.radius || 50,
-      date_listed: '',
+    // Resolve city to coordinates
+    const city   = opts.city || 'Melbourne';
+    const coords = await resolveCity(city) || { latitude: -37.8136, longitude: 144.9631 }; // Melbourne fallback
+
+    const params = {
+      query:     keyword,
+      latitude:  coords.latitude,
+      longitude: coords.longitude,
+      radius_km: opts.radius || 50,
     };
-    const res = await axios.post(
-      'https://api.brightdata.com/trigger?customer=hl_c5b3f9c7&type=discover_new&discover_by=keyword&dataset_id=gd_lvt9iwuh6fbcwmx1a&limit_per_input=25&include_errors=true',
-      { input: [bdInput] },
-      {
-        headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' },
-        timeout: 120000,
-      }
-    );
-    const snapshotId = res.data?.snapshot_id;
-    if (!snapshotId) {
-      console.error(`[BrightData] No snapshot_id returned for "${keyword}":`, JSON.stringify(res.data).slice(0, 200));
-      return [];
-    }
-    console.log(`[BrightData] "${keyword}" → snapshot ${snapshotId}, polling...`);
 
-    // Poll until snapshot is ready (max 3 min)
-    let allRows = [];
-    const pollDeadline = Date.now() + 10 * 60 * 1000;
-    while (Date.now() < pollDeadline) {
-      await new Promise(r => setTimeout(r, 3000));
-      const snap = await axios.get(
-        `https://api.brightdata.com/datasets/v3/snapshot/${snapshotId}?format=json`,
-        { headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}` }, timeout: 30000 }
-      );
-      if (snap.data?.status === 'running') {
-        console.log(`[BrightData] "${keyword}" snapshot still running...`);
-        continue;
-      }
-      if (Array.isArray(snap.data)) {
-        allRows = snap.data;
-        break;
-      }
-      if (Array.isArray(snap.data?.results)) {
-        allRows = snap.data.results;
-        break;
-      }
-      console.log(`[BrightData] "${keyword}" unexpected snapshot shape:`, JSON.stringify(snap.data).slice(0, 200));
-      break;
-    }
+    const res = await axios.get(`${SOCIAVAULT_BASE}/search`, {
+      params,
+      headers: { 'x-api-key': SOCIAVAULT_API_KEY },
+      timeout: 30000,
+    });
 
-    const elapsed = Date.now() - t0;
-    const errCount = allRows.filter(r => r.error).length;
-    const raw = allRows.filter(r => !r.error).filter(r => !r.country_code || r.country_code === 'AU').slice(0, cap);
-    console.log(`[BrightData] "${keyword}" → ${raw.length}/${allRows.length} items in ${elapsed}ms (${errCount} errors)`);
+    const elapsed  = Date.now() - t0;
+    const listings = res.data?.data?.listings || res.data?.listings || {};
+    // SociaVault returns listings as an object with numeric keys
+    const allRows  = Object.values(listings);
+    const raw      = allRows.filter(r => !r.is_sold && r.is_live !== false).slice(0, cap);
+    console.log(`[SociaVault] "${keyword}" → ${raw.length}/${allRows.length} items in ${elapsed}ms`);
 
     return raw.map(item => {
-      const id = item.product_id || (() => {
+      const id = item.id || (() => {
         const m = (item.url || '').match(/\/item\/(\d+)\//);
         return m ? m[1] : null;
       })();
 
       const rawTitle    = item.title || '';
       const description = item.description || null;
-      const rawPrice    = parsePrice(item.price);
+      const rawPrice    = item.price?.amount ?? parsePrice(item.price);
 
       // Decide if this listing is vehicle-like
       const isVehicle = isVehicleKeyword(keyword) || isVehicleListing(keyword, rawTitle, description);
 
-      // ── Layered field extraction ─────────────────────────
-      // Vehicle-specific fields
-      const year  = isVehicle ? (item.year  || extractYear(rawTitle, description))  : null;
-      const make  = isVehicle ? (item.make  || extractMake(keyword, rawTitle))       : null;
-      const model = isVehicle ? (item.model || extractModel(make, rawTitle))         : null;
+      // Vehicle-specific fields via regex fallback (SociaVault doesn't return structured vehicle data)
+      const year  = isVehicle ? extractYear(rawTitle, description)      : null;
+      const make  = isVehicle ? extractMake(keyword, rawTitle)          : null;
+      const model = isVehicle ? extractModel(make, rawTitle)            : null;
       const title = isVehicle ? normalizeVehicleTitle(rawTitle, year, make) : rawTitle;
 
-      // Log missing structured fields so we can spot BrightData gaps
-      if (isVehicle) {
-        const missing = [];
-        if (!item.year)         missing.push('year');
-        if (!item.make)         missing.push('make');
-        if (!item.model)        missing.push('model');
-        if (!item.transmission) missing.push('transmission');
-        if (missing.length) console.log(`[BrightData] id:${id} missing structured: ${missing.join(', ')} — used regex fallback`);
-      }
-
-      // Date parsing
-      let listedAt, listedAtUnknown = false;
-      try {
-        const d = item.listing_date ? new Date(item.listing_date) : null;
-        if (!d || isNaN(d.getTime())) throw new Error();
-        listedAt = d.toISOString();
-      } catch (_) {
-        listedAt = new Date().toISOString();
-        listedAtUnknown = true;
-      }
+      // Date — SociaVault doesn't return listing_date in search results, use foundAt
+      const listedAt        = new Date().toISOString();
+      const listedAtUnknown = true;
 
       return {
         id,
@@ -913,41 +858,41 @@ async function brightDataKeywordScan(keyword, opts = {}) {
         price:         rawPrice,
         isOfferPrice:  isOfferPrice(rawPrice),
         url:           item.url || `https://www.facebook.com/marketplace/item/${id}/`,
-        image:         (Array.isArray(item.images) ? item.images[0] : item.images) || item.image || null,
-        location:      typeof item.location === 'string' ? item.location : (item.location?.city || null),
+        image:         item.primary_photo?.url || null,
+        location:      item.location?.city || item.location?.display_name || null,
         description,
         keyword,
         listedAt,
         listedAtUnknown,
         foundAt:       new Date().toISOString(),
         // Vehicle-specific
-        mileage:       isVehicle ? (item.car_miles || extractMileage(rawTitle, description)) : null,
+        mileage:       isVehicle ? (item.mileage?.value || extractMileage(rawTitle, description)) : null,
         year,
         make,
         model,
-        transmission:  isVehicle ? (item.transmission || extractTransmission(rawTitle, description)) : null,
-        fuelType:      isVehicle ? (item.fuel_type || item.fuelType || null) : null,
-        exteriorColor: isVehicle ? (item.exterior_color || item.color || null) : null,
-        interiorColor: isVehicle ? (item.interior_color || null) : null,
-        bodyStyle:     isVehicle ? (item.body_style || item.bodyStyle || null) : null,
-        trim:          isVehicle ? (item.trim || null) : null,
-        drivetrain:    isVehicle ? (item.drivetrain || item.drive_type || null) : null,
-        sellerType:    isVehicle ? (item.seller_type || null) : null,
+        transmission:  isVehicle ? extractTransmission(rawTitle, description) : null,
+        fuelType:      null,
+        exteriorColor: null,
+        interiorColor: null,
+        bodyStyle:     null,
+        trim:          null,
+        drivetrain:    null,
+        sellerType:    null,
         // General marketplace fields
         condition:     item.condition || null,
-        brand:         !isVehicle ? (item.brand || item.manufacturer || null) : null,
-        size:          !isVehicle ? (item.size || null) : null,
-        category:      item.category || item.product_category || null,
+        brand:         !isVehicle ? null : null,
+        size:          null,
+        category:      null,
       };
     }).filter(l => l.id);
   } catch (e) {
-    console.error(`[BrightData] Error for "${keyword}" (${Date.now()-t0}ms):`, e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message);
+    console.error(`[SociaVault] Error for "${keyword}" (${Date.now()-t0}ms):`, e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message);
     return [];
   }
 }
 
 async function scrapeKeyword(keyword, opts = {}) {
-  return brightDataKeywordScan(keyword, opts);
+  return sociaVaultKeywordScan(keyword, opts);
 }
 
 
@@ -2438,7 +2383,7 @@ app.post('/dev/set-plan', authMiddleware, async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`FlipRadar backend on port ${PORT}`);
-  console.log(`BrightData: ${BRIGHTDATA_API_KEY ? 'set' : 'NO TOKEN'}`);
+  console.log(`SociaVault: ${SOCIAVAULT_API_KEY ? 'set' : 'NO TOKEN — add SOCIAVAULT_API_KEY'}`);
   console.log(`Redis:      ${REDIS_URL           ? 'connected' : 'NOT SET'}`);
   console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
   console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
