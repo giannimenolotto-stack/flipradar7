@@ -310,8 +310,8 @@ function verificationEmail(name, email, code) {
 // ── Scan intervals per plan ───────────────────────────────
 const PLAN_INTERVALS = {
   free:    null,
-  basic:   30 * 60 * 1000,
-  premium: 15 * 60 * 1000,
+  basic:   60 * 60 * 1000,  // 60 mins — halves Apify runs vs 30min
+  premium: 20 * 60 * 1000,
 };
 
 // ── In-memory state ───────────────────────────────────────
@@ -329,14 +329,88 @@ async function sendPushover(token, user, title, message, url) {
   } catch (e) { console.error('[Pushover] Error:', e.message); }
 }
 
-// ── Apify ─────────────────────────────────────────────────
+// ── Apify (curious_coder — feed scanning) ─────────────────
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
-const APIFY_ACTOR        = 'curious_coder~facebook-marketplace';         // cheap — used for everything
-const APIFY_ACTOR_DETAIL = 'data-slayer~facebook-marketplace-details';  // expensive — vehicles only, on-demand
+const APIFY_ACTOR = 'curious_coder~facebook-marketplace';
 
-// ── Enrichment dedup cache ────────────────────────────────
-// Prevents data-slayer from re-enriching the same listing on every 30-min scan cycle.
-// Key = listingId, value = { ts }. TTL matches the shared scan cache (30 min).
+// ── Bright Data (vehicle detail enrichment) ───────────────
+// Replaces data-slayer. Collect by URL — returns car_miles, color, condition etc.
+// Add to Render env: BRIGHTDATA_API_KEY, BRIGHTDATA_CUSTOMER, BRIGHTDATA_DATASET_ID
+const BRIGHTDATA_API_KEY    = process.env.BRIGHTDATA_API_KEY    || null;
+const BRIGHTDATA_CUSTOMER   = process.env.BRIGHTDATA_CUSTOMER   || 'hl_c5b3f9c7';
+const BRIGHTDATA_DATASET_ID = process.env.BRIGHTDATA_DATASET_ID || 'gd_lvt9iwuh6fbcwmx1a';
+const BRIGHTDATA_BASE_URL   = 'https://api.brightdata.com/datasets/v3';
+
+// ── Bright Data helpers ───────────────────────────────────
+
+// Trigger a fresh collect-by-URL snapshot for a batch of listing URLs.
+// Returns snapshot ID immediately — results come async.
+async function brightDataTrigger(urls) {
+  const body = urls.map(url => ({ url }));
+  const res = await axios.post(
+    `${BRIGHTDATA_BASE_URL}/trigger?customer=${BRIGHTDATA_CUSTOMER}&dataset_id=${BRIGHTDATA_DATASET_ID}&include_errors=true`,
+    body,
+    { headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 30000 }
+  );
+  return res.data?.snapshot_id || null;
+}
+
+// Poll until snapshot is ready (status: ready) or timeout.
+// Bright Data typically takes 20–60s per batch.
+async function brightDataPoll(snapshotId, maxWaitMs = 120000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    await sleep(5000); // poll every 5s
+    try {
+      const res = await axios.get(
+        `${BRIGHTDATA_BASE_URL}/snapshot/${snapshotId}?format=json`,
+        { headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}` }, timeout: 15000 }
+      );
+      // When ready, Bright Data returns the data array directly
+      if (Array.isArray(res.data) && res.data.length > 0) return res.data;
+      // Check status endpoint
+      const status = res.data?.status;
+      if (status === 'failed') throw new Error(`Bright Data snapshot ${snapshotId} failed`);
+    } catch (e) {
+      if (e.response?.status === 200) throw e; // real error
+      // 404/202 = still processing, keep polling
+    }
+  }
+  throw new Error(`Bright Data snapshot ${snapshotId} timed out after ${maxWaitMs}ms`);
+}
+
+// Map a Bright Data result row to the slim enrichment object FlipRadar uses.
+// Bright Data returns: product_id, title, final_price, car_miles, color,
+// condition, location, images, listing_date, description
+function brightDataToSlim(row) {
+  const slim = {};
+  const _sv = (k, v) => { if (v != null && v !== '') slim[k] = v; };
+
+  // Core vehicle fields Bright Data returns
+  _sv('mileage',       row.car_miles ? parseInt(row.car_miles) : null);
+  _sv('exteriorColor', row.color);
+  _sv('condition',     row.condition);
+
+  // Extract year/make/model from title since Bright Data doesn't return structured fields
+  // e.g. "1991 Holden Commodore" → year=1991, make=Holden, model=Commodore
+  if (row.title) {
+    const yearMatch = row.title.match(/\b(19[5-9]\d|20[0-2]\d)\b/);
+    if (yearMatch) _sv('year', parseInt(yearMatch[1]));
+    // make/model extraction handled by existing extractModel() in item mapping
+  }
+
+  // Images — use first image as primary
+  if (Array.isArray(row.images) && row.images.length > 0) {
+    _sv('primary_listing_photo_url', row.images[0]);
+    _sv('images', row.images);
+  }
+
+  return slim;
+}
+
+
+// Prevents Bright Data from re-enriching the same listing on every scan cycle.
+// Key = listingId, value = { ts }. TTL: 6 hours — mileage/year/transmission don't change.
 const _enrichCache = new Map();
 const ENRICH_CACHE_TTL_MS  = 6 * 60 * 60 * 1000;  // 6 hours — mileage/year/transmission don't change
 const ENRICH_REDIS_TTL_SEC = 7 * 24 * 3600;        // 7 days — persists across restarts
@@ -375,9 +449,9 @@ function shouldEnrich(item) {
 async function scrapeKeyword(keyword, opts = {}) {
   if (!APIFY_TOKEN) return [];
   // Initial scan looks back 7 days, fetches up to 25 items.
-  // Regular scans look back 1 day and fetch 25.
+  // Regular scans look back 1 day and fetch 15 — reduces per-listing cost ~40%.
   const days      = opts.backfillDays || (opts.backfill ? 7 : (opts.initialScan ? 7 : 1));
-  const maxItems  = 25;
+  const maxItems  = opts.initialScan ? 25 : 15;
   // Use isVehicleKeyword (keyword only) — not isVehicleListing which checks descriptions
   // This prevents "callaway golf clubs" triggering vehicle mode
   const vehicleMode    = isVehicleKeyword(keyword);
@@ -408,11 +482,11 @@ async function scrapeKeyword(keyword, opts = {}) {
     let items      = allItems.slice(0, maxItems);
     console.log(`[Apify] "${keyword}" -> ${items.length} item(s) (of ${allItems.length} returned)`);
 
-    // ── Vehicle keywords: enrich with data-slayer ─────────
+    // ── Vehicle keywords: enrich with Bright Data ────────────
     // Step 1: restore Redis-cached enrichment data (survives restarts, 7-day TTL).
-    // Step 2: only call data-slayer for listings still missing metadata after cache restore.
-    // Step 3: store fresh data-slayer results to Redis for future scans.
-    if (vehicleMode && items.length > 0 && APIFY_ACTOR_DETAIL) {
+    // Step 2: only call Bright Data for listings still missing metadata after cache restore.
+    // Step 3: store fresh Bright Data results to Redis for future scans.
+    if (vehicleMode && items.length > 0 && BRIGHTDATA_API_KEY) {
       // Restore Redis-cached enrichment in parallel for all listings
       const redisEnriched = await Promise.all(
         items.map(item => {
@@ -434,7 +508,7 @@ async function scrapeKeyword(keyword, opts = {}) {
         return merged;
       });
 
-      // Only escalate to data-slayer when metadata is still genuinely missing
+      // Only escalate to Bright Data when metadata is still genuinely missing
       const toEnrich = items.filter(item => {
         const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
         if (!listingId) return false;
@@ -453,63 +527,48 @@ async function scrapeKeyword(keyword, opts = {}) {
         return !hasOdo || !hasYear || !hasTrans;
       });
 
-      if (toEnrich.length > 0 && APIFY_ACTOR_DETAIL) {
-        console.log(`[Apify] "${keyword}" — enriching ${toEnrich.length}/${items.length} via data-slayer (${items.length - toEnrich.length} already complete)`);
+      if (toEnrich.length > 0 && BRIGHTDATA_API_KEY) {
+        console.log(`[BrightData] "${keyword}" — enriching ${toEnrich.length} listing(s) via Bright Data collect-by-URL`);
         try {
-          const batchSize = 5;
           const detailMap = {};
-          for (let b = 0; b < toEnrich.length; b += batchSize) {
-            const batch = toEnrich.slice(b, b + batchSize);
-            await Promise.all(batch.map(async item => {
-              const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
-              if (!listingId) return;
-              try {
-                const r = await axios.post(
-                  `https://api.apify.com/v2/acts/${APIFY_ACTOR_DETAIL}/run-sync-get-dataset-items`,
-                  { listingId },
-                  { params: { token: APIFY_TOKEN }, headers: { 'Content-Type': 'application/json' }, timeout: 45000 }
-                );
-                const rows = Array.isArray(r.data) ? r.data.filter(x => !x.error) : [];
-                if (rows[0]) {
-                  detailMap[listingId] = rows[0];
-                  _enrichCache.set(listingId, { ts: Date.now() });
-                  // Persist slim enrichment fields to Redis — survives restarts for 7 days.
-                  // IMPORTANT: only store non-null values. Null entries spread onto fresh
-                  // curious_coder items would overwrite valid fields (e.g. custom_sub_titles
-                  // with mileage chips, top-level mileage). custom_sub_titles is excluded
-                  // entirely — it belongs to curious_coder, not data-slayer.
-                  const slim = {};
-                  const _sv = (k, v) => { if (v != null) slim[k] = v; };
-                  const vi = rows[0].vehicle_info || rows[0].vehicleInfo || rows[0].listing_vehicle_data || {};
-                  _sv('vehicle_odometer_data',     rows[0].vehicle_odometer_data);
-                  _sv('vehicle_transmission_type', rows[0].vehicle_transmission_type);
-                  _sv('vehicle_info',              vi);
-                  _sv('odometer',   rows[0].odometer);
-                  _sv('mileage',    rows[0].mileage);
-                  _sv('year',       rows[0].year   || vi.year);
-                  _sv('make',       rows[0].make   || vi.make);
-                  _sv('model',      rows[0].model  || vi.model);
-                  _sv('fuelType',   rows[0].vehicle_fuel_type || vi.fuel_type || vi.fuelType || rows[0].fuel_type);
-                  _sv('bodyStyle',  vi.body_style  || rows[0].body_style || rows[0].bodyStyle);
-                  _sv('trim',       vi.trim        || rows[0].trim || vi.trim_level);
-                  _sv('drivetrain', vi.drivetrain  || vi.drive_type || rows[0].drivetrain);
-                  // custom_sub_titles intentionally excluded — curious_coder owns this field
-                  redisSet(K.enrich(listingId), slim, ENRICH_REDIS_TTL_SEC).catch(() => {});
-                }
-              } catch (e) {
-                console.error(`[DataSlayer] Failed for listingId ${listingId}:`, e.message);
-              }
-            }));
-            if (b + batchSize < toEnrich.length) await sleep(500);
+          // Collect URLs for all listings needing enrichment
+          const urls = toEnrich
+            .map(item => item.url || item.listing_url ||
+              `https://www.facebook.com/marketplace/item/${item.id || item.listingId || item.marketplace_listing_id}/`)
+            .filter(Boolean);
+
+          // Trigger one Bright Data snapshot for the whole batch — one billing event
+          const snapshotId = await brightDataTrigger(urls);
+          if (!snapshotId) throw new Error('No snapshot ID returned from Bright Data');
+          console.log(`[BrightData] Snapshot triggered: ${snapshotId} — polling for results...`);
+
+          // Poll until ready (typically 20–60s)
+          const rows = await brightDataPoll(snapshotId, 120000);
+          console.log(`[BrightData] Got ${rows.length}/${urls.length} results`);
+
+          for (const row of rows) {
+            // Match result back to listing by URL or product_id
+            const listingId = row.product_id ||
+              (row.url || '').match(/\/item\/(\d+)/)?.[1] || '';
+            if (!listingId) continue;
+
+            const slim = brightDataToSlim(row);
+            if (Object.keys(slim).length === 0) continue;
+
+            detailMap[listingId] = slim;
+            _enrichCache.set(listingId, { ts: Date.now() });
+            redisSet(K.enrich(listingId), slim, ENRICH_REDIS_TTL_SEC).catch(() => {});
           }
+
           const enriched = Object.keys(detailMap).length;
-          console.log(`[DataSlayer] Enriched ${enriched}/${toEnrich.length} listing(s)`);
+          console.log(`[BrightData] Enriched ${enriched}/${toEnrich.length} listing(s)`);
+
           if (enriched > 0) {
             items = items.map(item => {
               const listingId = item.id || item.listingId || String(item.marketplace_listing_id || '');
               const detail = detailMap[listingId];
               if (!detail) return item;
-              // Non-null values from data-slayer win; never overwrite with null
+              // Non-null values from Bright Data win; never overwrite with null
               const merged = { ...item };
               for (const [k, v] of Object.entries(detail)) {
                 if (v != null) merged[k] = v;
@@ -518,10 +577,13 @@ async function scrapeKeyword(keyword, opts = {}) {
             });
           }
         } catch (detailErr) {
-          console.error(`[DataSlayer] Batch error for "${keyword}":`, detailErr.message);
+          console.error(`[BrightData] Enrichment error for "${keyword}":`, detailErr.message);
         }
+      } else if (toEnrich.length > 0) {
+        console.log(`[BrightData] No API key — skipping enrichment for ${toEnrich.length} listing(s)`);
       } else {
-        console.log(`[Apify] "${keyword}" — all ${items.length} vehicle listing(s) complete or cached, skipping data-slayer`);
+        console.log(`[Apify] "${keyword}" — all ${items.length} vehicle listing(s) complete or cached, skipping enrichment`);
+      }
       }
     }
     return items.map(item => {
@@ -1355,20 +1417,56 @@ async function scanWatchItem(watcher, opts = {}) {
   return newCount;
 }
 
-// ── Per-watch timers ──────────────────────────────────────
-const watchTimers = {};
+// ── Per-keyword shared timers ─────────────────────────────
+// One timer per UNIQUE keyword, not per watcher.
+// 10 users watching "hilux" = 1 Apify call, results distributed to all 10.
+// This is the primary cost control mechanism.
+const watchTimers  = {};  // watcherId → intervalId (kept for cleanup)
+const keywordTimers = {}; // keyword → intervalId (deduplication)
 
 function startWatchTimer(watcher) {
   if (watchTimers[watcher.id]) clearInterval(watchTimers[watcher.id]);
   const interval = PLAN_INTERVALS[getEffectivePlan(watcher)] || PLAN_INTERVALS.basic;
+  const kw = (watcher.keyword || '').toLowerCase().trim();
+
+  // If a timer already exists for this keyword, don't create another Apify call —
+  // just record that this watcher is covered by the existing keyword timer.
+  if (keywordTimers[kw]) {
+    console.log(`[Timer] "${watcher.keyword}" — sharing existing keyword timer (no extra Apify calls)`);
+    // Still need a watcher-level interval reference for cleanup on watch delete
+    watchTimers[watcher.id] = keywordTimers[kw];
+    return;
+  }
+
   console.log(`[Timer] "${watcher.keyword}" every ${interval/60000}m (${watcher.plan||'basic'})`);
-  watchTimers[watcher.id] = setInterval(() => {
-    scanWatchItem(watcher).catch(e => console.error(`[Timer] Error for "${watcher.keyword}":`, e.message));
+  const timerId = setInterval(() => {
+    // Scan once for the keyword — distributeListingsToUser handles all watchers for it
+    const allForKeyword = watchlist.filter(w => !w.paused &&
+      (w.keyword || '').toLowerCase().trim() === kw);
+    if (allForKeyword.length === 0) return;
+    // Use the first watcher's config for the scan params; results go to all
+    scanWatchItem(allForKeyword[0]).catch(e =>
+      console.error(`[Timer] Error for "${watcher.keyword}":`, e.message));
   }, interval);
+
+  keywordTimers[kw]      = timerId;
+  watchTimers[watcher.id] = timerId;
 }
 
 function stopWatchTimer(watchId) {
-  if (watchTimers[watchId]) { clearInterval(watchTimers[watchId]); delete watchTimers[watchId]; }
+  const watcher = watchlist.find(w => w.id === watchId);
+  if (watchTimers[watchId]) {
+    // Only clear the keyword timer if no other active watcher shares this keyword
+    const kw = watcher ? (watcher.keyword || '').toLowerCase().trim() : null;
+    const otherActive = kw && watchlist.some(w =>
+      w.id !== watchId && !w.paused &&
+      (w.keyword || '').toLowerCase().trim() === kw);
+    if (!otherActive && kw && keywordTimers[kw]) {
+      clearInterval(keywordTimers[kw]);
+      delete keywordTimers[kw];
+    }
+    delete watchTimers[watchId];
+  }
 }
 
 // ── Auto-pause inactive users ─────────────────────────────
@@ -1423,7 +1521,8 @@ if (SELF_URL) {
 // ── Routes ────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'ok',
-  apify:  APIFY_TOKEN     ? 'connected' : 'NO APIFY_TOKEN SET',
+  apify:      APIFY_TOKEN      ? 'connected' : 'NO APIFY_TOKEN SET',
+  brightdata: BRIGHTDATA_API_KEY ? 'connected' : 'NO BRIGHTDATA_API_KEY SET',
   redis:  REDIS_URL       ? 'connected' : 'not set',
   gemini: GEMINI_API_KEY  ? 'connected' : 'not set',
   watches: watchlist.length,
