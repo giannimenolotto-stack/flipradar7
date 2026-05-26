@@ -2175,7 +2175,22 @@ ${vehicleDetails}
 ${mileageGuide}
 
 LISTING TITLE: ${title || '(not provided)'}
-DESCRIPTION: ${description || '(not provided)'}
+FULL LISTING DESCRIPTION:
+"""
+${description || '(not provided)'}
+"""
+
+CRITICAL — READ THE DESCRIPTION CAREFULLY AND EXTRACT ALL SIGNALS BEFORE VALUING:
+- Exact variant/trim/series (e.g. GXL, Turbo, Sport, VE SS, FG XR6, TDI400) — this significantly affects value
+- Engine size and type (e.g. 3.0 diesel, V8 petrol, turbocharged) — extract from description if not in title
+- Extras or modifications (towbar, roof rack, new tyres, lift kit, ARB gear, leather, sunroof, canopy) — add value
+- Service history (full logbooks, one owner, just serviced, stamped history) — significantly adds value
+- Defects or faults (scratch, dent, rust, oil leak, engine noise, needs RWC, worn interior, cracked screen) — reduce value and flag as red flags
+- Urgency signals (moving overseas, must sell, price reduced, motivated seller) — opportunity to negotiate lower
+- Rego status (registered until X, unregistered, interstate rego) — affects buyer's immediate cost
+- Recent work done (new clutch, new brakes, timing belt replaced, new battery) — reduces buyer risk
+
+Use ALL of the above to adjust your market value estimate. A well-specced variant with full service history is worth significantly more than a base model. Missing service history or vague condition descriptions should be red flags.
 
 Use your knowledge of AU used-car pricing to estimate market value conservatively. Apply the mileage guide above when mileage is provided.
 
