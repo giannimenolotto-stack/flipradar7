@@ -822,7 +822,7 @@ async function brightDataKeywordScan(keyword, opts = {}) {
       date_listed: '',
     };
     const res = await axios.post(
-      'https://api.brightdata.com/datasets/v3/trigger?customer=hl_c5b3f9c7&type=discover_new&discover_by=keyword&dataset_id=gd_lvt9iwuh6fbcwmx1a&limit_per_input=25&include_errors=true',
+      'https://api.brightdata.com/trigger?customer=hl_c5b3f9c7&type=discover_new&discover_by=keyword&dataset_id=gd_lvt9iwuh6fbcwmx1a&limit_per_input=25&include_errors=true',
       { input: [bdInput] },
       {
         headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' },
@@ -838,9 +838,9 @@ async function brightDataKeywordScan(keyword, opts = {}) {
 
     // Poll until snapshot is ready (max 3 min)
     let allRows = [];
-    const pollDeadline = Date.now() + 3 * 60 * 1000;
+    const pollDeadline = Date.now() + 10 * 60 * 1000;
     while (Date.now() < pollDeadline) {
-      await new Promise(r => setTimeout(r, 5000));
+      await new Promise(r => setTimeout(r, 3000));
       const snap = await axios.get(
         `https://api.brightdata.com/datasets/v3/snapshot/${snapshotId}?format=json`,
         { headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}` }, timeout: 30000 }
