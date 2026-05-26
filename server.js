@@ -2250,6 +2250,11 @@ Respond in this exact JSON format (no markdown, no prose outside JSON):
       text = claudeRes.data?.content?.[0]?.text || '';
     }
 
+    // Fetch market price data to anchor AI output
+    const vpxStats = (make && model && year)
+      ? await fetchBestVehiclePrice(make, model, year, mileage).catch(() => null)
+      : null;
+
     // Parse structured JSON from AI response
     let parsed = null;
     try {
