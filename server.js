@@ -775,7 +775,7 @@ async function brightDataKeywordScan(keyword, opts = {}) {
   const cap = opts.initialScan ? 25 : 15;
   try {
     const res = await axios.post(
-      'https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lvt9iwuh6fbcwmx1a&custom_output_fields=title,initial_price,final_price,currency,product_id,condition,description,location,country_code,root_category,images,seller_description,color,brand,listing_date,car_miles,timestamp,url,breadcrumbs,videos,profile_id,input,discovery_input,error,error_code,warning,warning_code,vehicle_year,vehicle_make,vehicle_model,vehicle_transmission,vehicle_fuel_type,vehicle_odometer_data,vehicle_info,exterior_color,interior_color,body_style,trim,drivetrain,seller_type,custom_sub_titles,listing_subtitle,subtitle&notify=false&include_errors=true&type=discover_new&discover_by=keyword',
+      'https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lvt9iwuh6fbcwmx1a&custom_output_fields=title,initial_price,final_price,currency,product_id,condition,description,location,country_code,root_category,images,seller_description,color,brand,listing_date,car_miles,timestamp,url,breadcrumbs,videos,profile_id,input,discovery_input,error,error_code,warning,warning_code&notify=false&include_errors=true&type=discover_new&discover_by=keyword',
       { input: [{ keyword, city: normaliseCityForBrightData(opts.city) }] },
       {
         headers: { 'Authorization': 'Bearer e7687dd0-2f08-4677-a915-57ceef4dc867', 'Content-Type': 'application/json' },
@@ -802,26 +802,17 @@ async function brightDataKeywordScan(keyword, opts = {}) {
       const isVehicle = isVehicleKeyword(keyword) || isVehicleListing(keyword, rawTitle, description);
 
       // ── Layered field extraction ─────────────────────────
-      // Vehicle-specific fields — prefer vehicle_ prefixed fields BrightData returns
-      const year  = isVehicle ? (item.vehicle_year  || item.year  || extractYear(rawTitle, description))  : null;
-      const make  = isVehicle ? (item.vehicle_make  || item.make  || extractMake(keyword, rawTitle))       : null;
-      const model = isVehicle ? (item.vehicle_model || item.model || extractModel(make, rawTitle))         : null;
-      const title = isVehicle ? normalizeVehicleTitle(rawTitle, year, make) : rawTitle;
-
-      // Log missing structured fields so we can spot BrightData gaps
-      if (isVehicle) {
-        const missing = [];
-        if (!item.vehicle_year && !item.year)         missing.push('year');
-        if (!item.vehicle_make && !item.make)         missing.push('make');
-        if (!item.vehicle_model && !item.model)       missing.push('model');
-        if (!item.vehicle_transmission && !item.transmission) missing.push('transmission');
-        if (missing.length) console.log(`[BrightData] id:${id} missing structured: ${missing.join(', ')} — used regex fallback`);
-      }
+      // Vehicle-specific fields — BrightData only returns base fields for this dataset;
+      // structured vehicle_ fields don't exist in the schema so we extract from title/description
+      const year  = isVehicle ? extractYear(rawTitle, description)          : null;
+      const make  = isVehicle ? extractMake(keyword, rawTitle)               : null;
+      const model = isVehicle ? extractModel(make, rawTitle)                 : null;
+      const title = isVehicle ? normalizeVehicleTitle(rawTitle, year, make)  : rawTitle;
 
       // ── Layered mileage extraction ────────────────────────
-      // Layer 1a: BrightData car_miles field (direct odometer)
-      // Layer 1b: structured vehicle_info / odometer / subtitle chips
-      // Layer 2:  regex/NLP from title + description
+      // Layer 1: car_miles (the one structured field BrightData does return for this dataset)
+      // Layer 2: extractMileageFromVehicleInfo checks subtitle chips / odometer blocks in item
+      // Layer 3: regex/NLP over title + description
       let mileage = null;
       if (isVehicle) {
         if (item.car_miles) {
@@ -831,9 +822,8 @@ async function brightDataKeywordScan(keyword, opts = {}) {
         if (!mileage) mileage = extractMileageFromVehicleInfo(item);
         if (!mileage) mileage = extractMileage(rawTitle, description);
 
-        // Mileage debug logging
         if (!mileage) {
-          console.log(`[Mileage] MISSING id:${id} — car_miles:${item.car_miles||'null'} vehicle_odometer_data:${item.vehicle_odometer_data||'null'} custom_sub_titles:${JSON.stringify(item.custom_sub_titles||null)} title:"${rawTitle.slice(0,80)}"`);
+          console.log(`[Mileage] MISSING id:${id} — car_miles:${item.car_miles||'null'} title:"${rawTitle.slice(0,80)}"`);
         } else {
           console.log(`[Mileage] id:${id} — ${mileage.toLocaleString()} km`);
         }
@@ -868,8 +858,8 @@ async function brightDataKeywordScan(keyword, opts = {}) {
         year,
         make,
         model,
-        transmission:  isVehicle ? (item.vehicle_transmission || item.transmission || extractTransmission(rawTitle, description)) : null,
-        fuelType:      isVehicle ? (item.vehicle_fuel_type || item.fuel_type || item.fuelType || null) : null,
+        transmission:  isVehicle ? (item.transmission || extractTransmission(rawTitle, description)) : null,
+        fuelType:      isVehicle ? (item.fuel_type || item.fuelType || null) : null,
         exteriorColor: isVehicle ? (item.exterior_color || item.color || null) : null,
         interiorColor: isVehicle ? (item.interior_color || null) : null,
         bodyStyle:     isVehicle ? (item.body_style || item.bodyStyle || null) : null,
