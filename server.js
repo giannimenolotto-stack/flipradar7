@@ -786,17 +786,9 @@ async function brightDataKeywordScan(keyword, opts = {}) {
   const cap = opts.initialScan ? 25 : 15;
   const webhookUrl = (process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || '').replace(/\/$/, '') + '/brightdata/webhook';
 
-  // Build input — pass price filters to BrightData so it only scrapes relevant listings
-  const bdInput = {
-    keyword,
-    city: normaliseCityForBrightData(opts.city),
-  };
-  if (opts.maxPrice) bdInput.max_price = opts.maxPrice;
-  if (opts.minPrice) bdInput.min_price = opts.minPrice;
-  // Only fetch listings from the last 7 days on regular scans, 30 days on initial
-  const daysBack = opts.initialScan ? 30 : 7;
-  const dateFrom = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  bdInput.date_listed = dateFrom;
+  // This dataset only accepts keyword — city, radius, date_listed, price filters
+  // are all rejected by the API despite appearing in the BrightData UI
+  const bdInput = { keyword };
 
   try {
     // Trigger async job — BrightData returns a snapshot_id immediately
