@@ -768,25 +768,64 @@ async function sendPushover(token, user, title, message, url) {
 }
 
 // ── BrightData ────────────────────────────────────────────
+// Pending async jobs: snapshotId → { resolve, reject, keyword, cap, timeout }
+const _bdPending = new Map();
+
+// Called by POST /brightdata/webhook when BrightData finishes a job
+function resolveBrightDataJob(snapshotId, rows) {
+  const job = _bdPending.get(snapshotId);
+  if (!job) return;
+  clearTimeout(job.timeout);
+  _bdPending.delete(snapshotId);
+  job.resolve(rows);
+}
 
 async function brightDataKeywordScan(keyword, opts = {}) {
   if (!BRIGHTDATA_API_KEY) return [];
   const t0  = Date.now();
   const cap = opts.initialScan ? 25 : 15;
+  const webhookUrl = (process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || '').replace(/\/$/, '') + '/brightdata/webhook';
+
+  // Build input — pass price filters to BrightData so it only scrapes relevant listings
+  const bdInput = {
+    keyword,
+    city: normaliseCityForBrightData(opts.city),
+  };
+  if (opts.maxPrice) bdInput.max_price = opts.maxPrice;
+  if (opts.minPrice) bdInput.min_price = opts.minPrice;
+  // Only fetch listings from the last 7 days on regular scans, 30 days on initial
+  const daysBack = opts.initialScan ? 30 : 7;
+  const dateFrom = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  bdInput.date_listed = dateFrom;
+
   try {
-    const res = await axios.post(
-      `https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lvt9iwuh6fbcwmx1a&custom_output_fields=title,initial_price,final_price,currency,product_id,condition,description,location,country_code,root_category,images,seller_description,color,brand,listing_date,car_miles,timestamp,url,breadcrumbs,videos,profile_id,input,discovery_input,error,error_code,warning,warning_code&notify=false&include_errors=true&type=discover_new&discover_by=keyword&limit=${cap}`,
-      { input: [{ keyword, city: normaliseCityForBrightData(opts.city) }] },
+    // Trigger async job — BrightData returns a snapshot_id immediately
+    const triggerRes = await axios.post(
+      `https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lvt9iwuh6fbcwmx1a&custom_output_fields=title,initial_price,final_price,currency,product_id,condition,description,location,country_code,root_category,images,seller_description,color,brand,listing_date,car_miles,timestamp,url,breadcrumbs,videos,profile_id,input,discovery_input,error,error_code,warning,warning_code&notify=url&endpoint=${encodeURIComponent(webhookUrl)}&include_errors=true&type=discover_new&discover_by=keyword`,
+      { input: [bdInput] },
       {
-        headers: { 'Authorization': 'Bearer e7687dd0-2f08-4677-a915-57ceef4dc867', 'Content-Type': 'application/json' },
-        timeout: 120000,
+        headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' },
+        timeout: 30000,
       }
     );
+
+    const snapshotId = triggerRes.data?.snapshot_id;
+    if (!snapshotId) throw new Error('No snapshot_id returned from BrightData');
+    console.log(`[BrightData] "${keyword}" → job started, snapshot_id: ${snapshotId}`);
+
+    // Wait for webhook to deliver results (up to 3 minutes)
+    const rows = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        _bdPending.delete(snapshotId);
+        reject(new Error(`BrightData webhook timeout for snapshot ${snapshotId}`));
+      }, 180000);
+      _bdPending.set(snapshotId, { resolve, reject, keyword, cap, timeout });
+    });
+
     const elapsed = Date.now() - t0;
-    const allRows = Array.isArray(res.data) ? res.data : [];
-    const errCount = allRows.filter(r => r.error).length;
-    const raw = allRows.filter(r => !r.error).slice(0, cap);
-    console.log(`[BrightData] "${keyword}" → ${raw.length}/${allRows.length} items in ${elapsed}ms (${errCount} errors)`);
+    const errCount = rows.filter(r => r.error).length;
+    const raw = rows.filter(r => !r.error).slice(0, cap);
+    console.log(`[BrightData] "${keyword}" → ${raw.length}/${rows.length} items in ${elapsed}ms (${errCount} errors)`);
 
     return raw.map(item => {
       const id = item.product_id || (() => {
@@ -1453,7 +1492,11 @@ async function scanWatchItem(watcher, opts = {}) {
     console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no BrightData call)`);
   } else {
     raw = await scrapeKeyword(keyword, {
-      city: watcher.location, lat: watcher.lat, lng: watcher.lng,
+      city:      watcher.location,
+      lat:       watcher.lat,
+      lng:       watcher.lng,
+      maxPrice:  watcher.maxPrice || null,
+      minPrice:  watcher.minPrice || null,
       radius: watcher.radius, initialScan: opts.initialScan || false
     });
     await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
@@ -1579,7 +1622,25 @@ app.get('/', (req, res) => res.json({
   lastScanNewListings: lastScanCount,
 }));
 
-// ── Auth routes ───────────────────────────────────────────
+// ── BrightData webhook — receives async scrape results ────
+// BrightData POSTs here when a snapshot_id job completes
+app.post('/brightdata/webhook', express.json({ limit: '50mb' }), (req, res) => {
+  res.sendStatus(200); // acknowledge immediately
+  try {
+    const snapshotId = req.query.snapshot_id || req.body?.snapshot_id;
+    const rows = Array.isArray(req.body) ? req.body : (req.body?.data || []);
+    if (!snapshotId) {
+      console.warn('[BrightData] Webhook received with no snapshot_id');
+      return;
+    }
+    console.log(`[BrightData] Webhook received snapshot_id:${snapshotId} rows:${rows.length}`);
+    resolveBrightDataJob(snapshotId, rows);
+  } catch (e) {
+    console.error('[BrightData] Webhook error:', e.message);
+  }
+});
+
+
 app.post('/auth/signup', async (req, res) => {
   try {
     const { email, password, name } = req.body;
