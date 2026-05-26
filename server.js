@@ -822,17 +822,48 @@ async function brightDataKeywordScan(keyword, opts = {}) {
       date_listed: '',
     };
     const res = await axios.post(
-      'https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lvt9iwuh6fbcwmx1a&custom_output_fields=title,initial_price,final_price,currency,product_id,condition,description,location,country_code,root_category,images,seller_description,color,brand,listing_date,car_miles,timestamp,url,breadcrumbs,videos,profile_id,input,discovery_input,error,error_code,warning,warning_code&notify=false&include_errors=true&type=discover_new&discover_by=keyword',
+      'https://api.brightdata.com/datasets/v3/trigger?customer=hl_c5b3f9c7&type=discover_new&discover_by=keyword&dataset_id=gd_lvt9iwuh6fbcwmx1a&limit_per_input=25&include_errors=true',
       { input: [bdInput] },
       {
-        headers: { 'Authorization': 'Bearer e7687dd0-2f08-4677-a915-57ceef4dc867', 'Content-Type': 'application/json' },
+        headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' },
         timeout: 120000,
       }
     );
+    const snapshotId = res.data?.snapshot_id;
+    if (!snapshotId) {
+      console.error(`[BrightData] No snapshot_id returned for "${keyword}":`, JSON.stringify(res.data).slice(0, 200));
+      return [];
+    }
+    console.log(`[BrightData] "${keyword}" → snapshot ${snapshotId}, polling...`);
+
+    // Poll until snapshot is ready (max 3 min)
+    let allRows = [];
+    const pollDeadline = Date.now() + 3 * 60 * 1000;
+    while (Date.now() < pollDeadline) {
+      await new Promise(r => setTimeout(r, 5000));
+      const snap = await axios.get(
+        `https://api.brightdata.com/datasets/v3/snapshot/${snapshotId}?format=json`,
+        { headers: { 'Authorization': `Bearer ${BRIGHTDATA_API_KEY}` }, timeout: 30000 }
+      );
+      if (snap.data?.status === 'running') {
+        console.log(`[BrightData] "${keyword}" snapshot still running...`);
+        continue;
+      }
+      if (Array.isArray(snap.data)) {
+        allRows = snap.data;
+        break;
+      }
+      if (Array.isArray(snap.data?.results)) {
+        allRows = snap.data.results;
+        break;
+      }
+      console.log(`[BrightData] "${keyword}" unexpected snapshot shape:`, JSON.stringify(snap.data).slice(0, 200));
+      break;
+    }
+
     const elapsed = Date.now() - t0;
-    const allRows = Array.isArray(res.data) ? res.data : [];
     const errCount = allRows.filter(r => r.error).length;
-    const raw = allRows.filter(r => !r.error).slice(0, cap);
+    const raw = allRows.filter(r => !r.error).filter(r => !r.country_code || r.country_code === 'AU').slice(0, cap);
     console.log(`[BrightData] "${keyword}" → ${raw.length}/${allRows.length} items in ${elapsed}ms (${errCount} errors)`);
 
     return raw.map(item => {
@@ -1444,7 +1475,6 @@ async function scanWatchItem(watcher, opts = {}) {
     raw = (cached.listings || []).slice(0, 25);
     console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no BrightData call)`);
   } else {
-    console.log('[Scan] watcher fields:', JSON.stringify({ location: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius }));
     raw = await scrapeKeyword(keyword, {
       city: watcher.location, lat: watcher.lat, lng: watcher.lng,
       radius: watcher.radius, initialScan: opts.initialScan || false
