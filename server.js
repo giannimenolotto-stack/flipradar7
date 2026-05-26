@@ -803,7 +803,7 @@ async function resolveCity(city) {
 async function sociaVaultKeywordScan(keyword, opts = {}) {
   if (!SOCIAVAULT_API_KEY) return [];
   const t0  = Date.now();
-  const cap = opts.initialScan ? 25 : 15;
+  const cap = opts.initialScan ? 10 : 15;
   try {
     // Resolve city to coordinates
     const city   = opts.city || 'Melbourne';
@@ -1343,6 +1343,13 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     }
     if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
     if (watcher.minPrice && listing.price < watcher.minPrice) continue;
+    // Vehicle filters
+    if (watcher.minYear && listing.year && listing.year < watcher.minYear) continue;
+    if (watcher.maxYear && listing.year && listing.year > watcher.maxYear) continue;
+    if (watcher.minKms  && listing.mileage && listing.mileage < watcher.minKms) continue;
+    if (watcher.maxKms  && listing.mileage && listing.mileage > watcher.maxKms) continue;
+    if (watcher.transmission && listing.transmission &&
+        listing.transmission.toLowerCase() !== watcher.transmission.toLowerCase()) continue;
 
     // On regular scans: drop listings posted before the initial scan completed.
     // Backfill already covered everything older — this blocks old listings
@@ -1694,7 +1701,13 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
       plan:     watchPlan,
       pushoverToken: pushoverToken || null,
       pushoverUser:  pushoverUser  || null,
-      excludeWords,  // stored on watch — used to filter listings before saving
+      excludeWords,
+      // Vehicle-specific filters
+      minYear:       req.body.minYear       ? parseInt(req.body.minYear)       : null,
+      maxYear:       req.body.maxYear       ? parseInt(req.body.maxYear)       : null,
+      minKms:        req.body.minKms        ? parseInt(req.body.minKms)        : null,
+      maxKms:        req.body.maxKms        ? parseInt(req.body.maxKms)        : null,
+      transmission:  req.body.transmission  ? req.body.transmission.trim()     : null, // 'auto', 'manual', or null
       paused:    false,
       addedAt:   new Date().toISOString(),
       lastScanned: null,
@@ -1721,21 +1734,30 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
   } catch (e) { console.error('[AddWatch]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
-// PATCH /watchlist/:id — update exclude words on existing watch
+// PATCH /watchlist/:id — update watch filters
 app.patch('/watchlist/:id', authMiddleware, async (req, res) => {
   try {
     const watch = await getWatch(req.params.id);
     if (!watch || watch.userId !== req.userId)
       return res.status(404).json({ error: 'Not found' });
-    const { excludeWords } = req.body;
-    if (Array.isArray(excludeWords)) {
+
+    const { excludeWords, minYear, maxYear, minKms, maxKms, transmission, minPrice, maxPrice } = req.body;
+
+    if (Array.isArray(excludeWords))
       watch.excludeWords = excludeWords.map(w => w.toLowerCase().trim()).filter(Boolean);
-      await saveWatch(watch);
-      // Update in-memory watchlist too
-      const idx = watchlist.findIndex(w => w.id === req.params.id);
-      if (idx !== -1) watchlist[idx].excludeWords = watch.excludeWords;
-    }
-    res.json({ ok: true, excludeWords: watch.excludeWords });
+    if (minPrice  !== undefined) watch.minPrice  = minPrice  ? parseInt(minPrice)  : null;
+    if (maxPrice  !== undefined) watch.maxPrice  = maxPrice  ? parseInt(maxPrice)  : null;
+    if (minYear   !== undefined) watch.minYear   = minYear   ? parseInt(minYear)   : null;
+    if (maxYear   !== undefined) watch.maxYear   = maxYear   ? parseInt(maxYear)   : null;
+    if (minKms    !== undefined) watch.minKms    = minKms    ? parseInt(minKms)    : null;
+    if (maxKms    !== undefined) watch.maxKms    = maxKms    ? parseInt(maxKms)    : null;
+    if (transmission !== undefined) watch.transmission = transmission ? transmission.trim() : null;
+
+    await saveWatch(watch);
+    const idx = watchlist.findIndex(w => w.id === req.params.id);
+    if (idx !== -1) watchlist[idx] = { ...watchlist[idx], ...watch };
+
+    res.json({ ok: true, watch });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
