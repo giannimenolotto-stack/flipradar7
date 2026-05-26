@@ -1444,6 +1444,7 @@ async function scanWatchItem(watcher, opts = {}) {
     raw = (cached.listings || []).slice(0, 25);
     console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no BrightData call)`);
   } else {
+    console.log('[Scan] watcher fields:', JSON.stringify({ location: watcher.location, lat: watcher.lat, lng: watcher.lng, radius: watcher.radius }));
     raw = await scrapeKeyword(keyword, {
       city: watcher.location, lat: watcher.lat, lng: watcher.lng,
       radius: watcher.radius, initialScan: opts.initialScan || false
