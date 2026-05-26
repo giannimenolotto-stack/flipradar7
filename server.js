@@ -803,7 +803,7 @@ async function resolveCity(city) {
 async function sociaVaultKeywordScan(keyword, opts = {}) {
   if (!SOCIAVAULT_API_KEY) return [];
   const t0  = Date.now();
-  const cap = opts.initialScan ? 10 : 15;
+  const cap = opts.initialScan ? 10 : 10;
   try {
     // Resolve city to coordinates
     const city   = opts.city || 'Melbourne';
@@ -814,6 +814,7 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
       lat:       coords.latitude,
       lng:       coords.longitude,
       radius_km: opts.radius || 50,
+      limit:     10,  // most recent 10 listings only
     };
 
     const res = await axios.get(`${SOCIAVAULT_BASE}/search`, {
