@@ -1549,8 +1549,8 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
       sort_by:     'creation_time_descend',  // newest first
       ...(opts.initialScan ? { date_listed: 'last_7_days' } : {}),
       // Pass price filters to SociaVault so all 24 results are already in range
-      ...(opts.minPrice ? { price_min: opts.minPrice } : {}),
-      ...(opts.maxPrice ? { price_max: opts.maxPrice } : {}),
+      ...(opts.minPrice ? { min_price: opts.minPrice } : {}),
+      ...(opts.maxPrice ? { max_price: opts.maxPrice } : {}),
     };
 
     const res = await axios.get(`${SOCIAVAULT_BASE}/search`, {
@@ -2120,8 +2120,8 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     // Price range filter — only applies when the user has set a min/max
     // Listings with no price or placeholder prices ($1, $1234 etc) always pass through
     // unless they fall outside an explicitly set range that includes real prices
-    if (watcher.maxPrice && listing.price && !listing.isOfferPrice && listing.price > watcher.maxPrice) { dropMaxPrice++; continue; }
-    if (watcher.minPrice && listing.price && !listing.isOfferPrice && listing.price < watcher.minPrice) { dropMinPrice++; continue; }
+    if (watcher.maxPrice && listing.price && listing.price > watcher.maxPrice) { dropMaxPrice++; continue; }
+    if (watcher.minPrice && listing.price && listing.price < watcher.minPrice) { dropMinPrice++; continue; }
     // Vehicle filters
     if (watcher.minYear && listing.year && listing.year < watcher.minYear) continue;
     if (watcher.maxYear && listing.year && listing.year > watcher.maxYear) continue;
