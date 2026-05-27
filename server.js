@@ -1537,10 +1537,10 @@ function verificationEmail(name, email, code) {
 
 // ── Scan intervals per plan ───────────────────────────────
 const PLAN_INTERVALS = {
-  free:    20 * 60 * 1000,  // 20 min
-  basic:   20 * 60 * 1000,  // 20 min
-  pro:     20 * 60 * 1000,  // 20 min
-  premium: 20 * 60 * 1000,  // 20 min
+  free:    2 * 60 * 60 * 1000,  // 2 hours
+  basic:   2 * 60 * 60 * 1000,  // 2 hours
+  pro:     2 * 60 * 60 * 1000,  // 2 hours
+  premium: 2 * 60 * 60 * 1000,  // 2 hours
 };
 
 // ── In-memory state ───────────────────────────────────────
@@ -2024,7 +2024,7 @@ function isOfferPrice(price) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── Shared scan cache TTL ────────────────────────────────
-const SHARED_SCAN_TTL_MS = 25 * 60 * 1000; // 25 mins — slightly under the 30min scan interval
+const SHARED_SCAN_TTL_MS = 110 * 60 * 1000; // 110 mins — slightly under the 2hr scan interval
 
 // ── Distribute raw listings to a single user ─────────────
 async function distributeListingsToUser(watcher, raw, opts = {}) {
