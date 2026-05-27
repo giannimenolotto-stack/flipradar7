@@ -1022,9 +1022,11 @@ async function saveUserSeen(userId, seen, { merge = true } = {}) {
 // ── Our own scan price history ────────────────────────────
 // Every time we see a listing for a keyword, store its price
 async function storeScanPrice(keyword, listing) {
-  if (!listing.price || listing.price <= 0) return;
-  if (listing.isOfferPrice) return;
-  // Write to PostgreSQL — the only pricing store
+  // Only write to DB if the listing has a real price.
+  // Offer prices ($1, $1234 placeholders) and no-price listings
+  // show in the feed but are never stored in Neon — the DB is
+  // purely for price intelligence and we don't want noise in it.
+  if (!listing.price || listing.price <= 0 || listing.isOfferPrice) return;
   upsertListingToDB({ ...listing, keyword }).catch(() => {});
 }
 
@@ -2016,7 +2018,9 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
   }
 
   let seenSkipped = 0;
-  let seenModified = false; // tracks whether seen map changed without a new listing (Fix C)
+  let seenModified = false;
+  // Debug counters — logged at end to show exactly where listings went
+  let dropMaxPrice = 0, dropMinPrice = 0;
   // On regular scans (after initial scan completed), drop any listing that was
   // posted before the initial scan finished — those should have been caught then.
   // This stops old listings trickling in on every 30-min scan.
@@ -2032,8 +2036,11 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
       // by the recurring timer firing in the gap between watch creation and initial scan.
       if (!opts.initialScan) { seenSkipped++; continue; }
     }
-    if (watcher.maxPrice && listing.price > watcher.maxPrice) continue;
-    if (watcher.minPrice && listing.price < watcher.minPrice) continue;
+    // Price range filter — only applies when the user has set a min/max
+    // Listings with no price or placeholder prices ($1, $1234 etc) always pass through
+    // unless they fall outside an explicitly set range that includes real prices
+    if (watcher.maxPrice && listing.price && !listing.isOfferPrice && listing.price > watcher.maxPrice) { dropMaxPrice++; continue; }
+    if (watcher.minPrice && listing.price && !listing.isOfferPrice && listing.price < watcher.minPrice) { dropMinPrice++; continue; }
     // Vehicle filters
     if (watcher.minYear && listing.year && listing.year < watcher.minYear) continue;
     if (watcher.maxYear && listing.year && listing.year > watcher.maxYear) continue;
@@ -2042,25 +2049,12 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     if (watcher.transmission && listing.transmission &&
         listing.transmission.toLowerCase() !== watcher.transmission.toLowerCase()) continue;
 
-    // On regular scans: drop listings posted before the initial scan completed.
-    // Backfill already covered everything older — this blocks old listings
-    // from trickling in on subsequent 30-min scans.
-    if (initialScanCutoff && !opts.initialScan && !opts.backfill) {
-      // listedAtUnknown means the listing date couldn't be parsed, so listedAt was set to
-      // the current scrape time — it always passes the cutoff check even for old listings.
-      // Treat these conservatively: mark seen and skip rather than risking a flood.
-      if (listing.listedAtUnknown) {
-        seen[key] = Date.now();
-        seenModified = true;
-        continue;
-      }
-      const listedTs = listing.listedAt ? new Date(listing.listedAt).getTime() : null;
-      if (listedTs && listedTs < initialScanCutoff) {
-        seen[key] = Date.now();
-        seenModified = true;
-        continue;
-      }
-    }
+    // SociaVault never returns a listing date in search results — listedAtUnknown is
+    // always true. The seen cache (48h TTL, keyed by listing ID) is the only reliable
+    // deduplication mechanism. We do NOT drop listings based on date — if a listing ID
+    // hasn't been seen before, it passes through regardless of when it was posted.
+    // On recurring scans, the seen check at the top of this loop already handles
+    // deduplication — any listing seen in the last 48h is skipped there.
 
     seen[key] = Date.now();
 
@@ -2090,6 +2084,13 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
       tag:    `listing-${listing.id}`,
     }).catch(() => {});
     await sleep(300);
+  }
+
+  // Log the breakdown so we can see exactly where listings went
+  const totalIn = relevant.length;
+  const totalOut = newCount;
+  if (totalIn > 0) {
+    console.log(`[Distribute] "${keyword}" → ${totalIn} in, ${totalOut} new, ${seenSkipped} already seen, ${dropMaxPrice + dropMinPrice} outside price range`);
   }
 
   if (newCount > 0) {
