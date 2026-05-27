@@ -107,8 +107,12 @@ async function initDB() {
         -- bit 5: price above category ceiling
         -- bit 6: spam signals
 
-        in_price_pool   BOOLEAN DEFAULT TRUE
+        in_price_pool   BOOLEAN DEFAULT TRUE,
         -- FALSE if any quality flag set — never used in price calculations
+
+        -- ── Price drop tracking ───────────────────────────
+        previous_price    INTEGER,               -- price before the drop
+        price_dropped_at  TIMESTAMPTZ            -- when the drop was detected
       );
 
       -- ── Indexes ───────────────────────────────────────────
@@ -205,6 +209,8 @@ async function initDB() {
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS seen_count INTEGER DEFAULT 1',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS in_price_pool BOOLEAN DEFAULT TRUE',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS previous_price INTEGER',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_dropped_at TIMESTAMPTZ',
     ];
     for (const sql of migrations) {
       await pool.query(sql).catch(() => {});
@@ -865,6 +871,8 @@ const K = {
   // Appraisal result cache — keyed by listing ID (most specific) or content hash
   appraisalById:   (listingId) => `fr:apr:id:${listingId}`,
   appraisalByHash: (hash)      => `fr:apr:h:${hash}`,
+  // Price history per listing — tracks last known price for drop detection
+  listingPrice:    (id)        => `fr:lp:${id}`,
 };
 
 // ── Auth ──────────────────────────────────────────────────
@@ -1071,6 +1079,52 @@ async function aiExtractVehicleFields(title, keyword) {
   } catch (e) {
     console.error('[AIExtract] Error:', e.message);
     return null;
+  }
+}
+
+// ── Price drop detection ─────────────────────────────────
+// Checks the last known price for a listing against the current price.
+// If the price dropped, flags the listing and persists to Neon.
+// Stored in Redis with a 14-day TTL — long enough to catch slow drops.
+const PRICE_TTL_SECS = 14 * 24 * 3600;
+
+async function checkPriceDrop(listing) {
+  if (!listing.id || !listing.price || listing.isOfferPrice) return listing;
+  try {
+    const key      = K.listingPrice(listing.id);
+    const lastData = await redisGet(key);
+    const lastPrice = lastData?.price || null;
+
+    // Store current price for next scan
+    await redisSet(key, { price: listing.price, seenAt: Date.now() }, PRICE_TTL_SECS);
+
+    // No previous price — first time we've seen this listing
+    if (!lastPrice || lastPrice === listing.price) return listing;
+
+    // Price went up or stayed same — not a drop
+    if (listing.price >= lastPrice) return listing;
+
+    // Price dropped — flag it
+    const dropAmount  = lastPrice - listing.price;
+    const dropPercent = Math.round((dropAmount / lastPrice) * 100);
+    console.log(`[PriceDrop] ${listing.title?.slice(0,40)} — $${lastPrice} → $${listing.price} (-$${dropAmount}, -${dropPercent}%)`);
+
+    // Update Neon with previous price
+    pool.query(
+      `UPDATE listings SET previous_price = $1, price_dropped_at = NOW() WHERE listing_id = $2`,
+      [lastPrice, listing.id]
+    ).catch(() => {});
+
+    return {
+      ...listing,
+      priceDropped:  true,
+      previousPrice: lastPrice,
+      dropAmount,
+      dropPercent,
+    };
+  } catch (e) {
+    console.error('[PriceDrop] Error:', e.message);
+    return listing;
   }
 }
 
@@ -2118,17 +2172,20 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     ? new Date(watcher.initialScanCompletedAt).getTime()
     : null;
 
-  for (const listing of relevant) {
-    // ── Always write to Neon DB regardless of seen/price/filter status ──
-    // The DB is market intelligence — we want every real-priced listing,
-    // not just ones that are new to this user or within their price range.
+  for (let listing of relevant) {
+    // ── Check for price drop + write to Neon DB ───────────
+    // Price drop check runs first — enriches the listing object with
+    // priceDropped/previousPrice flags before anything else sees it.
+    listing = await checkPriceDrop(listing);
     storeScanPrice(keyword, listing).catch(() => {});
 
     const key    = `${keyword}:${listing.id}`;
     const seenTs = seen[key];
-    if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS) {
-      // Initial scan always lets listings through — seen may have been populated
-      // by the recurring timer firing in the gap between watch creation and initial scan.
+
+    // Price-dropped listings always get through to the feed even if seen before
+    // — the user needs to know the price changed
+    const isPriceDrop = listing.priceDropped && listing.price < (listing.previousPrice || Infinity);
+    if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS && !isPriceDrop) {
       if (!opts.initialScan) { seenSkipped++; continue; }
     }
     // Price range filter — only applies when the user has set a min/max
@@ -2141,13 +2198,6 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     if (watcher.maxKms  && listing.mileage && listing.mileage > watcher.maxKms) continue;
     if (watcher.transmission && listing.transmission &&
         listing.transmission.toLowerCase() !== watcher.transmission.toLowerCase()) continue;
-
-    // SociaVault never returns a listing date in search results — listedAtUnknown is
-    // always true. The seen cache (48h TTL, keyed by listing ID) is the only reliable
-    // deduplication mechanism. We do NOT drop listings based on date — if a listing ID
-    // hasn't been seen before, it passes through regardless of when it was posted.
-    // On recurring scans, the seen check at the top of this loop already handles
-    // deduplication — any listing seen in the last 48h is skipped there.
 
     seen[key] = Date.now();
 
@@ -2162,14 +2212,20 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     const pToken   = watcher.pushoverToken || process.env.PUSHOVER_TOKEN;
     const pUser    = watcher.pushoverUser  || process.env.PUSHOVER_USER;
     const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
+    const dropStr  = listing.priceDropped
+      ? ` 🔻 Price dropped from $${listing.previousPrice} (-$${listing.dropAmount})`
+      : '';
+    const pushTitle = listing.priceDropped
+      ? `💸 Price Drop: ${keyword}`
+      : `FlipRadar: ${keyword}`;
     // Pushover notification (if configured)
-    await sendPushover(pToken, pUser, `FlipRadar: ${keyword}`, `${listing.title}\n${priceStr}`, listing.url);
+    await sendPushover(pToken, pUser, pushTitle, `${listing.title}\n${priceStr}${dropStr}`, listing.url);
     // Web push notification — works even when app is closed, no extra app needed
     sendWebPush(watcher.userId, {
-      title:  `FlipRadar: ${listing.title}`,
-      body:   `${priceStr} · ${listing.location || keyword}`,
-      url:    listing.url,
-      tag:    `listing-${listing.id}`,
+      title: pushTitle,
+      body:  `${priceStr}${dropStr} · ${listing.location || keyword}`,
+      url:   listing.url,
+      tag:   `listing-${listing.id}`,
     }).catch(() => {});
     await sleep(300);
   }
@@ -3174,6 +3230,39 @@ app.get('/auth/plan', authMiddleware, async (req, res) => {
       appraisalsLimit:     limit === Infinity ? -1 : limit,
       watchlistLimit:      PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
     });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /onboarding — tells the frontend what state the user is in
+// Used to show/hide onboarding screen and tips
+app.get('/onboarding', authMiddleware, async (req, res) => {
+  try {
+    const user    = await getUser(req.userId);
+    const watches = await getUserWatches(req.userId);
+    const listings = await getUserListings(req.userId);
+    res.json({
+      hasWatches:    watches.length > 0,
+      watchCount:    watches.length,
+      hasListings:   listings.length > 0,
+      listingCount:  listings.length,
+      plan:          getEffectivePlan(user),
+      watchLimit:    PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
+      // Steps completed
+      steps: {
+        addedWatch:    watches.length > 0,
+        gotListings:   listings.length > 0,
+        usedAppraisal: (user.appraisalsToday || 0) > 0 || user.appraisalDate != null,
+      },
+    });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /listings/price-drops — listings that have dropped in price recently
+app.get('/listings/price-drops', authMiddleware, async (req, res) => {
+  try {
+    const listings = await getUserListings(req.userId);
+    const drops = listings.filter(l => l.priceDropped && l.previousPrice);
+    res.json(drops);
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
