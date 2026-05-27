@@ -1471,7 +1471,10 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
       radius_km:   opts.radius || 50,
       count:       cap,
       sort_by:     'creation_time_descend',  // newest first
-      ...(opts.initialScan ? { date_listed: 'last_7_days' } : {}),  // seed with last 7 days, recurring just gets newest
+      ...(opts.initialScan ? { date_listed: 'last_7_days' } : {}),
+      // Pass price filters to SociaVault so all 24 results are already in range
+      ...(opts.minPrice ? { price_min: opts.minPrice } : {}),
+      ...(opts.maxPrice ? { price_max: opts.maxPrice } : {}),
     };
 
     const res = await axios.get(`${SOCIAVAULT_BASE}/search`, {
@@ -2121,7 +2124,9 @@ async function scanWatchItem(watcher, opts = {}) {
   } else {
     raw = await scrapeKeyword(keyword, {
       city: watcher.location, lat: watcher.lat, lng: watcher.lng,
-      radius: watcher.radius, initialScan: opts.initialScan || false
+      radius: watcher.radius, initialScan: opts.initialScan || false,
+      minPrice: watcher.minPrice || null,
+      maxPrice: watcher.maxPrice || null,
     });
     await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
     console.log(`[SharedCache] "${keyword}" → cached ${raw.length} listings`);
