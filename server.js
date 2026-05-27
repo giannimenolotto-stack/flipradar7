@@ -2110,6 +2110,11 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     : null;
 
   for (const listing of relevant) {
+    // ── Always write to Neon DB regardless of seen/price/filter status ──
+    // The DB is market intelligence — we want every real-priced listing,
+    // not just ones that are new to this user or within their price range.
+    storeScanPrice(keyword, listing).catch(() => {});
+
     const key    = `${keyword}:${listing.id}`;
     const seenTs = seen[key];
     if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS) {
@@ -2118,8 +2123,6 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
       if (!opts.initialScan) { seenSkipped++; continue; }
     }
     // Price range filter — only applies when the user has set a min/max
-    // Listings with no price or placeholder prices ($1, $1234 etc) always pass through
-    // unless they fall outside an explicitly set range that includes real prices
     if (watcher.maxPrice && listing.price && listing.price > watcher.maxPrice) { dropMaxPrice++; continue; }
     if (watcher.minPrice && listing.price && listing.price < watcher.minPrice) { dropMinPrice++; continue; }
     // Vehicle filters
@@ -2138,8 +2141,6 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     // deduplication — any listing seen in the last 48h is skipped there.
 
     seen[key] = Date.now();
-
-    storeScanPrice(keyword, listing).catch(() => {});
 
     if (!userListings.find(l => l.id === listing.id)) {
       userListings.unshift(listing);
