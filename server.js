@@ -3423,6 +3423,17 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
       '- roiPercent < 0% → PASS',
       '- A $300 profit on a $4000 car is FAIR, not GOOD DEAL. Be honest.',
       '',
+      'NEGATIVE PROFIT RULE — critical:',
+      'If your calculation produces a negative profit (you would lose money flipping this):',
+      '- DO NOT show a negative estimatedProfit — set it to 0',
+      '- DO NOT show a negative roiPercent — set it to 0',
+      '- Set estimatedResellLow to approximately the listing price (what you paid)',
+      '- Set estimatedResellHigh to listing price plus 3–5% at most',
+      '- The message to the user is: you would need to sell for roughly what you paid just to break even',
+      '- Set verdict to PASS and dealScore to 15 or lower',
+      '- The oneLiner should honestly say something like "You would need to sell for at least $X just to break even after costs"',
+      '- Do not invent profit that does not exist',
+      '',
       'Broken/project cars: if listing mentions "spares or repairs", "not running", "blown", "needs work", "as-is" — set isBrokenOrProject true, provide repairEstimate, cap verdict at FAIR unless post-repair ROI is exceptional.',
       '',
       'Respond ONLY in this exact JSON format (no markdown, no text outside JSON):',
@@ -3522,9 +3533,16 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
         parsed.low                  = dbResult.marketLow;
         parsed.median               = dbResult.marketMedian;
         parsed.high                 = dbResult.marketHigh;
-        parsed.estimatedProfit      = Math.max(0, realisticProfit);
-        parsed.roiPercent           = listingPrice > 0
-          ? Math.round((realisticProfit / listingPrice) * 100) : 0;
+        if (realisticProfit <= 0) {
+          // Negative flip — set resell to around what was paid, profit to 0
+          parsed.estimatedProfit      = 0;
+          parsed.roiPercent           = 0;
+          parsed.estimatedResellLow   = listingPrice;
+          parsed.estimatedResellHigh  = Math.round(listingPrice * 1.04);
+        } else {
+          parsed.estimatedProfit      = Math.round(realisticProfit);
+          parsed.roiPercent           = Math.round((realisticProfit / listingPrice) * 100);
+        }
 
         // Verdict anchored to realistic ROI after all costs
         if      (parsed.roiPercent >= 30) { parsed.verdict = 'STEAL';     parsed.dealScore = Math.min(95, Math.max(parsed.dealScore || 0, 85)); }
