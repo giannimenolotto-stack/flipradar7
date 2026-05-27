@@ -1407,10 +1407,10 @@ function verificationEmail(name, email, code) {
 
 // ── Scan intervals per plan ───────────────────────────────
 const PLAN_INTERVALS = {
-  free:    null,
-  basic:   60 * 60 * 1000,  // 60 min
-  pro:     15 * 60 * 1000,  // 15 min
-  premium:  1 * 60 * 1000,  // 1 min
+  free:    20 * 60 * 1000,  // 20 min
+  basic:   20 * 60 * 1000,  // 20 min
+  pro:     20 * 60 * 1000,  // 20 min
+  premium: 20 * 60 * 1000,  // 20 min
 };
 
 // ── In-memory state ───────────────────────────────────────
