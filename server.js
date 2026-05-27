@@ -1627,7 +1627,16 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
       };
     }).filter(l => l.id);
   } catch (e) {
-    console.error(`[SociaVault] Error for "${keyword}" (${Date.now()-t0}ms):`, e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message);
+    const status = e.response?.status;
+    if (status === 503 || status === 502 || status === 504) {
+      console.warn(`[SociaVault] "${keyword}" — server unavailable (${status}), will retry next scan`);
+    } else if (status === 402) {
+      console.error(`[SociaVault] OUT OF CREDITS — top up at sociavault.com/dashboard`);
+    } else if (status === 401) {
+      console.error(`[SociaVault] INVALID API KEY — check SOCIAVAULT_API_KEY in Render env vars`);
+    } else {
+      console.error(`[SociaVault] Error for "${keyword}" (${Date.now()-t0}ms):`, e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message);
+    }
     return [];
   }
 }
@@ -2144,12 +2153,9 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
 
     if (!userListings.find(l => l.id === listing.id)) {
       userListings.unshift(listing);
-      userListings.sort((a, b) => {
-        // Push listings with unknown dates to the bottom
-        if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
-        if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
-        return new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt);
-      });
+      userListings.sort((a, b) =>
+        new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt)
+      );
       if (userListings.length > 500) userListings.length = 500;
     }
     newCount++;
@@ -2913,9 +2919,7 @@ app.get('/listings', authMiddleware, async (req, res) => {
     }
     result = [...result].sort((a, b) => {
         // Push listings with unknown dates to the bottom
-        if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
-        if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
-        return new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt);
+        return new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt);
       });
     res.json(result);
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
@@ -2953,9 +2957,7 @@ app.post('/listings/unblock', authMiddleware, async (req, res) => {
       listings.unshift({ ...listing, foundAt: new Date().toISOString() });
       listings.sort((a, b) => {
         // Push listings with unknown dates to the bottom
-        if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
-        if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
-        return new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt);
+        return new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt);
       });
       await saveUserListings(req.userId, listings);
     }
