@@ -65,7 +65,7 @@ async function initDB() {
         body_style      TEXT,   -- e.g. 'sedan', 'wagon', 'ute', 'hatch', 'van'
         year            INTEGER,-- manufacture year
         year_band       TEXT,   -- bucketed: e.g. '2006-2010', '2011-2013'
-        mileage         INTEGER,-- odometer in km
+        kms             INTEGER,-- odometer reading in km
         mileage_band    TEXT,   -- bucketed: e.g. '0-50k', '50k-100k', '100k-150k', '150k-200k', '200k+'
         transmission    TEXT,   -- 'auto' | 'manual'
         fuel_type       TEXT,   -- 'petrol' | 'diesel' | 'hybrid' | 'electric'
@@ -189,6 +189,8 @@ async function initDB() {
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS variant TEXT',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS body_style TEXT',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS year_band TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER',
+      "ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER",
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS mileage_band TEXT',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS fuel_type TEXT',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS engine TEXT',
@@ -202,6 +204,7 @@ async function initDB() {
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS quality_flags INTEGER DEFAULT 0',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS seen_count INTEGER DEFAULT 1',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS in_price_pool BOOLEAN DEFAULT TRUE',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER',
     ];
     for (const sql of migrations) {
       await pool.query(sql).catch(() => {});
@@ -354,8 +357,8 @@ function enrichVehicleIdentity(listing) {
   const bodyStyle = listing.body_style || extractBodyStyleFromTitle(title, desc);
   const fuelType  = listing.fuel_type  || extractFuelTypeFromTitle(title, desc);
   const engine    = listing.engine     || extractEngineFromTitle(title, desc);
-  const yearBand  = listing.year       ? bandYear(listing.year)       : null;
-  const mileageBand = listing.mileage  ? bandMileage(listing.mileage) : 'unknown';
+  const yearBand    = listing.year ? bandYear(listing.year)   : null;
+  const mileageBand = listing.kms  ? bandMileage(listing.kms) : 'unknown';
   const transmission = listing.transmission
     ? (listing.transmission.toLowerCase().includes('man') ? 'manual' : 'auto')
     : null;
@@ -364,12 +367,13 @@ function enrichVehicleIdentity(listing) {
     ...listing,
     series,
     variant,
-    body_style:  bodyStyle,
-    fuel_type:   fuelType,
+    body_style:   bodyStyle,
+    fuel_type:    fuelType,
     engine,
-    year_band:   yearBand,
+    year_band:    yearBand,
     mileage_band: mileageBand,
     transmission,
+    // kms stays as-is from the listing object
   };
 }
 
@@ -421,7 +425,7 @@ function scoreListingQuality(listing) {
   if (PLACEHOLDER_TITLES.test(listing.title || '')) flags |= 64;
 
   // Vehicle-specific: mileage sanity (> 900k km is almost certainly a data error)
-  if (listing.mileage && listing.mileage > 900000) flags |= 8;
+  if (listing.kms && listing.kms > 900000) flags |= 8;
 
   // Determine quality label
   let quality = 'ok';
@@ -449,7 +453,7 @@ async function upsertListingToDB(rawListing) {
         (listing_id, title, description, price, is_offer_price, location, state,
          seller_name, image_url, url, keyword, category,
          make, model, series, variant, body_style, year, year_band,
-         mileage, mileage_band, transmission, fuel_type, engine,
+         kms, mileage_band, transmission, fuel_type, engine,
          price_quality, quality_flags, in_price_pool,
          listed_at, scraped_at, last_seen_at, is_active, listing_status, seen_count)
       VALUES (
@@ -469,7 +473,7 @@ async function upsertListingToDB(rawListing) {
         series         = COALESCE(EXCLUDED.series,      listings.series),
         variant        = COALESCE(EXCLUDED.variant,     listings.variant),
         body_style     = COALESCE(EXCLUDED.body_style,  listings.body_style),
-        mileage        = COALESCE(EXCLUDED.mileage,     listings.mileage),
+        kms            = COALESCE(EXCLUDED.kms,          listings.kms),
         mileage_band   = COALESCE(EXCLUDED.mileage_band,listings.mileage_band),
         fuel_type      = COALESCE(EXCLUDED.fuel_type,   listings.fuel_type),
         engine         = COALESCE(EXCLUDED.engine,      listings.engine),
@@ -498,7 +502,7 @@ async function upsertListingToDB(rawListing) {
       listing.body_style    || null,
       listing.year          || null,
       listing.year_band     || null,
-      listing.mileage       || null,
+      listing.kms           || null,
       listing.mileage_band  || null,
       listing.transmission  || null,
       listing.fuel_type     || null,
@@ -1021,13 +1025,85 @@ async function saveUserSeen(userId, seen, { merge = true } = {}) {
 
 // ── Our own scan price history ────────────────────────────
 // Every time we see a listing for a keyword, store its price
+// ── AI field extraction for DB storage ───────────────────
+// Called when regex extraction missed key fields from the title.
+// Uses a cheap single AI call to pull year, kms, make, model,
+// series, variant from the raw title — only fires when needed.
+async function aiExtractVehicleFields(title, keyword) {
+  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
+  try {
+    const prompt = [
+      'Extract vehicle details from this Australian Facebook Marketplace listing title.',
+      'Return ONLY valid JSON, no markdown, no extra text.',
+      `Title: "${title}"`,
+      'Search keyword: "' + keyword + '"',
+      '{',
+      '  "year": number or null,',
+      '  "make": "brand name or null",',
+      '  "model": "model name or null",',
+      '  "series": "generation code e.g. VE, FG, GU, NP, BF or null",',
+      '  "variant": "trim level e.g. SS, XR6, SV6, Calais, SR5 or null",',
+      '  "kms": number or null,',
+      '  "transmission": "auto or manual or null",',
+      '  "body_style": "sedan/wagon/ute/hatch/suv/van/coupe or null",',
+      '  "fuel_type": "petrol/diesel/hybrid/electric or null",',
+      '  "engine": "e.g. 3.6L V6 or null"',
+      '}',
+    ].join('\n');
+
+    let text = '';
+    if (GEMINI_API_KEY) {
+      const res = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
+      );
+      text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else {
+      const res = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001', max_tokens: 300,
+        messages: [{ role: 'user', content: prompt }],
+      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 10000 });
+      text = res.data?.content?.[0]?.text || '';
+    }
+    const match = text.match(/\{[\s\S]*\}/);
+    return match ? JSON.parse(match[0]) : null;
+  } catch (e) {
+    console.error('[AIExtract] Error:', e.message);
+    return null;
+  }
+}
+
 async function storeScanPrice(keyword, listing) {
   // Only write to DB if the listing has a real price.
-  // Offer prices ($1, $1234 placeholders) and no-price listings
-  // show in the feed but are never stored in Neon — the DB is
-  // purely for price intelligence and we don't want noise in it.
   if (!listing.price || listing.price <= 0 || listing.isOfferPrice) return;
-  upsertListingToDB({ ...listing, keyword }).catch(() => {});
+
+  // For vehicle listings, fill in missing fields with AI if regex missed them.
+  // Only fires when key fields are absent — most titles regex just fine.
+  let enriched = { ...listing, keyword };
+  const isVehicle = listing.make || isVehicleKeyword(keyword);
+
+  if (isVehicle && (!listing.year || !listing.kms || !listing.make || !listing.model)) {
+    const aiFields = await aiExtractVehicleFields(listing.title, keyword).catch(() => null);
+    if (aiFields) {
+      enriched = {
+        ...enriched,
+        year:         enriched.year         || aiFields.year         || null,
+        make:         enriched.make         || aiFields.make         || null,
+        model:        enriched.model        || aiFields.model        || null,
+        series:       enriched.series       || aiFields.series       || null,
+        variant:      enriched.variant      || aiFields.variant      || null,
+        kms:          enriched.kms          || aiFields.kms          || null,
+        transmission: enriched.transmission || aiFields.transmission || null,
+        body_style:   enriched.body_style   || aiFields.body_style   || null,
+        fuel_type:    enriched.fuel_type    || aiFields.fuel_type    || null,
+        engine:       enriched.engine       || aiFields.engine       || null,
+      };
+      console.log(`[AIExtract] "${listing.title.slice(0,50)}" → year:${enriched.year} kms:${enriched.kms} make:${enriched.make} model:${enriched.model} series:${enriched.series}`);
+    }
+  }
+
+  upsertListingToDB(enriched).catch(() => {});
 }
 
 // VPX / Carsales / AutoGrab removed — FlipRadar DB is the only pricing source
@@ -1283,11 +1359,11 @@ function buildVehicleVerdict(listingPrice, priceSource, mileage) {
   else if (dealScore >= 55) demandLevel = '📈 Moderate';
   else                      demandLevel = '📉 Low';
 
-  if (!mileageAdjusted)            dealScore = Math.max(0, dealScore - 8);
-  if (mileage && mileage > 200000) dealScore = Math.max(0, dealScore - 5);
+  if (!mileageAdjusted)          dealScore = Math.max(0, dealScore - 8);
+  if (mileage && mileage > 200000) dealScore = Math.max(0, dealScore - 5);  // mileage param = kms value
 
   const carLabel         = [year, make, model].filter(Boolean).join(' ');
-  const mileageWarning   = !mileageAdjusted ? ' Mileage not listed — actual value may vary.' : '';
+  const mileageWarning   = !mileageAdjusted ? ' Kms not listed — actual value may vary.' : '';
   const whyItsWorth      = `Based on comparable ${carLabel} listings currently on the AU market.${mileageWarning}`;
 
   return {
@@ -1515,6 +1591,11 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
       const listedAt        = new Date().toISOString();
       const listedAtUnknown = true;
 
+      // Extract series and variant from title for vehicle listings
+      const series  = isVehicle ? extractSeriesFromTitle(make, model, rawTitle) : null;
+      const variant = isVehicle ? extractVariantFromTitle(rawTitle)             : null;
+      const kms     = isVehicle ? (item.mileage?.value || extractMileage(rawTitle, description)) : null;
+
       return {
         id,
         title,
@@ -1528,23 +1609,20 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
         listedAt,
         listedAtUnknown,
         foundAt:       new Date().toISOString(),
-        // Vehicle-specific
-        mileage:       isVehicle ? (item.mileage?.value || extractMileage(rawTitle, description)) : null,
+        // Vehicle-specific — renamed mileage → kms throughout
+        kms,
         year,
         make,
         model,
+        series,
+        variant,
         transmission:  isVehicle ? extractTransmission(rawTitle, description) : null,
-        fuelType:      null,
-        exteriorColor: null,
-        interiorColor: null,
-        bodyStyle:     null,
-        trim:          null,
-        drivetrain:    null,
-        sellerType:    null,
+        body_style:    isVehicle ? extractBodyStyleFromTitle(rawTitle, description) : null,
+        fuel_type:     isVehicle ? extractFuelTypeFromTitle(rawTitle, description) : null,
+        engine:        isVehicle ? extractEngineFromTitle(rawTitle, description)   : null,
         // General marketplace fields
         condition:     item.condition || null,
-        brand:         !isVehicle ? null : null,
-        size:          null,
+        brand:         null,
         category:      null,
       };
     }).filter(l => l.id);
@@ -2047,8 +2125,8 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     // Vehicle filters
     if (watcher.minYear && listing.year && listing.year < watcher.minYear) continue;
     if (watcher.maxYear && listing.year && listing.year > watcher.maxYear) continue;
-    if (watcher.minKms  && listing.mileage && listing.mileage < watcher.minKms) continue;
-    if (watcher.maxKms  && listing.mileage && listing.mileage > watcher.maxKms) continue;
+    if (watcher.minKms  && listing.kms && listing.kms < watcher.minKms) continue;
+    if (watcher.maxKms  && listing.kms && listing.kms > watcher.maxKms) continue;
     if (watcher.transmission && listing.transmission &&
         listing.transmission.toLowerCase() !== watcher.transmission.toLowerCase()) continue;
 
@@ -3273,7 +3351,7 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
       `Make/Model/Year: ${carLabel}`,
       req.body.series  ? `Series: ${req.body.series}`   : null,
       req.body.variant ? `Variant: ${req.body.variant}` : null,
-      mileage     ? `Mileage: ${Number(mileage).toLocaleString()} km` : null,
+      mileage     ? `Kms: ${Number(mileage).toLocaleString()} km` : null,
       transmission ? `Transmission: ${transmission}` : null,
       condition    ? `Condition: ${condition}` : null,
       `Listing Price: $${Number(listingPrice).toLocaleString()}`,
@@ -3281,7 +3359,7 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
 
     const mileageGuide = [
       '',
-      'MILEAGE DEPRECIATION GUIDE (AU market — use when interpolating from cohort data):',
+      'KMS DEPRECIATION GUIDE (AU market — use when interpolating from cohort data):',
       '- Under 80,000 km:    premium — add 10–20% above cohort median',
       '- 80,000–130,000 km:  normal use — at cohort median',
       '- 130,000–180,000 km: moderate discount (~10–20% below median)',
@@ -3312,7 +3390,21 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
       '- Urgency signals (must sell, moving, price reduced) — negotiation leverage',
       '- Rego status (registered until X, unregistered, interstate) — affects buyer cost',
       '',
-      'Flip guidance: deduct ~8% for selling fees and ~$200–500 for detailing/prep. Only call STEAL if margin is genuinely exceptional after all costs.',
+      'REALISTIC FLIP COSTS — deduct ALL of these before calling it profitable:',
+      '- Selling fees: 0% on FB Marketplace but factor in 5–8% if listing on Gumtree/Carsales',
+      '- Detailing/clean: $150–400 depending on condition',
+      '- Minor repairs (if any): $200–1000 — be conservative, things always cost more than expected',
+      '- Rego/RWC if unregistered: $300–800',
+      '- Time holding cost: the longer it sits, the less profit — price to sell in 1–2 weeks max',
+      '- Realistic sell price: you will NOT sell at market median — price 5–10% BELOW median to move it fast',
+      '',
+      'estimatedResellLow = realistic fast-sale price (10% below median, priced to sell in days)',
+      'estimatedResellHigh = best case if patient (at or just below median)',
+      'estimatedProfit = estimatedResellLow MINUS listingPrice MINUS all costs above — this is what you actually pocket',
+      'roiPercent = estimatedProfit / listingPrice — if this is under 10% call it FAIR, under 0% call it PASS',
+      '',
+      'Do NOT call STEAL unless profit after ALL costs is >30% ROI. Do NOT call GOOD DEAL unless profit after ALL costs is >15% ROI.',
+      'A $500 profit on a $5000 car is FAIR at best — be honest.',
       '',
       'Broken/project cars: if listing mentions "spares or repairs", "not running", "blown", "needs work", "as-is" — set isBrokenOrProject true, provide repairEstimate, cap verdict at FAIR unless post-repair ROI is exceptional.',
       '',
@@ -3401,16 +3493,28 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
         parsed.low                  = dbResult.marketLow;
         parsed.median               = dbResult.marketMedian;
         parsed.high                 = dbResult.marketHigh;
-        const feeAdj = dbResult.marketMedian * 0.92;
-        parsed.estimatedProfit = Math.max(0, Math.round(feeAdj - listingPrice));
-        parsed.roiPercent = dbResult.marketMedian > 0
-          ? Math.round(((feeAdj - listingPrice) / listingPrice) * 100) : 0;
-        // Re-anchor verdict/score to corrected ROI
-        if      (parsed.roiPercent >= 50) { parsed.verdict = 'STEAL';     parsed.dealScore = Math.max(parsed.dealScore || 0, 88); }
-        else if (parsed.roiPercent >= 30) { parsed.verdict = 'GOOD DEAL'; parsed.dealScore = Math.max(parsed.dealScore || 0, 72); }
-        else if (parsed.roiPercent >= 15) { parsed.verdict = 'GOOD DEAL'; parsed.dealScore = Math.max(parsed.dealScore || 0, 58); }
-        else if (parsed.roiPercent >= 0)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(parsed.dealScore || 55, 55); }
-        else                              { parsed.verdict = 'PASS';      parsed.dealScore = Math.min(parsed.dealScore || 30, 30); }
+        // Realistic sell price = 10% below median (priced to actually sell, not sit)
+        const realisticSellPrice = Math.round(dbResult.marketMedian * 0.90);
+        // Realistic costs: detailing + minor prep (conservative estimate)
+        const flipCosts = listingPrice < 5000 ? 300 : listingPrice < 15000 ? 500 : 800;
+        const realisticProfit = realisticSellPrice - listingPrice - flipCosts;
+
+        parsed.estimatedResellLow   = realisticSellPrice;
+        parsed.estimatedResellHigh  = Math.round(dbResult.marketMedian * 0.97); // best case just under median
+        parsed.estimatedMarketValue = dbResult.marketMedian;
+        parsed.low                  = dbResult.marketLow;
+        parsed.median               = dbResult.marketMedian;
+        parsed.high                 = dbResult.marketHigh;
+        parsed.estimatedProfit      = Math.max(0, realisticProfit);
+        parsed.roiPercent           = listingPrice > 0
+          ? Math.round((realisticProfit / listingPrice) * 100) : 0;
+
+        // Verdict anchored to realistic ROI after all costs
+        if      (parsed.roiPercent >= 30) { parsed.verdict = 'STEAL';     parsed.dealScore = Math.min(95, Math.max(parsed.dealScore || 0, 85)); }
+        else if (parsed.roiPercent >= 15) { parsed.verdict = 'GOOD DEAL'; parsed.dealScore = Math.min(84, Math.max(parsed.dealScore || 0, 65)); }
+        else if (parsed.roiPercent >= 5)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(64, Math.max(parsed.dealScore || 0, 45)); }
+        else if (parsed.roiPercent >= 0)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(44, 40); }
+        else                              { parsed.verdict = 'PASS';      parsed.dealScore = Math.min(parsed.dealScore || 25, 25); }
       }
 
       // Strip internal fields — never send to user
