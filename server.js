@@ -67,6 +67,9 @@ const K = {
   vpx:   (make, model, year) => `fr:vpx:${make}:${model}:${year}`,
   csales:(make, model, year) => `fr:csales:${make}:${model}:${year}`, // carsales market cache
   agrab: (make, model, year) => `fr:agrab:${make}:${model}:${year}`,  // autograb/redbook cache
+  // Appraisal result cache — keyed by listing ID (most specific) or content hash
+  appraisalById:   (listingId) => `fr:apr:id:${listingId}`,
+  appraisalByHash: (hash)      => `fr:apr:h:${hash}`,
 };
 
 // ── Auth ──────────────────────────────────────────────────
@@ -403,6 +406,56 @@ async function getAutoGrabCache(makeKey, modelKey, year) {
 }
 async function storeAutoGrabCache(makeKey, modelKey, year, data) {
   await redisSet(K.agrab(makeKey, modelKey, year), data, AGRAB_TTL_SECS);
+}
+
+// ── Appraisal result cache ────────────────────────────────
+// Stores full AI appraisal results so identical listings cost 0 points for subsequent users.
+// Cache key priority:
+//   1. Listing ID  — exact match, most reliable (7-day TTL)
+//   2. Content hash — title + normalised price + keyword (3-day TTL, catches reposts)
+const APPRAISAL_CACHE_TTL_BY_ID   = 7 * 24 * 3600;   // 7 days — listing unlikely to change
+const APPRAISAL_CACHE_TTL_BY_HASH = 3 * 24 * 3600;   // 3 days — same item, different listing
+
+function buildAppraisalHash(title, price, keyword) {
+  // Normalise inputs so minor differences don't bust the cache
+  const normTitle   = (title   || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 80);
+  const normKeyword = (keyword || '').toLowerCase().trim().slice(0, 30);
+  const normPrice   = Math.round((parseFloat(price) || 0) / 50) * 50; // round to nearest $50
+  const raw = `${normKeyword}|${normTitle}|${normPrice}`;
+  return crypto.createHash('sha1').update(raw).digest('hex').slice(0, 16);
+}
+
+async function getAppraisalCache(listingId, title, price, keyword) {
+  // Try listing ID first (exact match)
+  if (listingId) {
+    const hit = await redisGet(K.appraisalById(listingId));
+    if (hit) {
+      console.log(`[AprCache] HIT by listingId: ${listingId}`);
+      return { ...hit, fromCache: true };
+    }
+  }
+  // Fall back to content hash
+  const hash = buildAppraisalHash(title, price, keyword);
+  const hit  = await redisGet(K.appraisalByHash(hash));
+  if (hit) {
+    console.log(`[AprCache] HIT by hash: ${hash} (${keyword}, ~$${price})`);
+    return { ...hit, fromCache: true };
+  }
+  return null;
+}
+
+async function setAppraisalCache(listingId, title, price, keyword, result) {
+  // Strip fields that shouldn't be cached (per-user, transient)
+  const toCache = { ...result };
+  delete toCache.fromCache;
+  delete toCache.usedCache;
+
+  if (listingId) {
+    await redisSet(K.appraisalById(listingId), toCache, APPRAISAL_CACHE_TTL_BY_ID);
+  }
+  const hash = buildAppraisalHash(title, price, keyword);
+  await redisSet(K.appraisalByHash(hash), toCache, APPRAISAL_CACHE_TTL_BY_HASH);
+  console.log(`[AprCache] Stored: listingId=${listingId || 'none'} hash=${hash}`);
 }
 
 // Live AutoGrab API call — returns { privateSale, tradeIn, dealerRetail } or null.
@@ -936,11 +989,13 @@ async function fetchListingDetails(listingId, listingUrl) {
 // ── Vehicle helpers ───────────────────────────────────────
 const VEHICLE_KEYWORDS = ['car','ute','van','truck','motorcycle','suv','4wd','wagon',
   'sedan','hatch','coupe','convertible','tractor','forklift','boat','caravan',
-  'camper','excavator','loader','hilux','landcruiser','patrol',
+  'camper','excavator','loader','hilux','landcruiser','patrol','hiace','tarago','kluger',
   'ranger','triton','navara','colorado','dmax','bt50','pajero','prado','defender','discovery',
   'transit','sprinter','vito','ducato','daily','commodore','falcon','camry','corolla',
   'civic','accord','mazda','subaru','toyota','ford','holden','honda','nissan','mitsubishi',
-  'hyundai','kia','bmw','mercedes','audi','volkswagen','vw','jeep','ram','dodge'];
+  'hyundai','kia','bmw','mercedes','audi','volkswagen','vw','jeep','ram','dodge',
+  'amarok','everest','fortuner','outlander','asx','eclipse','cx5','cx-5','rav4',
+  'forester','impreza','wrx','outback','liberty','insignia','astra','captiva'];
 // NOTE: scooter, moped, bike removed — electric versions dont need odometer data (includeDetails:true is wasted cost)
 
 // Only checks the KEYWORD — prevents "callaway golf clubs" triggering vehicle mode
@@ -2174,6 +2229,14 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
             imageUrl, imageBase64, imageMime, listingId, listingUrl } = req.body;
     if (!listingPrice) return res.status(400).json({ error: 'listingPrice required' });
 
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const keyword = req.body.keyword || [make, model, year].filter(Boolean).join(' ');
+    const cached  = await getAppraisalCache(listingId, title, listingPrice, keyword);
+    if (cached) {
+      console.log(`[AI/vehicle] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
     const cr = await consumeAppraisal(req.userId);
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
@@ -2342,7 +2405,12 @@ Respond in this exact JSON format (no markdown, no prose outside JSON):
         parsed.estimatedMarketValue = parsed.estimatedMarketValue || vpxStats.marketMedian;
         parsed.vpxData = vpxStats;
       }
-      res.json({ ...parsed, text, usedCache: false });
+      const finalResult = { ...parsed, text, usedCache: false };
+      // Store in appraisal cache for future users
+      await setAppraisalCache(listingId, title, listingPrice, keyword, finalResult).catch(e =>
+        console.error('[AprCache] Write error:', e.message)
+      );
+      res.json(finalResult);
     } else {
       res.json({ text, usedCache: false, vpxData: vpxStats || null });
     }
@@ -2382,8 +2450,15 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
 app.post('/ai/text', authMiddleware, async (req, res) => {
   try {
     if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Anthropic not configured on server' });
-    const { prompt, max_tokens } = req.body;
+    const { prompt, max_tokens, listingId, title, price, keyword } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    if (cached) {
+      console.log(`[AI/text] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
 
     // Check appraisal limit
     const cr = await consumeAppraisal(req.userId);
@@ -2402,7 +2477,16 @@ app.post('/ai/text', authMiddleware, async (req, res) => {
       timeout: 60000,
     });
     const text = claudeRes.data?.content?.[0]?.text || '';
-    res.json({ text });
+    const result = { text, usedCache: false };
+
+    // Store in cache for future users
+    if (listingId || (title && price)) {
+      await setAppraisalCache(listingId, title, price, keyword, result).catch(e =>
+        console.error('[AprCache] Write error (text):', e.message)
+      );
+    }
+
+    res.json(result);
   } catch (e) {
     console.error('[AI/text]', e.response?.data || e.message);
     res.status(500).json({ error: e.response?.data?.error?.message || e.message });
@@ -2414,8 +2498,15 @@ app.post('/ai/text', authMiddleware, async (req, res) => {
 app.post('/ai/text-image', authMiddleware, async (req, res) => {
   try {
     if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
-    const { prompt, imageUrl } = req.body;
+    const { prompt, imageUrl, listingId, title, price, keyword } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    if (cached) {
+      console.log(`[AI/text-image] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
 
     // Check appraisal limit
     const cr = await consumeAppraisal(req.userId);
@@ -2444,11 +2535,45 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
       timeout: 30000,
     });
     const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    res.json({ text });
+    const result = { text, usedCache: false };
+
+    // Store in cache for future users
+    if (listingId || (title && price)) {
+      await setAppraisalCache(listingId, title, price, keyword, result).catch(e =>
+        console.error('[AprCache] Write error (text-image):', e.message)
+      );
+    }
+
+    res.json(result);
   } catch (e) {
     console.error('[AI/text-image]', e.response?.data || e.message);
     res.status(500).json({ error: e.response?.data?.error?.message || e.message });
   }
+});
+
+// ── Appraisal cache admin ─────────────────────────────────
+// GET /appraisal-cache?listingId=xxx  — check if a result is cached
+app.get('/appraisal-cache', authMiddleware, async (req, res) => {
+  try {
+    const { listingId, title, price, keyword } = req.query;
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    res.json({ found: !!cached, cached: cached || null });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE /appraisal-cache?listingId=xxx  — bust a specific cache entry (owner only)
+app.delete('/appraisal-cache', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    const { listingId, title, price, keyword } = req.query;
+    if (listingId) await redisDel(K.appraisalById(listingId));
+    if (title && price) {
+      const hash = buildAppraisalHash(title, price, keyword);
+      await redisDel(K.appraisalByHash(hash));
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 // ── DEV: force-set plan (secret-gated, remove before public launch) ──
