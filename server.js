@@ -358,7 +358,7 @@ function enrichVehicleIdentity(listing) {
   const fuelType  = listing.fuel_type  || extractFuelTypeFromTitle(title, desc);
   const engine    = listing.engine     || extractEngineFromTitle(title, desc);
   const yearBand    = listing.year ? bandYear(listing.year)   : null;
-  const mileageBand = listing.kms  ? bandMileage(listing.kms) : 'unknown';
+  const mileageBand = listing.mileage ? bandMileage(listing.mileage) : 'unknown';
   const transmission = listing.transmission
     ? (listing.transmission.toLowerCase().includes('man') ? 'manual' : 'auto')
     : null;
@@ -425,7 +425,7 @@ function scoreListingQuality(listing) {
   if (PLACEHOLDER_TITLES.test(listing.title || '')) flags |= 64;
 
   // Vehicle-specific: mileage sanity (> 900k km is almost certainly a data error)
-  if (listing.kms && listing.kms > 900000) flags |= 8;
+  if (listing.mileage && listing.mileage > 900000) flags |= 8;
 
   // Determine quality label
   let quality = 'ok';
@@ -502,7 +502,7 @@ async function upsertListingToDB(rawListing) {
       listing.body_style    || null,
       listing.year          || null,
       listing.year_band     || null,
-      listing.kms           || null,
+      listing.mileage       || null,
       listing.mileage_band  || null,
       listing.transmission  || null,
       listing.fuel_type     || null,
@@ -1083,7 +1083,7 @@ async function storeScanPrice(keyword, listing) {
   let enriched = { ...listing, keyword };
   const isVehicle = listing.make || isVehicleKeyword(keyword);
 
-  if (isVehicle && (!listing.year || !listing.kms || !listing.make || !listing.model)) {
+  if (isVehicle && (!listing.year || !listing.mileage || !listing.make || !listing.model)) {
     const aiFields = await aiExtractVehicleFields(listing.title, keyword).catch(() => null);
     if (aiFields) {
       enriched = {
@@ -1093,13 +1093,13 @@ async function storeScanPrice(keyword, listing) {
         model:        enriched.model        || aiFields.model        || null,
         series:       enriched.series       || aiFields.series       || null,
         variant:      enriched.variant      || aiFields.variant      || null,
-        kms:          enriched.kms          || aiFields.kms          || null,
+        mileage:      enriched.mileage       || aiFields.kms          || null,
         transmission: enriched.transmission || aiFields.transmission || null,
         body_style:   enriched.body_style   || aiFields.body_style   || null,
         fuel_type:    enriched.fuel_type    || aiFields.fuel_type    || null,
         engine:       enriched.engine       || aiFields.engine       || null,
       };
-      console.log(`[AIExtract] "${listing.title.slice(0,50)}" → year:${enriched.year} kms:${enriched.kms} make:${enriched.make} model:${enriched.model} series:${enriched.series}`);
+      console.log(`[AIExtract] "${listing.title.slice(0,50)}" → year:${enriched.year} mileage:${enriched.mileage} make:${enriched.make} model:${enriched.model} series:${enriched.series}`);
     }
   }
 
@@ -1594,7 +1594,7 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
       // Extract series and variant from title for vehicle listings
       const series  = isVehicle ? extractSeriesFromTitle(make, model, rawTitle) : null;
       const variant = isVehicle ? extractVariantFromTitle(rawTitle)             : null;
-      const kms     = isVehicle ? (item.mileage?.value || extractMileage(rawTitle, description)) : null;
+      const mileage = isVehicle ? (item.mileage?.value || extractMileage(rawTitle, description)) : null;
 
       return {
         id,
@@ -1609,8 +1609,8 @@ async function sociaVaultKeywordScan(keyword, opts = {}) {
         listedAt,
         listedAtUnknown,
         foundAt:       new Date().toISOString(),
-        // Vehicle-specific — renamed mileage → kms throughout
-        kms,
+        // Vehicle-specific — mileage kept for frontend compatibility, stored as kms in Neon
+        mileage,
         year,
         make,
         model,
@@ -2125,8 +2125,8 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     // Vehicle filters
     if (watcher.minYear && listing.year && listing.year < watcher.minYear) continue;
     if (watcher.maxYear && listing.year && listing.year > watcher.maxYear) continue;
-    if (watcher.minKms  && listing.kms && listing.kms < watcher.minKms) continue;
-    if (watcher.maxKms  && listing.kms && listing.kms > watcher.maxKms) continue;
+    if (watcher.minKms  && listing.mileage && listing.mileage < watcher.minKms) continue;
+    if (watcher.maxKms  && listing.mileage && listing.mileage > watcher.maxKms) continue;
     if (watcher.transmission && listing.transmission &&
         listing.transmission.toLowerCase() !== watcher.transmission.toLowerCase()) continue;
 
