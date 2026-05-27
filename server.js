@@ -8,12 +8,806 @@ const jwt     = require('jsonwebtoken');
 const cron    = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
 const Stripe = require('stripe');
+const { Pool } = require('pg');
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// ── PostgreSQL (Neon) ─────────────────────────────────────
+const DATABASE_URL = process.env.DATABASE_URL ||
+  'postgresql://neondb_owner:npg_XVfnxmq2HCU1@ep-spring-hall-appvfgub-pooler.c-7.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+
+pool.on('error', (e) => console.error('[DB] Pool error:', e.message));
+
+async function initDB() {
+  try {
+    // ── Core listings table ───────────────────────────────
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS listings (
+        id              BIGSERIAL PRIMARY KEY,
+        listing_id      TEXT UNIQUE NOT NULL,
+        title           TEXT NOT NULL,
+        description     TEXT,
+        price           INTEGER,
+        is_offer_price  BOOLEAN DEFAULT FALSE,
+        currency        TEXT DEFAULT 'AUD',
+        location        TEXT,
+        state           TEXT,
+        seller_name     TEXT,
+        seller_id       TEXT,
+        image_url       TEXT,
+        url             TEXT,
+
+        -- ── Search context ────────────────────────────────
+        keyword         TEXT,   -- the search term that found this listing
+
+        -- ── Category ─────────────────────────────────────
+        category        TEXT,   -- 'vehicle' | 'general'
+
+        -- ── Vehicle identity — as precise as possible ─────
+        -- These are the dimensions that determine price cohort.
+        -- A VE Commodore SS is NOT comparable to a VE Omega.
+        -- A 2008 with 250k km is NOT comparable to a 2012 with 80k km.
+        make            TEXT,   -- e.g. 'Holden'
+        model           TEXT,   -- e.g. 'Commodore'
+        series          TEXT,   -- e.g. 'VE', 'VF', 'FG', 'BF', 'NP', 'GU'
+        variant         TEXT,   -- e.g. 'SS', 'SV6', 'Omega', 'Calais', 'XR6', 'ST'
+        body_style      TEXT,   -- e.g. 'sedan', 'wagon', 'ute', 'hatch', 'van'
+        year            INTEGER,-- manufacture year
+        year_band       TEXT,   -- bucketed: e.g. '2006-2010', '2011-2013'
+        mileage         INTEGER,-- odometer in km
+        mileage_band    TEXT,   -- bucketed: e.g. '0-50k', '50k-100k', '100k-150k', '150k-200k', '200k+'
+        transmission    TEXT,   -- 'auto' | 'manual'
+        fuel_type       TEXT,   -- 'petrol' | 'diesel' | 'hybrid' | 'electric'
+        engine          TEXT,   -- e.g. '3.6L V6', '6.0L V8', '2.0T'
+        drive_type      TEXT,   -- '2WD' | '4WD' | 'AWD'
+        colour          TEXT,
+
+        -- ── General item fields ───────────────────────────
+        brand           TEXT,   -- for non-vehicles: e.g. 'Apple', 'Sony'
+        item_model      TEXT,   -- e.g. 'iPhone 14 Pro', 'PlayStation 5'
+        storage         TEXT,   -- for electronics: e.g. '256GB'
+        condition       TEXT,   -- 'new' | 'like new' | 'good' | 'fair' | 'poor'
+
+        -- ── Flexible attributes ───────────────────────────
+        attributes      JSONB DEFAULT '{}',
+
+        -- ── Lifecycle ─────────────────────────────────────
+        listing_status  TEXT DEFAULT 'active',
+        -- 'active'  = still live on FB
+        -- 'sold'    = gone from FB, assumed sold — STAYS in price pool
+        -- 'removed' = spam/scam, excluded from pool
+
+        -- ── Timestamps ───────────────────────────────────
+        listed_at       TIMESTAMPTZ,
+        scraped_at      TIMESTAMPTZ DEFAULT NOW(),
+        last_seen_at    TIMESTAMPTZ DEFAULT NOW(),
+        is_active       BOOLEAN DEFAULT TRUE,
+        seen_count      INTEGER DEFAULT 1,
+
+        -- ── Data quality ──────────────────────────────────
+        price_quality   TEXT DEFAULT 'unscored',
+        -- 'ok' | 'outlier' | 'not_for_sale' | 'suspicious' | 'spam' | 'offer_price'
+
+        quality_flags   INTEGER DEFAULT 0,
+        -- bit 1: damage/broken/spares
+        -- bit 2: swap/trade listing
+        -- bit 3: statistical outlier (IQR)
+        -- bit 4: price below category floor
+        -- bit 5: price above category ceiling
+        -- bit 6: spam signals
+
+        in_price_pool   BOOLEAN DEFAULT TRUE
+        -- FALSE if any quality flag set — never used in price calculations
+      );
+
+      -- ── Indexes ───────────────────────────────────────────
+      -- Keyword pool index (general items)
+      CREATE INDEX IF NOT EXISTS idx_kw_pool
+        ON listings(keyword, price)
+        WHERE price > 0 AND is_offer_price = FALSE
+          AND in_price_pool = TRUE AND category = 'general';
+
+      -- Vehicle cohort index — the main one for precise vehicle matching
+      CREATE INDEX IF NOT EXISTS idx_veh_cohort
+        ON listings(make, model, series, variant, year, mileage_band, transmission)
+        WHERE make IS NOT NULL AND price > 0
+          AND is_offer_price = FALSE AND in_price_pool = TRUE;
+
+      -- Vehicle broad index — fallback when cohort is too small
+      CREATE INDEX IF NOT EXISTS idx_veh_broad
+        ON listings(make, model, year_band)
+        WHERE make IS NOT NULL AND price > 0
+          AND is_offer_price = FALSE AND in_price_pool = TRUE;
+
+      CREATE INDEX IF NOT EXISTS idx_listings_state     ON listings(state);
+      CREATE INDEX IF NOT EXISTS idx_listings_scraped   ON listings(scraped_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_listings_status    ON listings(listing_status);
+      CREATE INDEX IF NOT EXISTS idx_listings_quality   ON listings(price_quality);
+      CREATE INDEX IF NOT EXISTS idx_listings_category  ON listings(category);
+    `);
+
+    // ── Pre-computed stats tables ──────────────────────────
+    await pool.query(`
+      -- General keyword stats (IQR-cleaned, rebuilt nightly)
+      CREATE TABLE IF NOT EXISTS keyword_price_stats (
+        keyword         TEXT PRIMARY KEY,
+        sample_count    INTEGER,
+        raw_count       INTEGER,
+        median_price    INTEGER,
+        p25_price       INTEGER,
+        p75_price       INTEGER,
+        iqr             INTEGER,
+        floor_price     INTEGER,
+        ceiling_price   INTEGER,
+        low_price       INTEGER,
+        high_price      INTEGER,
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      -- Vehicle cohort stats — keyed precisely
+      -- cohort_key is the canonical lookup key built from all identity fields
+      -- e.g. 'holden|commodore|ve|ss|sedan|2008|100k-150k|auto'
+      CREATE TABLE IF NOT EXISTS vehicle_price_stats (
+        cohort_key      TEXT PRIMARY KEY,
+        make            TEXT NOT NULL,
+        model           TEXT NOT NULL,
+        series          TEXT,
+        variant         TEXT,
+        body_style      TEXT,
+        year_band       TEXT NOT NULL,   -- e.g. '2006-2010'
+        mileage_band    TEXT NOT NULL,   -- e.g. '100k-150k'
+        transmission    TEXT,
+        sample_count    INTEGER,
+        raw_count       INTEGER,
+        median_price    INTEGER,
+        p25_price       INTEGER,
+        p75_price       INTEGER,
+        iqr             INTEGER,
+        floor_price     INTEGER,
+        ceiling_price   INTEGER,
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_vps_make_model
+        ON vehicle_price_stats(make, model, series, variant);
+    `);
+
+    // ── Migrate existing tables (safe to run on already-created DBs) ──
+    const migrations = [
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS series TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS variant TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS body_style TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS year_band TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS mileage_band TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS fuel_type TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS engine TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS drive_type TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS colour TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS brand TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS item_model TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS storage TEXT',
+      "ALTER TABLE listings ADD COLUMN IF NOT EXISTS listing_status TEXT DEFAULT 'active'",
+      "ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_quality TEXT DEFAULT 'unscored'",
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS quality_flags INTEGER DEFAULT 0',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS seen_count INTEGER DEFAULT 1',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS in_price_pool BOOLEAN DEFAULT TRUE',
+    ];
+    for (const sql of migrations) {
+      await pool.query(sql).catch(() => {});
+    }
+
+    console.log('[DB] Tables and migrations ready');
+  } catch (e) {
+    console.error('[DB] initDB error:', e.message);
+  }
+}
+
+// ── Build the precise cohort key for a vehicle ────────────
+// This is the fingerprint used to group comparable listings.
+// More fields filled in = smaller, more accurate cohort.
+// Falls back gracefully when fields are missing.
+function buildVehicleCohortKey(make, model, series, variant, yearBand, mileageBand, transmission) {
+  return [
+    (make         || 'unknown').toLowerCase().trim(),
+    (model        || 'unknown').toLowerCase().trim().replace(/\s+/g, '-'),
+    (series       || '').toLowerCase().trim(),
+    (variant      || '').toLowerCase().trim(),
+    (yearBand     || 'unknown'),
+    (mileageBand  || 'unknown'),
+    (transmission || '').toLowerCase().trim(),
+  ].join('|');
+}
+
+// ── Band a year into a range ──────────────────────────────
+// Groups close years together so small cohorts still get data
+// e.g. 2008 → '2006-2010', 2019 → '2018-2022'
+function bandYear(year) {
+  if (!year) return null;
+  // 5-year bands aligned to common AU model generations
+  const bands = [
+    [1990, 1994], [1995, 1999],
+    [2000, 2004], [2005, 2007], [2008, 2010],
+    [2011, 2013], [2014, 2016], [2017, 2019],
+    [2020, 2022], [2023, 2026],
+  ];
+  for (const [lo, hi] of bands) {
+    if (year >= lo && year <= hi) return `${lo}-${hi}`;
+  }
+  return `${year}`;
+}
+
+// ── Band mileage into a range ─────────────────────────────
+// Reflects how buyers actually think about odometer readings
+function bandMileage(mileage) {
+  if (!mileage || mileage <= 0) return 'unknown';
+  if (mileage <  50000)  return '0-50k';
+  if (mileage < 100000)  return '50k-100k';
+  if (mileage < 150000)  return '100k-150k';
+  if (mileage < 200000)  return '150k-200k';
+  if (mileage < 250000)  return '200k-250k';
+  return '250k+';
+}
+
+// ── Extract vehicle series from title ────────────────────
+// Series = body generation code, critical for AU cars
+// e.g. Commodore: VT/VX/VY/VZ/VE/VF  Falcon: AU/BA/BF/FG  Patrol: GQ/GU
+const AU_SERIES_PATTERNS = [
+  // Holden Commodore
+  { pattern: /(VT|VX|VY|VZ|VE|VF)/i,   make: 'holden',    model: 'commodore' },
+  // Ford Falcon
+  { pattern: /(AU|BA|BF|FG|FGX)/i,      make: 'ford',      model: 'falcon'    },
+  // Nissan Patrol
+  { pattern: /(GQ|GU|Y61|Y62)/i,        make: 'nissan',    model: 'patrol'    },
+  // Toyota LandCruiser
+  { pattern: /(80|100|200|300|series|HZJ|HDJ|FZJ|UZJ)/i, make: 'toyota', model: 'landcruiser' },
+  // Toyota HiLux
+  { pattern: /(N70|N80|N110|SR5|SR|Workmate|Rugged X)/i, make: 'toyota', model: 'hilux' },
+  // Ford Ranger
+  { pattern: /(PJ|PK|PX|PXII|PXIII|P703|Wildtrak|Raptor|XLT|XLS|XL)/i, make: 'ford', model: 'ranger' },
+];
+
+// ── Extract variant/grade from title ─────────────────────
+// Variant = trim level / grade, massively affects price
+const VARIANT_PATTERNS = [
+  // Holden Commodore variants
+  /(SS\s*V8|SSV|SS|SV6|Calais\s*V|Calais|Omega|Berlina|International|Equipe|Executive)/i,
+  // Ford Falcon variants  
+  /(XR8|XR6\s*Turbo|XR6T|XR6|XR5|XT|Futura|Fairmont|Ghia|Boss|G6E\s*Turbo|G6E|G6)/i,
+  // Ford Ranger variants
+  /(Raptor|Wildtrak|XLT|XLS|XL|Sport|Hi-Rider)/i,
+  // Toyota variants
+  /(SR5|SR|GX|GXL|VX|Sahara|Kakadu|WorkMate|Rugged\s*X|Rugged|Rogue)/i,
+  // General
+  /(Sport|SE|SL|SX|ST|ST-Line|GTi|GTD|R-Line|M\s*Sport|AMG|S\s*Line)/i,
+];
+
+function extractSeriesFromTitle(make, model, title) {
+  const text = (title || '').toUpperCase();
+  for (const { pattern, make: m, model: mo } of AU_SERIES_PATTERNS) {
+    if ((make || '').toLowerCase() === m && (model || '').toLowerCase().includes(mo)) {
+      const match = text.match(pattern);
+      if (match) return match[1].toUpperCase();
+    }
+  }
+  return null;
+}
+
+function extractVariantFromTitle(title) {
+  const text = (title || '');
+  for (const pattern of VARIANT_PATTERNS) {
+    const match = text.match(pattern);
+    if (match) return match[1].replace(/\s+/g, ' ').trim();
+  }
+  return null;
+}
+
+function extractBodyStyleFromTitle(title, description) {
+  const text = (title + ' ' + (description || '')).toLowerCase();
+  if (/(ute|utility|tray)/.test(text))        return 'ute';
+  if (/(wagon|estate|touring)/.test(text))     return 'wagon';
+  if (/(van|cargo|commercial)/.test(text))     return 'van';
+  if (/(hatch|hatchback)/.test(text))          return 'hatch';
+  if (/(coupe|fastback)/.test(text))           return 'coupe';
+  if (/(convertible|cabriolet|roadster)/.test(text)) return 'convertible';
+  if (/(sedan|saloon)/.test(text))             return 'sedan';
+  if (/(suv|4wd|4x4|crossover)/.test(text))   return 'suv';
+  return null;
+}
+
+function extractFuelTypeFromTitle(title, description) {
+  const text = (title + ' ' + (description || '')).toLowerCase();
+  if (/(diesel|turbo\s*diesel|tdi|tdci|crd|hdi)/.test(text)) return 'diesel';
+  if (/(electric|ev|bev|phev|plug.?in)/.test(text))           return 'electric';
+  if (/(hybrid)/.test(text))                                   return 'hybrid';
+  if (/(lpg|gas|dual\s*fuel)/.test(text))                     return 'lpg';
+  return 'petrol'; // default for AU market
+}
+
+function extractEngineFromTitle(title, description) {
+  const text = (title + ' ' + (description || ''));
+  const m = text.match(/(\d+\.\d+[Ll]?\s*(?:V6|V8|V12|I4|turbo|litre|ltr)?)/i)
+         || text.match(/(V8|V6|V12|turbo|supercharged)/i);
+  return m ? m[1].trim() : null;
+}
+
+// ── Enrich a listing with all precise vehicle identity fields ──
+// Called before upsert — fills in series, variant, bands etc
+function enrichVehicleIdentity(listing) {
+  if (!listing.make) return listing;
+
+  const title = listing.title || '';
+  const desc  = listing.description || '';
+
+  const series    = listing.series    || extractSeriesFromTitle(listing.make, listing.model, title);
+  const variant   = listing.variant   || extractVariantFromTitle(title);
+  const bodyStyle = listing.body_style || extractBodyStyleFromTitle(title, desc);
+  const fuelType  = listing.fuel_type  || extractFuelTypeFromTitle(title, desc);
+  const engine    = listing.engine     || extractEngineFromTitle(title, desc);
+  const yearBand  = listing.year       ? bandYear(listing.year)       : null;
+  const mileageBand = listing.mileage  ? bandMileage(listing.mileage) : 'unknown';
+  const transmission = listing.transmission
+    ? (listing.transmission.toLowerCase().includes('man') ? 'manual' : 'auto')
+    : null;
+
+  return {
+    ...listing,
+    series,
+    variant,
+    body_style:  bodyStyle,
+    fuel_type:   fuelType,
+    engine,
+    year_band:   yearBand,
+    mileage_band: mileageBand,
+    transmission,
+  };
+}
+
+// ── Listing quality scoring ──────────────────────────────
+// Run before DB write — returns { flags, quality, inPricePool }
+// Catches bad listings BEFORE they pollute the price pool
+
+// Category price floors/ceilings — reject physically impossible prices
+const CATEGORY_PRICE_BOUNDS = {
+  vehicle:     { floor: 200,  ceiling: 500000 },
+  electronics: { floor: 5,    ceiling: 30000  },
+  general:     { floor: 1,    ceiling: 100000 },
+};
+
+// Title patterns that signal a listing should never enter the price pool
+const DAMAGE_PATTERNS    = /\b(broken|cracked|faulty|damaged|spares?|repairs?|parts? only|not working|doesn'?t work|dead|seized|blown|written off|wrecked|flood|hail|smash|project car|needs work|no rego|unregistered|as.?is|as is)\b/i;
+const SWAP_PATTERNS      = /\b(swap|swaps|trade|trades|pto|part trade|part swap|swopping|swop)\b/i;
+const SPAM_PATTERNS      = /\b(follow|instagram|whatsapp|contact me|dm me|text me|call me|click link|bit\.ly|t\.me|telegram)\b/i;
+const PLACEHOLDER_TITLES = /^(car|item|stuff|thing|product|misc|other|test|listing)\s*$/i;
+
+function scoreListingQuality(listing) {
+  const price = listing.price || 0;
+  const title = (listing.title || '').toLowerCase();
+  const desc  = (listing.description || '').toLowerCase();
+  const full  = title + ' ' + desc;
+  let flags = 0;
+
+  // Bit 0 — already handled by isOfferPrice, but double-check
+  if (isOfferPrice(price)) flags |= 1;
+
+  // Bit 1 — damage / broken / spares
+  if (DAMAGE_PATTERNS.test(full)) flags |= 2;
+
+  // Bit 2 — swap / trade listings (not a sale price)
+  if (SWAP_PATTERNS.test(full)) flags |= 4;
+
+  // Bit 4 — price below category floor (too cheap to be real)
+  const category = listing.make ? 'vehicle' : 'general';
+  const bounds   = CATEGORY_PRICE_BOUNDS[category] || CATEGORY_PRICE_BOUNDS.general;
+  if (price > 0 && price < bounds.floor)   flags |= 16;
+
+  // Bit 5 — price above category ceiling (data entry error / scam)
+  if (price > 0 && price > bounds.ceiling) flags |= 32;
+
+  // Bit 6 — spam signals in title/description
+  if (SPAM_PATTERNS.test(full)) flags |= 64;
+
+  // Placeholder titles that give no useful signal
+  if (PLACEHOLDER_TITLES.test(listing.title || '')) flags |= 64;
+
+  // Vehicle-specific: mileage sanity (> 900k km is almost certainly a data error)
+  if (listing.mileage && listing.mileage > 900000) flags |= 8;
+
+  // Determine quality label
+  let quality = 'ok';
+  if (flags & 64) quality = 'spam';
+  else if (flags & (2 | 4)) quality = 'not_for_sale';  // damage or swap
+  else if (flags & (16 | 32)) quality = 'suspicious';  // price bounds
+  else if (flags & 1) quality = 'offer_price';
+
+  const inPricePool = quality === 'ok';
+
+  return { flags, quality, inPricePool };
+}
+
+async function upsertListingToDB(rawListing) {
+  try {
+    // Enrich with precise vehicle identity fields before writing
+    const listing = rawListing.make ? enrichVehicleIdentity(rawListing) : rawListing;
+
+    const price      = (listing.price && !isOfferPrice(listing.price)) ? listing.price : null;
+    const offerPrice = isOfferPrice(listing.price);
+    const { flags, quality, inPricePool } = scoreListingQuality({ ...listing, price: listing.price });
+
+    await pool.query(`
+      INSERT INTO listings
+        (listing_id, title, description, price, is_offer_price, location, state,
+         seller_name, image_url, url, keyword, category,
+         make, model, series, variant, body_style, year, year_band,
+         mileage, mileage_band, transmission, fuel_type, engine,
+         price_quality, quality_flags, in_price_pool,
+         listed_at, scraped_at, last_seen_at, is_active, listing_status, seen_count)
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+        $13,$14,$15,$16,$17,$18,$19,
+        $20,$21,$22,$23,$24,
+        $25,$26,$27,
+        $28,NOW(),NOW(),TRUE,'active',1
+      )
+      ON CONFLICT (listing_id) DO UPDATE SET
+        price          = EXCLUDED.price,
+        last_seen_at   = NOW(),
+        is_active      = TRUE,
+        listing_status = 'active',
+        seen_count     = listings.seen_count + 1,
+        -- Enrich identity fields if we now have better data
+        series         = COALESCE(EXCLUDED.series,      listings.series),
+        variant        = COALESCE(EXCLUDED.variant,     listings.variant),
+        body_style     = COALESCE(EXCLUDED.body_style,  listings.body_style),
+        mileage        = COALESCE(EXCLUDED.mileage,     listings.mileage),
+        mileage_band   = COALESCE(EXCLUDED.mileage_band,listings.mileage_band),
+        fuel_type      = COALESCE(EXCLUDED.fuel_type,   listings.fuel_type),
+        engine         = COALESCE(EXCLUDED.engine,      listings.engine),
+        description    = COALESCE(EXCLUDED.description, listings.description),
+        price_quality  = EXCLUDED.price_quality,
+        quality_flags  = EXCLUDED.quality_flags,
+        in_price_pool  = EXCLUDED.in_price_pool
+    `, [
+      listing.id,
+      listing.title,
+      listing.description   || null,
+      price,
+      offerPrice,
+      listing.location      || null,
+      extractState(listing.location),
+      null,
+      listing.image         || null,
+      listing.url           || null,
+      listing.keyword       ? listing.keyword.toLowerCase().trim() : null,
+      listing.make          ? 'vehicle' : 'general',
+      // Vehicle identity
+      listing.make          || null,
+      listing.model         || null,
+      listing.series        || null,
+      listing.variant       || null,
+      listing.body_style    || null,
+      listing.year          || null,
+      listing.year_band     || null,
+      listing.mileage       || null,
+      listing.mileage_band  || null,
+      listing.transmission  || null,
+      listing.fuel_type     || null,
+      listing.engine        || null,
+      // Quality
+      quality,
+      flags,
+      inPricePool,
+      listing.listedAt      ? new Date(listing.listedAt) : null,
+    ]);
+  } catch (e) {
+    if (!e.message.includes('duplicate')) {
+      console.error('[DB] upsertListing error:', e.message.slice(0, 120));
+    }
+  }
+}
+
+async function getDBPriceStats(keyword, minSamples = 5) {
+  try {
+    const kw = keyword.toLowerCase().trim();
+
+    // ── Fast path: pre-computed IQR-cleaned stats ──────────
+    const fast = await pool.query(
+      `SELECT * FROM keyword_price_stats WHERE keyword = $1`, [kw]
+    );
+    if (fast.rows.length && fast.rows[0].sample_count >= minSamples) {
+      const r = fast.rows[0];
+      return {
+        count:       r.sample_count,
+        rawCount:    r.raw_count || r.sample_count,
+        median:      r.median_price,
+        p25:         r.p25_price,
+        p75:         r.p75_price,
+        iqr:         r.iqr,
+        floor:       r.floor_price,
+        ceiling:     r.ceiling_price,
+        low:         r.low_price,
+        high:        r.high_price,
+        source:      'flipradar_db',
+        sourceLabel: `FlipRadar DB · ${r.sample_count} verified sales`,
+      };
+    }
+
+    // ── Live path: IQR outlier removal in SQL ──────────────
+    // Step 1: get raw percentiles from the clean pool
+    const percResult = await pool.query(`
+      SELECT
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75,
+        COUNT(*)::INT AS raw_count
+      FROM listings
+      WHERE keyword = $1
+        AND price > 0
+        AND is_offer_price = FALSE
+        AND in_price_pool = TRUE
+        AND is_active = TRUE
+        AND scraped_at > NOW() - INTERVAL '90 days'
+    `, [kw]);
+
+    const perc = percResult.rows[0];
+    if (!perc || perc.raw_count < minSamples) return null;
+
+    const iqr      = perc.p75 - perc.p25;
+    const fence_lo = Math.max(0, perc.p25 - 1.5 * iqr);
+    const fence_hi = perc.p75 + 1.5 * iqr;
+
+    // Step 2: stats using only prices within IQR fences
+    const result = await pool.query(`
+      SELECT
+        COUNT(*)::INT                                                    AS cnt,
+        PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY price)::INT        AS median,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT        AS p25,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT        AS p75,
+        MIN(price)::INT                                                  AS low,
+        MAX(price)::INT                                                  AS high
+      FROM listings
+      WHERE keyword = $1
+        AND price BETWEEN $2 AND $3
+        AND is_offer_price = FALSE
+        AND in_price_pool = TRUE
+        AND is_active = TRUE
+        AND scraped_at > NOW() - INTERVAL '90 days'
+    `, [kw, Math.round(fence_lo), Math.round(fence_hi)]);
+
+    const row = result.rows[0];
+    if (!row || row.cnt < minSamples) return null;
+
+    return {
+      count:       row.cnt,
+      rawCount:    perc.raw_count,
+      median:      row.median,
+      p25:         row.p25,
+      p75:         row.p75,
+      iqr,
+      floor:       Math.round(fence_lo),
+      ceiling:     Math.round(fence_hi),
+      low:         row.low,
+      high:        row.high,
+      source:      'flipradar_db',
+      sourceLabel: `FlipRadar DB · ${row.cnt} verified comparables`,
+    };
+  } catch (e) {
+    console.error('[DB] getDBPriceStats error:', e.message);
+    return null;
+  }
+}
+
+// ── IQR-clean stats from a set of prices ─────────────────
+// Used by all vehicle lookup tiers — same logic every time
+function calcIQRStats(prices) {
+  if (!prices || prices.length < 3) return null;
+  const sorted = [...prices].sort((a, b) => a - b);
+  const p25 = sorted[Math.floor(sorted.length * 0.25)];
+  const p75 = sorted[Math.floor(sorted.length * 0.75)];
+  const iqr  = p75 - p25;
+  const lo   = Math.max(0, p25 - 1.5 * iqr);
+  const hi   = p75 + 1.5 * iqr;
+  const clean = sorted.filter(p => p >= lo && p <= hi);
+  if (clean.length < 3) return null;
+  const median = clean[Math.floor(clean.length / 2)];
+  return {
+    count:    clean.length,
+    rawCount: sorted.length,
+    median,
+    p25:      clean[Math.floor(clean.length * 0.25)],
+    p75:      clean[Math.floor(clean.length * 0.75)],
+    low:      clean[0],
+    high:     clean[clean.length - 1],
+    iqr:      Math.round(iqr),
+    floor:    Math.round(lo),
+    ceiling:  Math.round(hi),
+  };
+}
+
+// ── Run IQR-cleaned price query for any WHERE clause ──────
+async function queryCleanPrices(whereSql, params) {
+  const r = await pool.query(`
+    SELECT price FROM listings
+    WHERE ${whereSql}
+      AND price > 0 AND is_offer_price = FALSE
+      AND in_price_pool = TRUE
+      AND listing_status IN ('active','sold')
+  `, params);
+  return r.rows.map(r => r.price);
+}
+
+// ── Vehicle price lookup — precision-first waterfall ──────
+//
+// Tries increasingly broad cohorts until it finds enough data.
+// Narrow cohort = more accurate.  Broad cohort = more samples.
+//
+// Tier 1 (most precise): make + model + series + variant + year_band + mileage_band + transmission
+// Tier 2:                make + model + series + variant + year_band + mileage_band
+// Tier 3:                make + model + series + variant + year_band
+// Tier 4:                make + model + series + year_band + mileage_band
+// Tier 5:                make + model + year_band + mileage_band
+// Tier 6 (broadest):     make + model + year_band
+//
+// Each tier needs DB_MIN_SAMPLES to be accepted.
+// Falls back to AI if no tier has enough data.
+
+async function getDBVehicleStats(make, model, year, mileage, opts = {}) {
+  if (!make || !year) return null;
+
+  const { series, variant, transmission } = opts;
+  const yearBand    = bandYear(year);
+  const mileageBand = mileage ? bandMileage(mileage) : null;
+  const MIN         = DB_MIN_SAMPLES;
+
+  // ── Fast path: pre-computed cohort stats table ──────────
+  // Check for the most precise cohort key first, then widen
+  const cohortKey = buildVehicleCohortKey(make, model, series, variant, yearBand, mileageBand || 'unknown', transmission);
+  const fastResult = await pool.query(
+    `SELECT * FROM vehicle_price_stats WHERE cohort_key = $1`, [cohortKey]
+  );
+  if (fastResult.rows.length && fastResult.rows[0].sample_count >= MIN) {
+    const r = fastResult.rows[0];
+    return formatVehicleStats(r.median_price, r.p25_price, r.p75_price,
+      r.sample_count, r.raw_count, r.iqr, r.floor_price, r.ceiling_price,
+      make, model, series, variant, yearBand, mileageBand, r.cohort_key, 'precomputed');
+  }
+
+  // ── Live waterfall — try each tier in order ─────────────
+
+  // Helper: run a tier query and return stats if enough data
+  async function tryTier(label, whereSql, params) {
+    const prices = await queryCleanPrices(whereSql, params);
+    const stats  = calcIQRStats(prices);
+    if (stats && stats.count >= MIN) {
+      console.log(`[VehiclePrice] ${make} ${model} ${year} — Tier ${label}: ${stats.count} samples`);
+      return { ...stats, tierLabel: label };
+    }
+    return null;
+  }
+
+  let result = null;
+
+  // Tier 1 — fully precise
+  if (!result && series && variant && mileageBand && transmission) {
+    result = await tryTier('1 (exact)',
+      `make=$1 AND model=$2 AND series=$3 AND variant=$4 AND year_band=$5 AND mileage_band=$6 AND transmission=$7`,
+      [make, model, series, variant, yearBand, mileageBand, transmission]
+    );
+  }
+
+  // Tier 2 — drop transmission
+  if (!result && series && variant && mileageBand) {
+    result = await tryTier('2 (no transmission)',
+      `make=$1 AND model=$2 AND series=$3 AND variant=$4 AND year_band=$5 AND mileage_band=$6`,
+      [make, model, series, variant, yearBand, mileageBand]
+    );
+  }
+
+  // Tier 3 — drop mileage band
+  if (!result && series && variant) {
+    result = await tryTier('3 (no mileage)',
+      `make=$1 AND model=$2 AND series=$3 AND variant=$4 AND year_band=$5`,
+      [make, model, series, variant, yearBand]
+    );
+  }
+
+  // Tier 4 — drop variant, keep series + mileage
+  if (!result && series && mileageBand) {
+    result = await tryTier('4 (series+mileage)',
+      `make=$1 AND model=$2 AND series=$3 AND year_band=$4 AND mileage_band=$5`,
+      [make, model, series, yearBand, mileageBand]
+    );
+  }
+
+  // Tier 5 — make + model + year band + mileage band (no series/variant)
+  if (!result && mileageBand) {
+    result = await tryTier('5 (model+mileage)',
+      `make=$1 AND model=$2 AND year_band=$3 AND mileage_band=$4`,
+      [make, model, yearBand, mileageBand]
+    );
+  }
+
+  // Tier 6 — make + model + year band only (broadest)
+  if (!result) {
+    result = await tryTier('6 (model+year)',
+      `make=$1 AND model=$2 AND year_band=$3`,
+      [make, model, yearBand]
+    );
+  }
+
+  if (!result) {
+    console.log(`[VehiclePrice] No data for ${make} ${model} ${year} — AI needed`);
+    return null;
+  }
+
+  return formatVehicleStats(
+    result.median, result.p25, result.p75,
+    result.count, result.rawCount, result.iqr, result.floor, result.ceiling,
+    make, model, series, variant, yearBand, mileageBand, null, result.tierLabel
+  );
+}
+
+function formatVehicleStats(median, p25, p75, count, rawCount, iqr, floor, ceiling,
+  make, model, series, variant, yearBand, mileageBand, cohortKey, tier) {
+  const label = [make, model, series, variant].filter(Boolean).join(' ');
+  const mileageStr = mileageBand && mileageBand !== 'unknown' ? ` · ${mileageBand} km` : '';
+  return {
+    marketMedian:    median,
+    marketLow:       p25,
+    marketHigh:      p75,
+    samples:         count,
+    rawSamples:      rawCount || count,
+    iqr,
+    floor,
+    ceiling,
+    yearBand,
+    mileageBand,
+    cohortKey,
+    tier,
+    source:          'flipradar_db',
+    sourceLabel:     `FlipRadar DB · ${count} comparable ${label}${mileageStr}`,
+    confidence:      calcConfidence('vpx', count),
+    make, model, series, variant,
+  };
+}
+
+async function getDBComparables(keyword, limit = 10) {
+  try {
+    const result = await pool.query(`
+      SELECT listing_id, title, price, location, state, url, listed_at, scraped_at
+      FROM listings
+      WHERE keyword = $1 AND price > 0 AND is_offer_price = FALSE
+        AND is_active = TRUE AND scraped_at > NOW() - INTERVAL '60 days'
+      ORDER BY scraped_at DESC LIMIT $2
+    `, [keyword.toLowerCase().trim(), limit]);
+    return result.rows;
+  } catch (e) { return []; }
+}
+
+async function getDBSummary() {
+  try {
+    const r = await pool.query(`
+      SELECT COUNT(*)::INT AS total_listings,
+        COUNT(DISTINCT keyword)::INT AS unique_keywords,
+        COUNT(DISTINCT make)::INT    AS unique_makes,
+        COUNT(*) FILTER (WHERE is_active)::INT AS active_listings,
+        MAX(scraped_at) AS last_scraped
+      FROM listings
+    `);
+    return r.rows[0];
+  } catch (e) { return null; }
+}
+
+// ── Upstash Redis ─────────────────────────────────────────
 // ── Upstash Redis ─────────────────────────────────────────
 const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -64,9 +858,6 @@ const K = {
   sharedScan:  kw  => `fr:scan:${kw.toLowerCase().trim()}`,  // shared scan cache across all users
   enrich:      id  => `fr:enrich:${id}`,                     // slim enrichment data per listing (7-day TTL)
   blocked:     uid => `fr:blocked:${uid}`,
-  vpx:   (make, model, year) => `fr:vpx:${make}:${model}:${year}`,
-  csales:(make, model, year) => `fr:csales:${make}:${model}:${year}`, // carsales market cache
-  agrab: (make, model, year) => `fr:agrab:${make}:${model}:${year}`,  // autograb/redbook cache
   // Appraisal result cache — keyed by listing ID (most specific) or content hash
   appraisalById:   (listingId) => `fr:apr:id:${listingId}`,
   appraisalByHash: (hash)      => `fr:apr:h:${hash}`,
@@ -100,37 +891,10 @@ const FROM_EMAIL    = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.c
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
 
-const OWN_PRICE_MIN       = 10;                    // need 10 of our own records to skip AI
-const VPX_REF_KM          = 100000;               // mileage reference for price normalization
-const VPX_MIN_SAMPLES     = 5;                    // samples needed to use VPX instead of AI
-const VPX_SAMPLE_CAP      = 500;                  // max samples stored per vehicle cohort
-const VPX_TTL_SECS        = null;                 // permanent — hard-won scraped data must not expire
 const SEEN_TTL_MS         = 48 * 60 * 60 * 1000;
 const SEEN_MAX_ENTRIES    = 5000;
-const CSALES_TTL_SECS     = 48 * 3600;            // 48 h carsales market cache
-const AGRAB_TTL_SECS      = 30 * 24 * 3600;       // 30 day autograb/redbook cache
-const CARSALES_BIAS       = 0.92;                  // asking-price → cleared-price correction (~8%)
-const AUTOGRAB_API_KEY    = process.env.AUTOGRAB_API_KEY  || null;
-const AUTOGRAB_BASE_URL   = process.env.AUTOGRAB_BASE_URL || 'https://api.autograb.com.au/v1';
-const BRIGHTDATA_API_KEY    = process.env.BRIGHTDATA_API_KEY    || null;
-const BRIGHTDATA_BASE_URL   = process.env.BRIGHTDATA_BASE_URL   || 'https://api.brightdata.com/datasets/v3';
-const BRIGHTDATA_DATASET_ID = process.env.BRIGHTDATA_DATASET_ID || null;
 
-// Top AU vehicle models to seed on first deploy (make, model, year range)
-const TOP_AU_SEED_MODELS = [
-  ...['2019','2020','2021','2022'].flatMap(y => [
-    {make:'Toyota',model:'Camry',year:parseInt(y)},
-    {make:'Toyota',model:'Hilux',year:parseInt(y)},
-    {make:'Toyota',model:'RAV4',year:parseInt(y)},
-    {make:'Toyota',model:'LandCruiser Prado',year:parseInt(y)},
-    {make:'Mazda',model:'CX-5',year:parseInt(y)},
-    {make:'Ford',model:'Ranger',year:parseInt(y)},
-    {make:'Hyundai',model:'Tucson',year:parseInt(y)},
-    {make:'Mitsubishi',model:'Triton',year:parseInt(y)},
-    {make:'Isuzu',model:'D-MAX',year:parseInt(y)},
-    {make:'Subaru',model:'Forester',year:parseInt(y)},
-  ]),
-];
+
 
 // ── Owner account — always premium, no payment required ──
 const OWNER_EMAIL = 'giannimenolotto@gmail.com';
@@ -259,154 +1023,12 @@ async function saveUserSeen(userId, seen, { merge = true } = {}) {
 // Every time we see a listing for a keyword, store its price
 async function storeScanPrice(keyword, listing) {
   if (!listing.price || listing.price <= 0) return;
-  if (listing.isOfferPrice) return; // placeholder prices pollute keyword price history
-  try {
-    const existing = await redisGet(K.prices(keyword)) || [];
-    if (!existing.find(r => r.id === listing.id)) {
-      existing.unshift({ id: listing.id, price: listing.price, title: listing.title, date: new Date().toISOString() });
-      await redisSet(K.prices(keyword), existing.slice(0, 200));
-    }
-  } catch (e) {
-    console.error(`[PriceStore] Error for "${keyword}":`, e.message);
-  }
-  // Also feed the vehicle price index when structured vehicle data is present
-  if (listing.make && listing.year) {
-    storeVehiclePrice(listing).catch(e => console.error('[VPX] passive write error:', e.message));
-  }
+  if (listing.isOfferPrice) return;
+  // Write to PostgreSQL — the only pricing store
+  upsertListingToDB({ ...listing, keyword }).catch(() => {});
 }
 
-async function getOwnPriceRange(keyword) {
-  const records = await redisGet(K.prices(keyword)) || [];
-  if (records.length < OWN_PRICE_MIN) return null;
-  const prices = records.map(r => r.price).filter(Boolean).sort((a, b) => a - b);
-  return {
-    prices,
-    low:    prices[0],
-    high:   prices[prices.length - 1],
-    median: prices[Math.floor(prices.length / 2)],
-    avg:    Math.round(prices.reduce((a, b) => a + b, 0) / prices.length),
-    count:  prices.length,
-    source: 'own_history',
-  };
-}
-
-// ── Vehicle Price Index (VPX) ─────────────────────────────
-// fr:vpx:<make>:<model>:<year> — mileage-normalised price samples per vehicle cohort.
-// Populated passively from every FB listing; seeded by Carsales scrapes.
-const _vpxCache = new Map();
-const VPX_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min hot-cache — avoids Redis on every appraisal
-
-async function storeVehiclePrice(listing) {
-  let { make, model, year, mileage, price, id, location } = listing;
-  if (!make || !year || !price || price <= 0) return;
-  if (isOfferPrice(price)) return;
-
-  if (!model) model = extractModel(make, listing.title || '');
-  if (!model) return; // without model we can't build a meaningful cohort key
-
-  const makeKey  = make.toLowerCase().trim();
-  const modelKey = model.toLowerCase().trim().replace(/\s+/g, '-');
-  const key      = K.vpx(makeKey, modelKey, year);
-
-  try {
-    const existing = await redisGet(key) || { samples: [] };
-    if (existing.samples.find(s => s.id === id)) return; // already stored
-
-    const normPrice = normalizePriceToRefKm(price, mileage, makeKey, modelKey);
-    existing.samples.unshift({
-      id,
-      price,
-      mileage:    mileage || null,
-      normPrice,
-      date:       new Date().toISOString(),
-      state:      extractState(location),
-      source:     'fb',
-    });
-    existing.samples = existing.samples.slice(0, VPX_SAMPLE_CAP);
-
-    // Recompute stats from normalised prices
-    const norm = existing.samples.map(s => s.normPrice).filter(p => p && p > 0).sort((a, b) => a - b);
-    if (norm.length >= 3) {
-      existing.stats = {
-        count:          norm.length,
-        medianAt100k:   norm[Math.floor(norm.length / 2)],
-        p25At100k:      norm[Math.floor(norm.length * 0.25)],
-        p75At100k:      norm[Math.floor(norm.length * 0.75)],
-        lowAt100k:      norm[0],
-        highAt100k:     norm[norm.length - 1],
-        updatedAt:      new Date().toISOString(),
-      };
-    }
-
-    await redisSet(key, existing, VPX_TTL_SECS);
-    _vpxCache.delete(key); // invalidate hot-cache on write
-  } catch (e) {
-    console.error(`[VPX] storeVehiclePrice error ${make} ${model} ${year}:`, e.message);
-  }
-}
-
-async function getVehiclePriceStats(make, model, year, mileage) {
-  if (!make || !model || !year) return null;
-  const makeKey  = make.toLowerCase().trim();
-  const modelKey = model.toLowerCase().trim().replace(/\s+/g, '-');
-  const key      = K.vpx(makeKey, modelKey, year);
-
-  // Hot-cache first
-  const hit = _vpxCache.get(key);
-  if (hit && (Date.now() - hit.ts) < VPX_CACHE_TTL_MS) return hit.data;
-
-  const doc = await redisGet(key);
-  if (!doc || !doc.stats || doc.stats.count < VPX_MIN_SAMPLES) return null;
-
-  const { medianAt100k, p25At100k, p75At100k, lowAt100k, highAt100k, count } = doc.stats;
-
-  // Adjust reference prices to the listing's actual mileage for display
-  const result = {
-    make, model, year,
-    samples:                count,
-    medianAt100k,
-    p25At100k,
-    p75At100k,
-    marketMedian:           mileage ? adjustMarketPriceToMileage(medianAt100k, mileage, makeKey, modelKey) : medianAt100k,
-    marketLow:              mileage ? adjustMarketPriceToMileage(p25At100k,    mileage, makeKey, modelKey) : p25At100k,
-    marketHigh:             mileage ? adjustMarketPriceToMileage(p75At100k,    mileage, makeKey, modelKey) : p75At100k,
-    mileageAdjusted:        !!(mileage),
-    updatedAt:              doc.stats.updatedAt,
-    source:                 'vpx',
-  };
-
-  _vpxCache.set(key, { data: result, ts: Date.now() });
-  return result;
-}
-
-// ── Carsales market cache ─────────────────────────────────
-async function getCarsalesCache(makeKey, modelKey, year) {
-  const doc = await redisGet(K.csales(makeKey, modelKey, year));
-  if (!doc || doc.count < 3) return null;
-  return doc;
-}
-async function storeCarsalesCache(makeKey, modelKey, year, samples) {
-  if (!samples.length) return;
-  const prices = samples.map(s => s.normPrice || s.price).filter(Boolean).sort((a, b) => a - b);
-  const doc = {
-    count:  prices.length,
-    median: prices[Math.floor(prices.length / 2)],
-    p25:    prices[Math.floor(prices.length * 0.25)],
-    p75:    prices[Math.floor(prices.length * 0.75)],
-    low:    prices[0],
-    high:   prices[prices.length - 1],
-    updatedAt: new Date().toISOString(),
-  };
-  await redisSet(K.csales(makeKey, modelKey, year), doc, CSALES_TTL_SECS);
-}
-
-// ── AutoGrab / RedBook cache ──────────────────────────────
-async function getAutoGrabCache(makeKey, modelKey, year) {
-  return redisGet(K.agrab(makeKey, modelKey, year));
-}
-async function storeAutoGrabCache(makeKey, modelKey, year, data) {
-  await redisSet(K.agrab(makeKey, modelKey, year), data, AGRAB_TTL_SECS);
-}
+// VPX / Carsales / AutoGrab removed — FlipRadar DB is the only pricing source
 
 // ── Appraisal result cache ────────────────────────────────
 // Stores full AI appraisal results so identical listings cost 0 points for subsequent users.
@@ -458,124 +1080,120 @@ async function setAppraisalCache(listingId, title, price, keyword, result) {
   console.log(`[AprCache] Stored: listingId=${listingId || 'none'} hash=${hash}`);
 }
 
-// Live AutoGrab API call — returns { privateSale, tradeIn, dealerRetail } or null.
-// Sign up at autograb.com.au for an API key. Endpoint may need adjustment per their docs.
-async function fetchAutoGrabLive(make, model, year) {
-  if (!AUTOGRAB_API_KEY) return null;
-  try {
-    const res = await axios.get(`${AUTOGRAB_BASE_URL}/valuations`, {
-      params: { make, model, year },
-      headers: { Authorization: `Bearer ${AUTOGRAB_API_KEY}`, Accept: 'application/json' },
-      timeout: 8000,
-    });
-    const d = res.data?.data || res.data || {};
-    // Normalise field names — adjust if AutoGrab response shape differs
-    const privateSale  = d.private_sale  || d.privateSale  || d.retail || null;
-    const tradeIn      = d.trade_in      || d.tradeIn      || d.wholesale || null;
-    const dealerRetail = d.dealer_retail || d.dealerRetail || d.dealer || privateSale;
-    if (!privateSale) return null;
-    return { privateSale: Math.round(privateSale), tradeIn: Math.round(tradeIn || privateSale * 0.82), dealerRetail: Math.round(dealerRetail) };
-  } catch (e) {
-    console.error(`[AutoGrab] ${make} ${model} ${year}:`, e.response?.status || e.message);
+// AutoGrab removed — DB is the only pricing source
+
+
+// ── DB vs AI decision engine ─────────────────────────────
+//
+// The DB only wins when it's genuinely more reliable than AI.
+// AI has broad training data but no real-time AU market prices.
+// Our DB has real AU listings but needs enough of them, from a
+// tight-enough cohort, to beat AI's generalised knowledge.
+//
+// Score is 0–100. We use DB if score >= DB_TRUST_THRESHOLD.
+//
+// Scoring factors:
+//   Cohort precision  — tier 1 (exact match) >> tier 6 (broad)
+//   Sample count      — more samples = more reliable
+//   IQR tightness     — narrow spread = consistent market = reliable
+//   Recency           — handled by listing_status filter in queries
+//
+// We never expose this score to the user.
+
+const DB_TRUST_THRESHOLD = 65; // minimum score to prefer DB over AI
+
+function scoreDBResult(stats) {
+  if (!stats || !stats.samples) return 0;
+
+  let score = 0;
+
+  // ── Cohort precision (0–35 points) ─────────────────────
+  // Tier 1 = exact match on all fields = most valuable
+  // Tier 6 = just make+model+year = barely better than AI
+  const tierScores = {
+    '1 (exact)':             35,
+    '2 (no transmission)':   30,
+    '3 (no mileage)':        22,
+    '4 (series+mileage)':    25,
+    '5 (model+mileage)':     18,
+    '6 (model+year)':        10,
+    'precomputed':           30, // precomputed = was already a good cohort
+  };
+  score += tierScores[stats.tier] || 10;
+
+  // ── Sample count (0–35 points) ──────────────────────────
+  // Need at least 8 to be useful; 30+ is solid; 60+ is excellent
+  const n = stats.samples;
+  if      (n >= 60) score += 35;
+  else if (n >= 30) score += 28;
+  else if (n >= 20) score += 22;
+  else if (n >= 12) score += 16;
+  else if (n >=  8) score += 10;
+  else              score +=  0; // < 8: not enough
+
+  // ── IQR tightness (0–30 points) ─────────────────────────
+  // Tight IQR = consistent market = we trust the median
+  // Wide IQR = noisy / mixed cohort = AI might do better
+  // Measured as IQR / median (coefficient of variation proxy)
+  if (stats.iqr != null && stats.marketMedian > 0) {
+    const cv = stats.iqr / stats.marketMedian;
+    if      (cv < 0.10) score += 30; // very tight — e.g. ±5% of median
+    else if (cv < 0.20) score += 22;
+    else if (cv < 0.30) score += 14;
+    else if (cv < 0.45) score +=  7;
+    else                score +=  0; // too wide — AI likely better
+  }
+
+  return Math.min(100, score);
+}
+
+function scoreDBKeywordResult(stats) {
+  if (!stats || !stats.count) return 0;
+  let score = 0;
+  const n = stats.count;
+  if      (n >= 50) score += 50;
+  else if (n >= 30) score += 40;
+  else if (n >= 20) score += 30;
+  else if (n >= 12) score += 20;
+  else if (n >=  8) score += 10;
+  if (stats.iqr != null && stats.median > 0) {
+    const cv = stats.iqr / stats.median;
+    if      (cv < 0.15) score += 50;
+    else if (cv < 0.25) score += 35;
+    else if (cv < 0.40) score += 20;
+    else if (cv < 0.55) score += 10;
+  }
+  return Math.min(100, score);
+}
+
+async function fetchBestVehiclePrice(make, model, year, mileage, opts = {}) {
+  const dbVehicle = await getDBVehicleStats(make, model, year, mileage, opts);
+  if (!dbVehicle) {
+    console.log(`[VehiclePrice] No DB data for ${make} ${model} ${year} — using AI`);
     return null;
   }
+  const score = scoreDBResult(dbVehicle);
+  if (score >= DB_TRUST_THRESHOLD) {
+    console.log(`[VehiclePrice] DB preferred (score ${score}) — ${make} ${model} ${year} tier ${dbVehicle.tier} n=${dbVehicle.samples}`);
+    return dbVehicle;
+  }
+  console.log(`[VehiclePrice] DB score ${score} < ${DB_TRUST_THRESHOLD} — AI preferred for ${make} ${model} ${year}`);
+  // Still return it so the AI route can use it to sanity-check its output
+  return { ...dbVehicle, belowThreshold: true };
 }
 
-
-// ── Tiered vehicle pricing orchestrator ──────────────────
-// Checks all cached sources in parallel, fetches live on cache miss.
-// Returns the highest-confidence priced source, or null if none available.
-async function fetchBestVehiclePrice(make, model, year, mileage) {
-  const makeKey  = (make  || '').toLowerCase().trim();
-  const modelKey = (model || '').toLowerCase().trim().replace(/\s+/g, '-');
-
-  // Tier 1–3: all cache reads in parallel (~50ms)
-  const [vpxStats, csalesDoc, agrabDoc] = await Promise.all([
-    getVehiclePriceStats(make, model, year, mileage),
-    getCarsalesCache(makeKey, modelKey, year),
-    getAutoGrabCache(makeKey, modelKey, year),
-  ]);
-
-  const candidates = [];
-
-  if (vpxStats && vpxStats.samples >= VPX_MIN_SAMPLES) {
-    candidates.push({
-      marketMedian:    vpxStats.marketMedian,
-      marketLow:       vpxStats.marketLow,
-      marketHigh:      vpxStats.marketHigh,
-      samples:         vpxStats.samples,
-      mileageAdjusted: vpxStats.mileageAdjusted,
-      source:    'vpx',
-      sourceLabel: `FlipRadar AU index · ${vpxStats.samples} comparable${vpxStats.samples !== 1 ? 's' : ''}`,
-      confidence: calcConfidence('vpx', vpxStats.samples),
-      make, model, year,
-    });
-  }
-
-  if (agrabDoc) {
-    const med  = mileage ? adjustMarketPriceToMileage(agrabDoc.privateSale,  mileage, makeKey, modelKey) : agrabDoc.privateSale;
-    const low  = mileage ? adjustMarketPriceToMileage(agrabDoc.tradeIn,      mileage, makeKey, modelKey) : agrabDoc.tradeIn;
-    const high = mileage ? adjustMarketPriceToMileage(agrabDoc.dealerRetail, mileage, makeKey, modelKey) : agrabDoc.dealerRetail;
-    candidates.push({
-      marketMedian: med, marketLow: low, marketHigh: high,
-      samples: 0, mileageAdjusted: !!(mileage),
-      source: 'autograb', sourceLabel: 'RedBook valuation (AutoGrab)',
-      confidence: calcConfidence('autograb', 0),
-      make, model, year,
-    });
-  }
-
-  if (csalesDoc && csalesDoc.count >= 3) {
-    const med  = Math.round((mileage ? adjustMarketPriceToMileage(csalesDoc.median, mileage, makeKey, modelKey) : csalesDoc.median) * CARSALES_BIAS);
-    const low  = Math.round((mileage ? adjustMarketPriceToMileage(csalesDoc.p25,    mileage, makeKey, modelKey) : csalesDoc.p25)    * CARSALES_BIAS);
-    const high = Math.round((mileage ? adjustMarketPriceToMileage(csalesDoc.p75,    mileage, makeKey, modelKey) : csalesDoc.p75)    * CARSALES_BIAS);
-    candidates.push({
-      marketMedian: med, marketLow: low, marketHigh: high,
-      samples: csalesDoc.count, mileageAdjusted: !!(mileage),
-      source: 'csales', sourceLabel: `Carsales AU market · ${csalesDoc.count} active listings`,
-      confidence: calcConfidence('csales', csalesDoc.count),
-      make, model, year,
-    });
-  }
-
-  // Sort by confidence — return immediately if best is already high enough
-  candidates.sort((a, b) => b.confidence - a.confidence);
-  if (candidates.length && candidates[0].confidence >= 0.65) return candidates[0];
-
-  // Tier 4: live AutoGrab (cache miss, $0.10–0.50, cached 30 days)
-  if (AUTOGRAB_API_KEY) {
-    const live = await fetchAutoGrabLive(makeKey, modelKey, year);
-    if (live) {
-      await storeAutoGrabCache(makeKey, modelKey, year, live);
-      const med  = mileage ? adjustMarketPriceToMileage(live.privateSale,  mileage, makeKey, modelKey) : live.privateSale;
-      const low  = mileage ? adjustMarketPriceToMileage(live.tradeIn,      mileage, makeKey, modelKey) : live.tradeIn;
-      const high = mileage ? adjustMarketPriceToMileage(live.dealerRetail, mileage, makeKey, modelKey) : live.dealerRetail;
-      return {
-        marketMedian: med, marketLow: low, marketHigh: high,
-        samples: 0, mileageAdjusted: !!(mileage),
-        source: 'autograb', sourceLabel: 'RedBook valuation (AutoGrab)',
-        confidence: calcConfidence('autograb', 0),
-        make, model, year,
-      };
-    }
-  }
-
-  // Return best we have even if below threshold (caller decides whether to use AI)
-  return candidates.length ? candidates[0] : null;
-}
-
-// ── Master price lookup — call this before AI ─────────────
-// Returns price data if we have enough to skip AI, null if AI needed
 async function getPriceCacheForKeyword(keyword) {
-  // 1. Check our own scan history first (most relevant — AU marketplace prices)
-  const own = await getOwnPriceRange(keyword);
-  if (own) {
-    console.log(`[PriceCache] "${keyword}" → own history (${own.count} records), skipping AI`);
-    return own;
+  const dbStats = await getDBPriceStats(keyword);
+  if (!dbStats) {
+    console.log(`[PriceCache] "${keyword}" → no DB data, using AI`);
+    return null;
   }
-
-  // 2. Not enough data — caller should use AI
-  console.log(`[PriceCache] "${keyword}" → no cache, AI needed`);
+  const score = scoreDBKeywordResult(dbStats);
+  if (score >= DB_TRUST_THRESHOLD) {
+    console.log(`[PriceCache] "${keyword}" → DB preferred (score ${score}, n=${dbStats.count})`);
+    return { ...dbStats, low: dbStats.p25 || dbStats.low, high: dbStats.p75 || dbStats.high };
+  }
+  console.log(`[PriceCache] "${keyword}" → DB score ${score} < ${DB_TRUST_THRESHOLD} — AI preferred`);
   return null;
 }
 
@@ -626,10 +1244,9 @@ function buildCacheVerdict(listingPrice, priceData) {
   };
 }
 
-// Mileage-aware verdict using the unified priceSource format from fetchBestVehiclePrice.
+// Mileage-aware verdict from DB price data (used when DB beats AI threshold).
 function buildVehicleVerdict(listingPrice, priceSource, mileage) {
-  const { marketMedian, marketLow, marketHigh, samples, make, model, year, mileageAdjusted,
-          source, sourceLabel, confidence } = priceSource;
+  const { marketMedian, marketLow, marketHigh, mileageAdjusted, make, model, year } = priceSource;
 
   const feeAdj          = marketMedian * 0.92;  // ~8% selling fees (FB/Gumtree)
   const roi             = marketMedian > 0 ? Math.round(((feeAdj - listingPrice) / listingPrice) * 100) : 0;
@@ -638,7 +1255,7 @@ function buildVehicleVerdict(listingPrice, priceSource, mileage) {
   let verdict, oneLiner, dealScore;
   if (roi >= 50) {
     verdict = 'STEAL'; dealScore = 95;
-    oneLiner = `Listed ${roi}% below AU market median — exceptional flip potential`;
+    oneLiner = `Listed ${roi}% below market median — exceptional flip potential`;
   } else if (roi >= 30) {
     verdict = 'GOOD DEAL'; dealScore = 82;
     oneLiner = `Listed ${roi}% below market — strong flip potential`;
@@ -664,24 +1281,12 @@ function buildVehicleVerdict(listingPrice, priceSource, mileage) {
   else if (dealScore >= 55) demandLevel = '📈 Moderate';
   else                      demandLevel = '📉 Low';
 
-  // Mileage unknown: lower dealScore and flag it — market median is at reference km, actual may differ significantly
-  if (!mileageAdjusted) {
-    dealScore = Math.max(0, dealScore - 8);
-  }
-  // Extra penalty for very high mileage — hard sell regardless of price
-  if (mileage && mileage > 200000) {
-    dealScore = Math.max(0, dealScore - 5);
-  }
+  if (!mileageAdjusted)            dealScore = Math.max(0, dealScore - 8);
+  if (mileage && mileage > 200000) dealScore = Math.max(0, dealScore - 5);
 
-  const mileageNote = mileageAdjusted ? ' (mileage-adjusted)' : '';
-  const carLabel    = [year, make, model].filter(Boolean).join(' ');
-  const srcLabel    = sourceLabel || 'AU vehicle index';
-  const confPct     = confidence != null ? Math.round(confidence * 100) : null;
-  const mileageWarning = !mileageAdjusted ? ' Mileage not provided — actual value may vary significantly.' : '';
-
-  const whyItsWorth = confPct != null
-    ? `${srcLabel} — ${confPct}% confidence${samples ? `, ${samples} comparable${samples !== 1 ? 's' : ''}` : ''}${mileageNote}.${mileageWarning}`
-    : `Based on ${samples} comparable ${carLabel} listings in AU${mileageNote}.${mileageWarning}`;
+  const carLabel         = [year, make, model].filter(Boolean).join(' ');
+  const mileageWarning   = !mileageAdjusted ? ' Mileage not listed — actual value may vary.' : '';
+  const whyItsWorth      = `Based on comparable ${carLabel} listings currently on the AU market.${mileageWarning}`;
 
   return {
     verdict,
@@ -700,15 +1305,10 @@ function buildVehicleVerdict(listingPrice, priceSource, mileage) {
     greenFlags:          [],
     redFlags:            [],
     whatToCheckInPerson: [],
-    dataPoints:          samples,
-    source:              source || 'vpx',
-    sourceLabel:         srcLabel,
-    confidence:          confidence || 0,
     low:    marketLow,
     median: marketMedian,
     high:   marketHigh,
-    negotiationScript: `Similar ${carLabel}s sell for around $${marketMedian.toLocaleString()}${mileageNote} in AU — would you take $${Math.round(listingPrice * 0.82).toLocaleString()}?`,
-    vpxData: priceSource,
+    negotiationScript: `Similar ${carLabel}s are going for around $${marketMedian.toLocaleString()} — would you take $${Math.round(listingPrice * 0.82).toLocaleString()}?`,
   };
 }
 
@@ -1147,6 +1747,7 @@ function normalizeVehicleTitle(rawTitle, year, make) {
 }
 
 // ── AU vehicle depreciation rates ────────────────────────
+const VPX_REF_KM = 100000;  // mileage reference for normalisation (100k km baseline)
 // annualRate: fraction lost per year, perKm: $/km additional depreciation vs VPX_REF_KM
 const DEP_TABLE = {
   toyota:      { annualRate: 0.12, perKm: 0.06 },
@@ -1604,6 +2205,271 @@ async function pauseInactiveUsers() {
 }
 cron.schedule('0 3 * * *', () => pauseInactiveUsers().catch(e => console.error('[AutoPause]', e.message)));
 
+// ── Nightly DB stats rebuild + IQR outlier pass (2am AEST) ──
+// 1. Back-scores any unscored/changed listings with quality flags
+// 2. Runs per-keyword IQR pass to tag statistical outliers
+// 3. Rebuilds pre-computed stats tables so appraisals are instant
+cron.schedule('0 2 * * *', async () => {
+  console.log('[Cron] Starting nightly quality pass + stats rebuild...');
+  try {
+
+    // ── Step 1: Re-score listings flagged unscored or with stale quality ──
+    // Catches any listings written before quality scoring was added
+    await pool.query(`
+      UPDATE listings SET
+        quality_flags = (
+          CASE WHEN title ~* '\\m(broken|cracked|faulty|damaged|spares?|repairs?|parts? only|not working|dead|seized|blown|written off|wrecked|flood|hail|project car|needs work|as.?is)\\M' THEN 2 ELSE 0 END |
+          CASE WHEN title ~* '\\m(swap|swaps|trade|trades|pto|part trade|part swap)\\M'  THEN 4 ELSE 0 END |
+          CASE WHEN title ~* '\\m(follow|instagram|whatsapp|telegram|bit\\.ly|t\\.me)\\M' THEN 64 ELSE 0 END
+        ),
+        price_quality = CASE
+          WHEN title ~* '\\m(broken|cracked|faulty|damaged|spares?|repairs?|parts? only|not working|dead|seized|blown|written off|wrecked|flood|hail|project car|needs work|as.?is)\\M' THEN 'not_for_sale'
+          WHEN title ~* '\\m(swap|swaps|trade|trades|pto|part trade|part swap)\\M'  THEN 'not_for_sale'
+          WHEN title ~* '\\m(follow|instagram|whatsapp|telegram|bit\\.ly|t\\.me)\\M' THEN 'spam'
+          ELSE 'ok'
+        END,
+        in_price_pool = CASE
+          WHEN title ~* '\\m(broken|cracked|faulty|damaged|spares?|repairs?|parts? only|not working|dead|seized|blown|written off|wrecked|flood|hail|project car|needs work|as.?is)\\M' THEN FALSE
+          WHEN title ~* '\\m(swap|swaps|trade|trades|pto|part trade|part swap)\\M'  THEN FALSE
+          WHEN title ~* '\\m(follow|instagram|whatsapp|telegram|bit\\.ly|t\\.me)\\M' THEN FALSE
+          ELSE TRUE
+        END
+      WHERE price_quality = 'unscored' OR price_quality IS NULL
+    `);
+
+    // ── Step 2: IQR outlier pass — per keyword ─────────────
+    // Marks listings whose price falls outside p25-1.5*IQR .. p75+1.5*IQR as outliers
+    // This catches listings like "$50 iPhone 14 Pro" or "$200,000 Toyota Corolla"
+    await pool.query(`
+      WITH cohort_fences AS (
+        SELECT
+          keyword,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price) AS p25,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price) AS p75
+        FROM listings
+        WHERE keyword IS NOT NULL
+          AND price > 0 AND is_offer_price = FALSE
+          AND price_quality = 'ok'
+          AND is_active = TRUE
+          AND scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY keyword
+        HAVING COUNT(*) >= 8
+      )
+      UPDATE listings l SET
+        price_quality = 'outlier',
+        quality_flags = quality_flags | 8,
+        in_price_pool = FALSE
+      FROM cohort_fences f
+      WHERE l.keyword = f.keyword
+        AND l.price_quality = 'ok'
+        AND l.is_active = TRUE
+        AND (
+          l.price < GREATEST(0, f.p25 - 1.5 * (f.p75 - f.p25))
+          OR
+          l.price > f.p75 + 1.5 * (f.p75 - f.p25)
+        )
+    `);
+
+    // ── Step 3: IQR outlier pass — per vehicle cohort ──────
+    await pool.query(`
+      WITH vehicle_fences AS (
+        SELECT
+          make, model, year,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price) AS p25,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price) AS p75
+        FROM listings
+        WHERE make IS NOT NULL AND year IS NOT NULL
+          AND price > 0 AND is_offer_price = FALSE
+          AND price_quality = 'ok'
+          AND is_active = TRUE
+        GROUP BY make, model, year
+        HAVING COUNT(*) >= 8
+      )
+      UPDATE listings l SET
+        price_quality = 'outlier',
+        quality_flags = quality_flags | 8,
+        in_price_pool = FALSE
+      FROM vehicle_fences f
+      WHERE l.make = f.make
+        AND (l.model = f.model OR (l.model IS NULL AND f.model IS NULL))
+        AND l.year = f.year
+        AND l.price_quality = 'ok'
+        AND l.is_active = TRUE
+        AND (
+          l.price < GREATEST(0, f.p25 - 1.5 * (f.p75 - f.p25))
+          OR
+          l.price > f.p75 + 1.5 * (f.p75 - f.p25)
+        )
+    `);
+
+    // ── Step 4: Rebuild keyword_price_stats with IQR data ──
+    await pool.query(`
+      INSERT INTO keyword_price_stats
+        (keyword, sample_count, raw_count, median_price, p25_price, p75_price,
+         iqr, floor_price, ceiling_price, low_price, high_price, updated_at)
+      WITH base AS (
+        SELECT keyword,
+          COUNT(*)::INT AS raw_count,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
+        FROM listings
+        WHERE keyword IS NOT NULL AND price > 0
+          AND is_offer_price = FALSE AND in_price_pool = TRUE AND is_active = TRUE
+          AND scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY keyword HAVING COUNT(*) >= 5
+      ),
+      fenced AS (
+        SELECT l.keyword,
+          b.raw_count,
+          b.p25, b.p75,
+          (b.p75 - b.p25)                               AS iqr,
+          GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))::INT  AS fence_lo,
+          (b.p75 + 1.5*(b.p75-b.p25))::INT             AS fence_hi,
+          COUNT(*)::INT                                 AS clean_count,
+          PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT AS median,
+          MIN(l.price)::INT                             AS low,
+          MAX(l.price)::INT                             AS high
+        FROM listings l JOIN base b ON l.keyword = b.keyword
+        WHERE l.price BETWEEN GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))
+                          AND (b.p75 + 1.5*(b.p75-b.p25))
+          AND l.is_offer_price = FALSE AND l.in_price_pool = TRUE
+          AND l.is_active = TRUE
+          AND l.scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY l.keyword, b.raw_count, b.p25, b.p75
+        HAVING COUNT(*) >= 5
+      )
+      SELECT keyword, clean_count, raw_count, median, p25, p75,
+             iqr::INT, fence_lo, fence_hi, low, high, NOW()
+      FROM fenced
+      ON CONFLICT (keyword) DO UPDATE SET
+        sample_count  = EXCLUDED.sample_count,
+        raw_count     = EXCLUDED.raw_count,
+        median_price  = EXCLUDED.median_price,
+        p25_price     = EXCLUDED.p25_price,
+        p75_price     = EXCLUDED.p75_price,
+        iqr           = EXCLUDED.iqr,
+        floor_price   = EXCLUDED.floor_price,
+        ceiling_price = EXCLUDED.ceiling_price,
+        low_price     = EXCLUDED.low_price,
+        high_price    = EXCLUDED.high_price,
+        updated_at    = NOW()
+    `);
+
+    // ── Step 5: Rebuild vehicle_price_stats — keyed by precise cohort ──
+    // Groups by every identity dimension, building one row per unique cohort.
+    // cohort_key = make|model|series|variant|year_band|mileage_band|transmission
+    await pool.query(`
+      INSERT INTO vehicle_price_stats
+        (cohort_key, make, model, series, variant, body_style,
+         year_band, mileage_band, transmission,
+         sample_count, raw_count,
+         median_price, p25_price, p75_price,
+         iqr, floor_price, ceiling_price, updated_at)
+      WITH raw_cohorts AS (
+        SELECT
+          LOWER(make)
+            || '|' || LOWER(COALESCE(model,''))
+            || '|' || LOWER(COALESCE(series,''))
+            || '|' || LOWER(COALESCE(variant,''))
+            || '|' || COALESCE(year_band,'unknown')
+            || '|' || COALESCE(mileage_band,'unknown')
+            || '|' || LOWER(COALESCE(transmission,''))   AS cohort_key,
+          make, COALESCE(model,'') AS model,
+          series, variant, body_style,
+          year_band, mileage_band, transmission,
+          COUNT(*)::INT AS raw_count,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
+        FROM listings
+        WHERE make IS NOT NULL AND year_band IS NOT NULL
+          AND price > 0 AND is_offer_price = FALSE
+          AND in_price_pool = TRUE
+          AND listing_status IN ('active','sold')
+        GROUP BY cohort_key, make, COALESCE(model,''), series, variant,
+                 body_style, year_band, mileage_band, transmission
+        HAVING COUNT(*) >= 5
+      ),
+      fenced AS (
+        SELECT
+          rc.cohort_key, rc.make, rc.model, rc.series, rc.variant,
+          rc.body_style, rc.year_band, rc.mileage_band, rc.transmission,
+          rc.raw_count,
+          (rc.p75 - rc.p25)                                AS iqr,
+          GREATEST(0, rc.p25 - 1.5*(rc.p75-rc.p25))::INT  AS fence_lo,
+          (rc.p75 + 1.5*(rc.p75-rc.p25))::INT             AS fence_hi,
+          COUNT(l.id)::INT                                 AS clean_count,
+          PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT AS median,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT AS p25_clean,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT AS p75_clean
+        FROM listings l
+        JOIN raw_cohorts rc ON (
+          LOWER(l.make) = LOWER(rc.make)
+          AND COALESCE(l.model,'') = rc.model
+          AND COALESCE(l.series,'')       = COALESCE(rc.series,'')
+          AND COALESCE(l.variant,'')      = COALESCE(rc.variant,'')
+          AND COALESCE(l.year_band,'unknown')    = COALESCE(rc.year_band,'unknown')
+          AND COALESCE(l.mileage_band,'unknown') = COALESCE(rc.mileage_band,'unknown')
+          AND COALESCE(l.transmission,'')        = COALESCE(rc.transmission,'')
+        )
+        WHERE l.price BETWEEN GREATEST(0, rc.p25 - 1.5*(rc.p75-rc.p25))
+                          AND (rc.p75 + 1.5*(rc.p75-rc.p25))
+          AND l.is_offer_price = FALSE
+          AND l.in_price_pool = TRUE
+          AND l.listing_status IN ('active','sold')
+        GROUP BY rc.cohort_key, rc.make, rc.model, rc.series, rc.variant,
+                 rc.body_style, rc.year_band, rc.mileage_band, rc.transmission,
+                 rc.raw_count, rc.p25, rc.p75
+        HAVING COUNT(l.id) >= 5
+      )
+      SELECT cohort_key, make, model, series, variant, body_style,
+             year_band, mileage_band, transmission,
+             clean_count, raw_count,
+             median, p25_clean, p75_clean,
+             iqr::INT, fence_lo, fence_hi, NOW()
+      FROM fenced
+      ON CONFLICT (cohort_key) DO UPDATE SET
+        sample_count  = EXCLUDED.sample_count,
+        raw_count     = EXCLUDED.raw_count,
+        median_price  = EXCLUDED.median_price,
+        p25_price     = EXCLUDED.p25_price,
+        p75_price     = EXCLUDED.p75_price,
+        iqr           = EXCLUDED.iqr,
+        floor_price   = EXCLUDED.floor_price,
+        ceiling_price = EXCLUDED.ceiling_price,
+        updated_at    = NOW()
+    `);
+
+    // ── Step 6: Mark gone listings as sold (not inactive) ──
+    // Listings not seen in 30 days assumed sold — price stays in pool
+    const sold = await pool.query(`
+      UPDATE listings
+      SET listing_status = 'sold',
+          is_active      = FALSE
+      WHERE last_seen_at < NOW() - INTERVAL '30 days'
+        AND listing_status = 'active'
+        AND is_active = TRUE
+      RETURNING id
+    `);
+
+    // ── Step 7: Report ─────────────────────────────────────
+    const [summary, outlierCount, poolCount] = await Promise.all([
+      getDBSummary(),
+      pool.query(`SELECT COUNT(*)::INT AS cnt FROM listings WHERE price_quality = 'outlier'`),
+      pool.query(`SELECT COUNT(*)::INT AS cnt FROM listings WHERE in_price_pool = TRUE AND is_active = TRUE`),
+    ]);
+    const soldCount = await pool.query(`SELECT COUNT(*)::INT AS cnt FROM listings WHERE listing_status='sold'`);
+    console.log(
+      `[Cron] Done. Total: ${summary?.total_listings} listings · ` +
+      `In price pool: ${poolCount.rows[0].cnt} · ` +
+      `Outliers tagged: ${outlierCount.rows[0].cnt} · ` +
+      `Marked sold: ${sold.rowCount} · ` +
+      `Total sold in DB: ${soldCount.rows[0].cnt}`
+    );
+  } catch (e) {
+    console.error('[Cron] Stats rebuild error:', e.message);
+  }
+});
+
 // ── Boot: load all watches from Redis ─────────────────────
 async function loadAllWatches() {
   // Resolve owner userId so watcher-level plan checks work
@@ -1634,15 +2500,93 @@ if (SELF_URL) {
 }
 
 // ── Routes ────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({
-  status: 'ok',
-  brightdata: BRIGHTDATA_API_KEY ? 'connected' : 'NO BRIGHTDATA_API_KEY SET',
-  redis:  REDIS_URL   ? 'connected' : 'not set',
-  watches: watchlist.length,
-  timers:  Object.keys(watchTimers).length,
-  lastScan: lastScanTime,
-  lastScanNewListings: lastScanCount,
-}));
+app.get('/', async (req, res) => {
+  const dbSummary = await getDBSummary().catch(() => null);
+  res.json({
+    status:   'ok',
+    redis:    REDIS_URL ? 'connected' : 'not set',
+    database: DATABASE_URL ? 'connected' : 'not set',
+    db: dbSummary ? {
+      totalListings:    dbSummary.total_listings,
+      activeListings:   dbSummary.active_listings,
+      uniqueKeywords:   dbSummary.unique_keywords,
+      uniqueMakes:      dbSummary.unique_makes,
+      lastScraped:      dbSummary.last_scraped,
+    } : null,
+    watches:  watchlist.length,
+    timers:   Object.keys(watchTimers).length,
+    lastScan: lastScanTime,
+    lastScanNewListings: lastScanCount,
+  });
+});
+
+// GET /db/stats — detailed database statistics (owner-gated)
+app.get('/db/stats', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+
+    const [summary, topKeywords, topMakes, recentActivity] = await Promise.all([
+      getDBSummary(),
+      pool.query(`
+        SELECT keyword, sample_count, median_price, p25_price, p75_price, updated_at
+        FROM keyword_price_stats
+        ORDER BY sample_count DESC LIMIT 20
+      `),
+      pool.query(`
+        SELECT make, COUNT(*)::INT AS count, AVG(price)::INT AS avg_price,
+               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+        FROM listings
+        WHERE make IS NOT NULL AND price > 0 AND is_offer_price = FALSE
+        GROUP BY make ORDER BY count DESC LIMIT 15
+      `),
+      pool.query(`
+        SELECT DATE(scraped_at) AS day, COUNT(*)::INT AS listings_scraped
+        FROM listings
+        WHERE scraped_at > NOW() - INTERVAL '14 days'
+        GROUP BY day ORDER BY day DESC
+      `),
+    ]);
+
+    res.json({
+      summary,
+      topKeywords:    topKeywords.rows,
+      topVehicleMakes: topMakes.rows,
+      dailyActivity:  recentActivity.rows,
+    });
+  } catch (e) {
+    console.error('[DB/stats]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /db/comparables?keyword=ps5&limit=20 — raw comparables for a keyword
+app.get('/db/comparables', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, limit } = req.query;
+    if (!keyword) return res.status(400).json({ error: 'keyword required' });
+    const rows = await getDBComparables(keyword, parseInt(limit) || 20);
+    res.json({ keyword, count: rows.length, comparables: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /db/prices?keyword=hilux — price stats for a keyword
+app.get('/db/prices', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, make, model, year, mileage } = req.query;
+    if (make && year) {
+      const stats = await getDBVehicleStats(make, model, parseInt(year), mileage ? parseInt(mileage) : null);
+      return res.json({ found: !!stats, type: 'vehicle', ...stats });
+    }
+    if (!keyword) return res.status(400).json({ error: 'keyword or make+year required' });
+    const stats = await getDBPriceStats(keyword);
+    res.json({ found: !!stats, type: 'keyword', ...stats });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 // ── Auth routes ───────────────────────────────────────────
 app.post('/auth/signup', async (req, res) => {
@@ -1967,7 +2911,7 @@ app.get('/prices/vehicle', authMiddleware, async (req, res) => {
     const { make, model, year, mileage } = req.query;
     if (!make || !year) return res.status(400).json({ error: 'make and year required' });
     const resolvedModel = model || null;
-    const stats = await getVehiclePriceStats(make, resolvedModel, parseInt(year), mileage ? parseInt(mileage) : null);
+    const stats = await getDBVehicleStats(make, resolvedModel, parseInt(year), mileage ? parseInt(mileage) : null);
     if (!stats) return res.json({ found: false, make, model, year });
     res.json({ found: true, ...stats });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
@@ -2219,8 +3163,8 @@ const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-ra
 // Redis key for push subscriptions
 const K_push = userId => `fr:push:${userId}`;
 
-// POST /ai/vehicle — vehicle-specific AI appraisal (pure AI, no market data lookup)
-// Body: { make, model, year, mileage, listingPrice, title, description, imageUrl?, imageBase64?, imageMime? }
+// POST /ai/vehicle — vehicle appraisal grounded in DB data when available
+// DB data is fetched FIRST so AI can reason from real market numbers.
 app.post('/ai/vehicle', authMiddleware, async (req, res) => {
   try {
     if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
@@ -2240,99 +3184,161 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
     const cr = await consumeAppraisal(req.userId);
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
-    // Fetch full listing details from SociaVault to get real description, condition, photos
+    // ── Step 1: Fetch DB market data BEFORE building prompt ──
+    // Key change: DB data feeds INTO the prompt so AI reasons from
+    // real AU market numbers rather than training data alone.
+    const dbResult = (make && model && year)
+      ? await fetchBestVehiclePrice(make, model, year, mileage, {
+          series: req.body.series, variant: req.body.variant, transmission
+        }).catch(() => null)
+      : null;
+
+    const dbPreferred = dbResult && !dbResult.belowThreshold;
+    const dbAvailable = !!dbResult;
+
+    // ── Step 2: Fetch full listing details from SociaVault ──
     let fullDescription = description || '';
     let condition = null;
-    let additionalPhotos = [];
     if (listingId || listingUrl) {
       const details = await fetchListingDetails(listingId, listingUrl);
       if (details) {
-        // Prefer the full scraped description over the search-result stub
         if (details.description && details.description.length > (fullDescription?.length || 0)) {
           fullDescription = details.description;
         }
-        condition     = details.condition || null;
-        additionalPhotos = details.photos || [];
-        console.log(`[AI/vehicle] Fetched full details for ${listingId || listingUrl} — desc: ${fullDescription.length} chars, condition: ${condition}`);
+        condition = details.condition || null;
+        console.log(`[AI/vehicle] Fetched full details — desc: ${fullDescription.length} chars, condition: ${condition}`);
       }
     }
 
+    // ── Step 3: Build DB market context block ────────────────
+    // Injected into the prompt — AI uses these real numbers as its anchor.
+    let dbMarketContext = '';
+    if (dbAvailable && dbResult.marketMedian) {
+      const mb        = dbResult.mileageBand || 'unknown mileage range';
+      const yb        = dbResult.yearBand    || String(year);
+      const cohortStr = [make, model, dbResult.series, dbResult.variant].filter(Boolean).join(' ');
+      const listingMileageBand = mileage ? bandMileage(mileage) : null;
+      const mileageMismatch = listingMileageBand && dbResult.mileageBand && listingMileageBand !== dbResult.mileageBand;
+
+      if (dbPreferred) {
+        const consistency = dbResult.iqr && dbResult.marketMedian
+          ? (dbResult.iqr / dbResult.marketMedian < 0.2 ? 'tight, consistent market' : 'moderate spread')
+          : '';
+        const mileageNote = mileageMismatch
+          ? `NOTE: Listing mileage (${Number(mileage).toLocaleString()} km) is outside the ${mb} cohort. ` +
+            `Use the cohort data as a baseline and adjust using the depreciation guide below.`
+          : `Listing mileage matches this cohort — use the market data directly, adjusted for condition signals.`;
+
+        dbMarketContext = [
+          '',
+          'REAL MARKET DATA FROM AU LISTINGS (use as your pricing anchor — actual observed data, not estimates):',
+          `- Vehicle cohort: ${cohortStr} · ${yb} · ${mb}`,
+          `- Market median price for this cohort: $${dbResult.marketMedian.toLocaleString()}`,
+          `- Price range (P25–P75): $${dbResult.marketLow.toLocaleString()} – $${dbResult.marketHigh.toLocaleString()}`,
+          `- Sample size: ${dbResult.samples} comparable AU listings`,
+          dbResult.iqr ? `- Market consistency (IQR): $${dbResult.iqr.toLocaleString()} — ${consistency}` : '',
+          '',
+          mileageNote,
+          'Your estimatedMarketValue MUST be grounded in these numbers.',
+          'Adjust up or down based on condition/extras/description but do not deviate >25% without stating why in whyItsWorth.',
+        ].filter(l => l !== null).join('\n');
+
+      } else {
+        dbMarketContext = [
+          '',
+          'PARTIAL MARKET DATA FROM AU LISTINGS (small sample — directional reference only):',
+          `- Vehicle cohort: ${cohortStr} · ${yb} · ${mb}`,
+          `- Observed median: $${dbResult.marketMedian.toLocaleString()}`,
+          `- Observed range: $${dbResult.marketLow.toLocaleString()} – $${dbResult.marketHigh.toLocaleString()}`,
+          `- Sample size: ${dbResult.samples} listings`,
+          mileageMismatch
+            ? `Listing mileage (${Number(mileage).toLocaleString()} km) differs from ${mb} cohort — interpolate using the depreciation guide.`
+            : '',
+          'Use alongside your own knowledge. If figures conflict with your knowledge, use judgment.',
+        ].filter(l => l !== null).join('\n');
+      }
+    } else {
+      dbMarketContext = '\nNO DATABASE DATA AVAILABLE for this vehicle cohort yet.\nUse your knowledge of the AU used-car market. Be conservative.';
+    }
+
+    // ── Step 4: Build the full prompt ─────────────────────
     const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
     const vehicleDetails = [
       `Make/Model/Year: ${carLabel}`,
-      mileage ? `Mileage: ${Number(mileage).toLocaleString()} km` : null,
+      req.body.series  ? `Series: ${req.body.series}`   : null,
+      req.body.variant ? `Variant: ${req.body.variant}` : null,
+      mileage     ? `Mileage: ${Number(mileage).toLocaleString()} km` : null,
       transmission ? `Transmission: ${transmission}` : null,
-      condition ? `Condition: ${condition}` : null,
+      condition    ? `Condition: ${condition}` : null,
       `Listing Price: $${Number(listingPrice).toLocaleString()}`,
     ].filter(Boolean).join('\n');
 
-    const mileageGuide = mileage
-      ? `\n\nMILEAGE DEPRECIATION GUIDE (AU market):
-- Under 80,000 km: premium condition — little to no discount vs median
-- 80,000–130,000 km: normal use — at or near median
-- 130,000–180,000 km: moderate discount (~10–20% below median expected)
-- 180,000–250,000 km: significant discount (~25–40% below median)
-- Over 250,000 km: hard sell — price well below median, expect long time-to-sell`
-      : '';
+    const mileageGuide = [
+      '',
+      'MILEAGE DEPRECIATION GUIDE (AU market — use when interpolating from cohort data):',
+      '- Under 80,000 km:    premium — add 10–20% above cohort median',
+      '- 80,000–130,000 km:  normal use — at cohort median',
+      '- 130,000–180,000 km: moderate discount (~10–20% below median)',
+      '- 180,000–250,000 km: significant discount (~25–40% below median)',
+      '- Over 250,000 km:    hard sell — well below median, long time-to-sell',
+    ].join('\n');
 
-    const prompt = `You are an expert Australian used-vehicle flipper and assessor. Your goal is conservative, realistic flip analysis using your knowledge of the AU used-car market — do NOT overestimate profit potential.
+    const prompt = [
+      'You are an expert Australian used-vehicle flipper and market analyst. Your goal is accurate, conservative valuation grounded in real market data.',
+      dbMarketContext,
+      '',
+      'VEHICLE DETAILS:',
+      vehicleDetails,
+      mileageGuide,
+      '',
+      `LISTING TITLE: ${title || '(not provided)'}`,
+      'FULL LISTING DESCRIPTION:',
+      '"""',
+      fullDescription || '(not provided)',
+      '"""',
+      '',
+      'EXTRACT AND FACTOR IN FROM DESCRIPTION:',
+      '- Exact variant/trim/series (VE SS, FG XR6, GU TDI, SR5 etc) — significantly affects value',
+      '- Engine (3.6L V6, 6.0L V8, 3.0 diesel etc) — extract if not in title',
+      '- Extras (towbar, lift kit, ARB gear, new tyres, canopy, leather, sunroof) — add value',
+      '- Service history (logbooks, one owner, recently serviced) — adds significant value',
+      '- Defects (rust, oil leaks, engine noise, worn interior, needs RWC, accident history) — reduce value, add red flags',
+      '- Urgency signals (must sell, moving, price reduced) — negotiation leverage',
+      '- Rego status (registered until X, unregistered, interstate) — affects buyer cost',
+      '',
+      'Flip guidance: deduct ~8% for selling fees and ~$200–500 for detailing/prep. Only call STEAL if margin is genuinely exceptional after all costs.',
+      '',
+      'Broken/project cars: if listing mentions "spares or repairs", "not running", "blown", "needs work", "as-is" — set isBrokenOrProject true, provide repairEstimate, cap verdict at FAIR unless post-repair ROI is exceptional.',
+      '',
+      'Respond ONLY in this exact JSON format (no markdown, no text outside JSON):',
+      '{',
+      '  "verdict": "STEAL|GOOD DEAL|FAIR|PASS",',
+      '  "dealScore": 0-100,',
+      '  "oneLiner": "one punchy sentence",',
+      '  "extractedTitle": "cleaned listing title",',
+      '  "extractedPrice": number,',
+      '  "estimatedMarketValue": number,',
+      '  "estimatedResellLow": number,',
+      '  "estimatedResellHigh": number,',
+      '  "recommendedOffer": number,',
+      '  "walkAwayPrice": number,',
+      '  "estimatedProfit": number,',
+      '  "roiPercent": number,',
+      '  "timeToSell": "1-3 days / 3-7 days / 1-2 weeks / 2-4 weeks",',
+      '  "demandLevel": "🔥 High or 📈 Moderate or 📉 Low",',
+      '  "whyItsWorth": "1-2 sentences referencing the actual price numbers",',
+      '  "greenFlags": ["..."],',
+      '  "redFlags": ["..."],',
+      '  "whatToCheckInPerson": ["..."],',
+      '  "negotiationScript": "what to say to the seller",',
+      '  "isBrokenOrProject": false,',
+      '  "repairEstimate": 0,',
+      '  "repairNotes": "",',
+      '  "aiGenerated": true',
+      '}',
+    ].join('\n');
 
-VEHICLE DETAILS:
-${vehicleDetails}
-${mileageGuide}
-
-LISTING TITLE: ${title || '(not provided)'}
-FULL LISTING DESCRIPTION:
-"""
-${fullDescription || '(not provided)'}
-"""
-
-CRITICAL — READ THE DESCRIPTION CAREFULLY AND EXTRACT ALL SIGNALS BEFORE VALUING:
-- Exact variant/trim/series (e.g. GXL, Turbo, Sport, VE SS, FG XR6, TDI400) — this significantly affects value
-- Engine size and type (e.g. 3.0 diesel, V8 petrol, turbocharged) — extract from description if not in title
-- Extras or modifications (towbar, roof rack, new tyres, lift kit, ARB gear, leather, sunroof, canopy) — add value
-- Service history (full logbooks, one owner, just serviced, stamped history) — significantly adds value
-- Defects or faults (scratch, dent, rust, oil leak, engine noise, needs RWC, worn interior, cracked screen) — reduce value and flag as red flags
-- Urgency signals (moving overseas, must sell, price reduced, motivated seller) — opportunity to negotiate lower
-- Rego status (registered until X, unregistered, interstate rego) — affects buyer's immediate cost
-- Recent work done (new clutch, new brakes, timing belt replaced, new battery) — reduces buyer risk
-
-Use ALL of the above to adjust your market value estimate. A well-specced variant with full service history is worth significantly more than a base model. Missing service history or vague condition descriptions should be red flags.
-
-Use your knowledge of AU used-car pricing to estimate market value conservatively. Apply the mileage guide above when mileage is provided.
-
-Flip guidance: account for selling fees (~8% on Facebook/Gumtree), detailing/minor repairs (~$200–500), and time cost. Only call it a STEAL if the margin is genuinely exceptional after all these costs.
-
-Broken/project car detection: If the listing mentions "spares or repairs", "project car", "not running", "blown head gasket", "engine out", "accident damage", "needs work", "as-is", or similar, set isBrokenOrProject to true and provide a realistic repairEstimate in AUD. Subtract repairEstimate from estimatedProfit. A broken car's maximum verdict should be FAIR unless the margin after full repairs is truly exceptional (30%+ net ROI). Be conservative — buyers often underestimate repair bills.
-
-Respond in this exact JSON format (no markdown, no prose outside JSON):
-{
-  "verdict": "STEAL|GOOD DEAL|FAIR|PASS",
-  "dealScore": 0-100,
-  "oneLiner": "one punchy sentence",
-  "extractedTitle": "cleaned listing title (make/model/year/variant)",
-  "extractedPrice": number,
-  "estimatedMarketValue": number,
-  "estimatedResellLow": number,
-  "estimatedResellHigh": number,
-  "recommendedOffer": number,
-  "walkAwayPrice": number,
-  "estimatedProfit": number,
-  "roiPercent": number,
-  "timeToSell": "e.g. 1-3 days or 1-2 weeks",
-  "demandLevel": "🔥 High or 📈 Moderate or 📉 Low",
-  "whyItsWorth": "1-2 sentence explanation of market value",
-  "greenFlags": ["positive aspects from listing"],
-  "redFlags": ["concerns or risks from listing"],
-  "whatToCheckInPerson": ["inspection checklist items"],
-  "negotiationScript": "what to say to the seller",
-  "isBrokenOrProject": false,
-  "repairEstimate": 0,
-  "repairNotes": "",
-  "aiGenerated": true
-}`;
-
-    // Prefer Gemini when image is available, otherwise Claude Haiku
+    // ── Step 5: Call AI ────────────────────────────────────
     let text = '';
     const hasImage = !!(imageBase64 || imageUrl);
 
@@ -2372,12 +3378,7 @@ Respond in this exact JSON format (no markdown, no prose outside JSON):
       text = claudeRes.data?.content?.[0]?.text || '';
     }
 
-    // Fetch market price data to anchor AI output
-    const vpxStats = (make && model && year)
-      ? await fetchBestVehiclePrice(make, model, year, mileage).catch(() => null)
-      : null;
-
-    // Parse structured JSON from AI response
+    // ── Step 6: Parse and apply DB hard-override if trusted ──
     let parsed = null;
     try {
       const jsonMatch = text.match(/\{[\s\S]*\}/);
@@ -2385,34 +3386,41 @@ Respond in this exact JSON format (no markdown, no prose outside JSON):
     } catch (_) {}
 
     if (parsed) {
-      if (vpxStats) {
-        // Anchor resell range to market data if AI drifted >25%
-        if (parsed.estimatedResellLow && parsed.estimatedResellHigh) {
-          const aiMedian = (parsed.estimatedResellLow + parsed.estimatedResellHigh) / 2;
-          const drift = Math.abs(aiMedian - vpxStats.marketMedian) / vpxStats.marketMedian;
-          if (drift > 0.25 && vpxStats.confidence >= 0.65) {
-            parsed.estimatedResellLow  = vpxStats.marketLow;
-            parsed.estimatedResellHigh = vpxStats.marketHigh;
-            parsed._pricingCorrected   = true;
-          }
-        }
-        parsed.sourceLabel        = vpxStats.sourceLabel;
-        parsed.confidence         = vpxStats.confidence;
-        parsed.dataPoints         = vpxStats.samples;
-        parsed.low                = vpxStats.marketLow;
-        parsed.median             = vpxStats.marketMedian;
-        parsed.high               = vpxStats.marketHigh;
-        parsed.estimatedMarketValue = parsed.estimatedMarketValue || vpxStats.marketMedian;
-        parsed.vpxData = vpxStats;
+      if (dbPreferred) {
+        // DB is fully trusted — lock the price fields
+        // AI still owns: verdict rationale, flags, negotiation script, inspection checklist
+        parsed.estimatedMarketValue = dbResult.marketMedian;
+        parsed.estimatedResellLow   = dbResult.marketLow;
+        parsed.estimatedResellHigh  = dbResult.marketHigh;
+        parsed.low                  = dbResult.marketLow;
+        parsed.median               = dbResult.marketMedian;
+        parsed.high                 = dbResult.marketHigh;
+        const feeAdj = dbResult.marketMedian * 0.92;
+        parsed.estimatedProfit = Math.max(0, Math.round(feeAdj - listingPrice));
+        parsed.roiPercent = dbResult.marketMedian > 0
+          ? Math.round(((feeAdj - listingPrice) / listingPrice) * 100) : 0;
+        // Re-anchor verdict/score to corrected ROI
+        if      (parsed.roiPercent >= 50) { parsed.verdict = 'STEAL';     parsed.dealScore = Math.max(parsed.dealScore || 0, 88); }
+        else if (parsed.roiPercent >= 30) { parsed.verdict = 'GOOD DEAL'; parsed.dealScore = Math.max(parsed.dealScore || 0, 72); }
+        else if (parsed.roiPercent >= 15) { parsed.verdict = 'GOOD DEAL'; parsed.dealScore = Math.max(parsed.dealScore || 0, 58); }
+        else if (parsed.roiPercent >= 0)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(parsed.dealScore || 55, 55); }
+        else                              { parsed.verdict = 'PASS';      parsed.dealScore = Math.min(parsed.dealScore || 30, 30); }
       }
+
+      // Strip internal fields — never send to user
+      delete parsed.sourceLabel;
+      delete parsed.confidence;
+      delete parsed.dataPoints;
+      delete parsed.dbData;
+      delete parsed._pricingCorrected;
+
       const finalResult = { ...parsed, text, usedCache: false };
-      // Store in appraisal cache for future users
       await setAppraisalCache(listingId, title, listingPrice, keyword, finalResult).catch(e =>
         console.error('[AprCache] Write error:', e.message)
       );
       res.json(finalResult);
     } else {
-      res.json({ text, usedCache: false, vpxData: vpxStats || null });
+      res.json({ text, usedCache: false });
     }
   } catch (e) {
     console.error('[AI/vehicle]', e.response?.data || e.message);
@@ -2600,6 +3608,11 @@ app.listen(PORT, async () => {
   console.log(`Redis:      ${REDIS_URL           ? 'connected' : 'NOT SET'}`);
   console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
   console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
+  await initDB();          // create tables if not exist
   await loadAllWatches();
+  const dbSummary = await getDBSummary();
+  if (dbSummary) {
+    console.log(`[DB] ${dbSummary.total_listings} listings · ${dbSummary.unique_keywords} keywords · ${dbSummary.unique_makes} vehicle makes`);
+  }
   console.log('[Ready] Server fully loaded');
 });
