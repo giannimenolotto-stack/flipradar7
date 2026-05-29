@@ -17,6 +17,8 @@ const ENOUGH_COMPS = 8;            // at/above this, real data carries it fully
 
 // ── the "slider": move a comp's price from its km to the target's km ──
 function slideToKm(price, fromKm, toKm, make) {
+  // VERIFY: DEP_TABLE must be keyed by lowercase make ('toyota') with a `perKm` field.
+  // If the keys differ, this silently falls back to REF_FALLBACK_PERKM for every car.
   const perKm = (DEP_TABLE?.[String(make || '').toLowerCase()]?.perKm) || REF_FALLBACK_PERKM;
   // fewer km than the comp ⇒ worth more; more km ⇒ worth less
   const adjusted = price + (fromKm - toKm) * perKm;
@@ -76,6 +78,15 @@ Return ONLY JSON: { "est_aud": number }`;
 
 // ── the blend: one value + confidence for the target car ──
 async function appraiseVehicleValue(target) {
+  // Guard: no km on the target ⇒ we can't slide comps to it. Fall back to AI only,
+  // rather than treating the car as 0 km (brand new) and inflating everything.
+  if (!target.kms || target.kms <= 0) {
+    const aiEst = await aiEstimateVehicle(target);
+    return aiEst
+      ? { value: aiEst, confidence: 15, source: 'ai_only', poolN: 0, aiEst }
+      : { value: null, confidence: 0, source: 'none', poolN: 0 };
+  }
+
   const comps = await getVehicleComps(target);
 
   // slide every comp to the target km, weight by km-closeness (+ a little recency)
