@@ -352,6 +352,622 @@ function extractEngineFromTitle(title, description) {
   return m ? m[1].trim() : null;
 }
 
+
+// ══════════════════════════════════════════════════════════════════════
+// VEHICLE GENERATION RESOLVER
+// Knows which year ranges belong to which chassis/generation code.
+// e.g. BMW 318i 1995 → E36. Holden Commodore 1999 → VT.
+// Lookup table covers AU market. AI fills the gaps and caches 1 year.
+// ══════════════════════════════════════════════════════════════════════
+
+const VEHICLE_GENERATIONS = {
+  holden: {
+    commodore: [
+      { series:'VP', from:1991, to:1993 },
+      { series:'VR', from:1993, to:1995 },
+      { series:'VS', from:1995, to:1997 },
+      { series:'VT', from:1997, to:2000 },
+      { series:'VX', from:2000, to:2002 },
+      { series:'VY', from:2002, to:2004 },
+      { series:'VZ', from:2004, to:2006 },
+      { series:'VE', from:2006, to:2013 },
+      { series:'VF', from:2013, to:2017 },
+    ],
+    colorado: [
+      { series:'RC', from:2008, to:2012 },
+      { series:'RG', from:2012, to:2020 },
+      { series:'RG Facelift', from:2016, to:2020 },
+    ],
+    captiva: [
+      { series:'CG', from:2006, to:2018 },
+    ],
+  },
+  ford: {
+    falcon: [
+      { series:'EA', from:1988, to:1991 },
+      { series:'EB', from:1991, to:1993 },
+      { series:'EF', from:1994, to:1996 },
+      { series:'EL', from:1996, to:1998 },
+      { series:'AU', from:1998, to:2002 },
+      { series:'BA', from:2002, to:2005 },
+      { series:'BF', from:2005, to:2008 },
+      { series:'FG', from:2008, to:2014 },
+      { series:'FG X', from:2014, to:2016 },
+    ],
+    ranger: [
+      { series:'PX', from:2011, to:2015 },
+      { series:'PX MkII', from:2015, to:2018 },
+      { series:'PX MkIII', from:2018, to:2022 },
+      { series:'P703', from:2022, to:2099 },
+    ],
+    territory: [
+      { series:'SX', from:2004, to:2005 },
+      { series:'SY', from:2005, to:2011 },
+      { series:'SZ', from:2011, to:2016 },
+    ],
+    everest: [
+      { series:'UA', from:2015, to:2022 },
+      { series:'UB', from:2022, to:2099 },
+    ],
+  },
+  toyota: {
+    landcruiser: [
+      { series:'40 Series', from:1960, to:1984 },
+      { series:'60 Series', from:1980, to:1987 },
+      { series:'70 Series', from:1984, to:2099 },
+      { series:'80 Series', from:1989, to:1998 },
+      { series:'100 Series', from:1997, to:2007 },
+      { series:'200 Series', from:2007, to:2021 },
+      { series:'300 Series', from:2021, to:2099 },
+    ],
+    prado: [
+      { series:'J70',  from:1984, to:1990 },
+      { series:'J80',  from:1990, to:1996 },
+      { series:'J90',  from:1996, to:2002 },
+      { series:'J120', from:2002, to:2009 },
+      { series:'J150', from:2009, to:2099 },
+    ],
+    hilux: [
+      { series:'N60',      from:1983, to:1988 },
+      { series:'5th Gen',  from:1988, to:1997 },
+      { series:'6th Gen',  from:1997, to:2005 },
+      { series:'N70',      from:2005, to:2015 },
+      { series:'N80',      from:2015, to:2099 },
+    ],
+    camry: [
+      { series:'XV10', from:1991, to:1996 },
+      { series:'XV20', from:1996, to:2001 },
+      { series:'XV30', from:2001, to:2006 },
+      { series:'XV40', from:2006, to:2011 },
+      { series:'XV50', from:2011, to:2017 },
+      { series:'XV70', from:2017, to:2099 },
+    ],
+    corolla: [
+      { series:'E100', from:1991, to:1997 },
+      { series:'E110', from:1997, to:2002 },
+      { series:'E120', from:2001, to:2007 },
+      { series:'E140', from:2006, to:2013 },
+      { series:'E170', from:2013, to:2018 },
+      { series:'E210', from:2018, to:2099 },
+    ],
+    kluger: [
+      { series:'XU20',  from:2003, to:2007 },
+      { series:'GSU40', from:2007, to:2014 },
+      { series:'GSU50', from:2014, to:2020 },
+      { series:'AXUH80',from:2020, to:2099 },
+    ],
+    'rav4': [
+      { series:'XA10', from:1994, to:2000 },
+      { series:'XA20', from:2000, to:2005 },
+      { series:'XA30', from:2005, to:2012 },
+      { series:'XA40', from:2012, to:2018 },
+      { series:'XA50', from:2018, to:2099 },
+    ],
+    'hiace': [
+      { series:'H100', from:1989, to:2004 },
+      { series:'H200', from:2004, to:2019 },
+      { series:'H300', from:2019, to:2099 },
+    ],
+    'tarago': [
+      { series:'XR50', from:2006, to:2017 },
+    ],
+  },
+  nissan: {
+    patrol: [
+      { series:'GQ', from:1987, to:1997 },
+      { series:'GU', from:1997, to:2016 },
+      { series:'Y62', from:2010, to:2099 },
+    ],
+    navara: [
+      { series:'D21', from:1986, to:1997 },
+      { series:'D22', from:1997, to:2015 },
+      { series:'D40', from:2004, to:2015 },
+      { series:'D23', from:2015, to:2099 },
+    ],
+    skyline: [
+      { series:'R31', from:1985, to:1990 },
+      { series:'R32', from:1989, to:1993 },
+      { series:'R33', from:1993, to:1998 },
+      { series:'R34', from:1998, to:2002 },
+      { series:'V35', from:2001, to:2006 },
+      { series:'V36', from:2006, to:2014 },
+    ],
+    silvia: [
+      { series:'S12', from:1984, to:1988 },
+      { series:'S13', from:1988, to:1994 },
+      { series:'S14', from:1993, to:1999 },
+      { series:'S15', from:1999, to:2002 },
+    ],
+    'x-trail': [
+      { series:'T30', from:2001, to:2007 },
+      { series:'T31', from:2007, to:2013 },
+      { series:'T32', from:2013, to:2022 },
+      { series:'T33', from:2022, to:2099 },
+    ],
+  },
+  mitsubishi: {
+    triton: [
+      { series:'Mk2/L200', from:1986, to:1996 },
+      { series:'MK',       from:1996, to:2006 },
+      { series:'ML',       from:2006, to:2009 },
+      { series:'MN',       from:2009, to:2015 },
+      { series:'MQ',       from:2015, to:2019 },
+      { series:'MR',       from:2018, to:2099 },
+    ],
+    pajero: [
+      { series:'NH/NJ/NK/NL', from:1991, to:1999 },
+      { series:'NM/NP',       from:1999, to:2006 },
+      { series:'NS/NT/NW/NX', from:2006, to:2021 },
+    ],
+    lancer: [
+      { series:'CE', from:1996, to:2003 },
+      { series:'CH', from:2002, to:2007 },
+      { series:'CJ', from:2007, to:2017 },
+    ],
+    'evolution': [
+      { series:'Evo I-III', from:1992, to:1995 },
+      { series:'Evo IV',    from:1996, to:1998 },
+      { series:'Evo V',     from:1998, to:1999 },
+      { series:'Evo VI',    from:1999, to:2001 },
+      { series:'Evo VII',   from:2001, to:2003 },
+      { series:'Evo VIII',  from:2003, to:2005 },
+      { series:'Evo IX',    from:2005, to:2007 },
+      { series:'Evo X',     from:2007, to:2016 },
+    ],
+    outlander: [
+      { series:'ZG', from:2006, to:2012 },
+      { series:'ZJ', from:2012, to:2021 },
+      { series:'ZM', from:2021, to:2099 },
+    ],
+  },
+  subaru: {
+    impreza: [
+      { series:'GC/GF',   from:1992, to:2000 },
+      { series:'GD/GG',   from:2000, to:2007 },
+      { series:'GE/GH/GR',from:2007, to:2011 },
+      { series:'GJ/GP',   from:2011, to:2016 },
+      { series:'GT',      from:2016, to:2023 },
+    ],
+    wrx: [
+      { series:'GC WRX',  from:1994, to:2000 },
+      { series:'GD WRX',  from:2000, to:2007 },
+      { series:'GE WRX',  from:2007, to:2014 },
+      { series:'VA',      from:2014, to:2021 },
+      { series:'VB',      from:2021, to:2099 },
+    ],
+    'wrx sti': [
+      { series:'GC STI',  from:1994, to:2000 },
+      { series:'GD STI',  from:2000, to:2007 },
+      { series:'GR STI',  from:2007, to:2014 },
+      { series:'VA STI',  from:2014, to:2021 },
+    ],
+    forester: [
+      { series:'SF', from:1997, to:2002 },
+      { series:'SG', from:2002, to:2008 },
+      { series:'SH', from:2008, to:2012 },
+      { series:'SJ', from:2012, to:2018 },
+      { series:'SK', from:2018, to:2099 },
+    ],
+    outback: [
+      { series:'BH', from:1999, to:2003 },
+      { series:'BP', from:2003, to:2009 },
+      { series:'BR', from:2009, to:2014 },
+      { series:'BS', from:2014, to:2020 },
+      { series:'BT', from:2020, to:2099 },
+    ],
+    liberty: [
+      { series:'BH', from:1998, to:2003 },
+      { series:'BP', from:2003, to:2009 },
+      { series:'BR', from:2009, to:2014 },
+      { series:'BS', from:2014, to:2020 },
+    ],
+  },
+  bmw: {
+    // 3 series: 316-340, M3
+    '3': [
+      { series:'E21', from:1975, to:1983 },
+      { series:'E30', from:1982, to:1994 },
+      { series:'E36', from:1990, to:2000 },
+      { series:'E46', from:1997, to:2006 },
+      { series:'E90', from:2004, to:2013 },
+      { series:'F30', from:2011, to:2019 },
+      { series:'G20', from:2018, to:2099 },
+    ],
+    // 5 series: 518-550, M5
+    '5': [
+      { series:'E28', from:1981, to:1988 },
+      { series:'E34', from:1987, to:1996 },
+      { series:'E39', from:1995, to:2003 },
+      { series:'E60', from:2003, to:2010 },
+      { series:'F10', from:2009, to:2017 },
+      { series:'G30', from:2016, to:2099 },
+    ],
+    // 7 series: 728-760
+    '7': [
+      { series:'E23', from:1977, to:1986 },
+      { series:'E32', from:1986, to:1994 },
+      { series:'E38', from:1994, to:2001 },
+      { series:'E65', from:2001, to:2008 },
+      { series:'F01', from:2008, to:2015 },
+      { series:'G11', from:2015, to:2099 },
+    ],
+    // 1 series
+    '1': [
+      { series:'E87', from:2004, to:2012 },
+      { series:'F20', from:2011, to:2019 },
+      { series:'F40', from:2019, to:2099 },
+    ],
+    // 2 series
+    '2': [
+      { series:'F22', from:2013, to:2021 },
+      { series:'G42', from:2021, to:2099 },
+    ],
+    // 4 series (coupe/convertible of 3)
+    '4': [
+      { series:'F32', from:2013, to:2020 },
+      { series:'G22', from:2020, to:2099 },
+    ],
+    // X models
+    'x1': [
+      { series:'E84', from:2009, to:2015 },
+      { series:'F48', from:2015, to:2022 },
+      { series:'U11', from:2022, to:2099 },
+    ],
+    'x3': [
+      { series:'E83', from:2003, to:2010 },
+      { series:'F25', from:2010, to:2017 },
+      { series:'G01', from:2017, to:2099 },
+    ],
+    'x5': [
+      { series:'E53', from:1999, to:2006 },
+      { series:'E70', from:2006, to:2013 },
+      { series:'F15', from:2013, to:2018 },
+      { series:'G05', from:2018, to:2099 },
+    ],
+    'x6': [
+      { series:'E71', from:2008, to:2014 },
+      { series:'F16', from:2014, to:2019 },
+      { series:'G06', from:2019, to:2099 },
+    ],
+    'm3': [
+      { series:'E30 M3', from:1986, to:1991 },
+      { series:'E36 M3', from:1992, to:1999 },
+      { series:'E46 M3', from:2000, to:2006 },
+      { series:'E92 M3', from:2007, to:2013 },
+      { series:'F80 M3', from:2014, to:2018 },
+      { series:'G80 M3', from:2020, to:2099 },
+    ],
+    'm4': [
+      { series:'F82 M4', from:2014, to:2020 },
+      { series:'G82 M4', from:2020, to:2099 },
+    ],
+  },
+  mercedes: {
+    'c-class': [
+      { series:'W202', from:1993, to:2000 },
+      { series:'W203', from:2000, to:2007 },
+      { series:'W204', from:2007, to:2014 },
+      { series:'W205', from:2014, to:2022 },
+      { series:'W206', from:2021, to:2099 },
+    ],
+    'e-class': [
+      { series:'W124', from:1984, to:1997 },
+      { series:'W210', from:1995, to:2002 },
+      { series:'W211', from:2002, to:2009 },
+      { series:'W212', from:2009, to:2016 },
+      { series:'W213', from:2016, to:2099 },
+    ],
+    's-class': [
+      { series:'W126', from:1979, to:1991 },
+      { series:'W140', from:1991, to:1998 },
+      { series:'W220', from:1998, to:2005 },
+      { series:'W221', from:2005, to:2013 },
+      { series:'W222', from:2013, to:2020 },
+      { series:'W223', from:2020, to:2099 },
+    ],
+    'sprinter': [
+      { series:'T1N', from:1995, to:2006 },
+      { series:'W906', from:2006, to:2018 },
+      { series:'W907', from:2018, to:2099 },
+    ],
+    'vito': [
+      { series:'W638', from:1996, to:2003 },
+      { series:'W639', from:2003, to:2014 },
+      { series:'W447', from:2014, to:2099 },
+    ],
+  },
+  audi: {
+    'a3': [
+      { series:'8L', from:1996, to:2003 },
+      { series:'8P', from:2003, to:2013 },
+      { series:'8V', from:2012, to:2020 },
+      { series:'8Y', from:2020, to:2099 },
+    ],
+    'a4': [
+      { series:'B5', from:1994, to:2001 },
+      { series:'B6', from:2000, to:2004 },
+      { series:'B7', from:2004, to:2008 },
+      { series:'B8', from:2007, to:2015 },
+      { series:'B9', from:2015, to:2099 },
+    ],
+    'a6': [
+      { series:'C4', from:1994, to:1997 },
+      { series:'C5', from:1997, to:2004 },
+      { series:'C6', from:2004, to:2011 },
+      { series:'C7', from:2011, to:2018 },
+      { series:'C8', from:2018, to:2099 },
+    ],
+    'tt': [
+      { series:'8N', from:1998, to:2006 },
+      { series:'8J', from:2006, to:2014 },
+      { series:'8S', from:2014, to:2023 },
+    ],
+    'q5': [
+      { series:'8R', from:2008, to:2017 },
+      { series:'FY', from:2016, to:2099 },
+    ],
+  },
+  volkswagen: {
+    golf: [
+      { series:'MK1', from:1974, to:1983 },
+      { series:'MK2', from:1983, to:1992 },
+      { series:'MK3', from:1992, to:1998 },
+      { series:'MK4', from:1998, to:2006 },
+      { series:'MK5', from:2004, to:2009 },
+      { series:'MK6', from:2008, to:2014 },
+      { series:'MK7', from:2012, to:2020 },
+      { series:'MK8', from:2020, to:2099 },
+    ],
+    polo: [
+      { series:'9N', from:2001, to:2009 },
+      { series:'6R', from:2009, to:2014 },
+      { series:'6C', from:2014, to:2017 },
+      { series:'AW', from:2017, to:2099 },
+    ],
+    passat: [
+      { series:'B5', from:1996, to:2005 },
+      { series:'B6', from:2005, to:2010 },
+      { series:'B7', from:2010, to:2014 },
+      { series:'B8', from:2014, to:2099 },
+    ],
+    tiguan: [
+      { series:'5N', from:2007, to:2016 },
+      { series:'AD', from:2016, to:2099 },
+    ],
+    amarok: [
+      { series:'2H', from:2010, to:2022 },
+      { series:'NF', from:2022, to:2099 },
+    ],
+  },
+  mazda: {
+    '3': [
+      { series:'BK', from:2003, to:2009 },
+      { series:'BL', from:2009, to:2013 },
+      { series:'BM', from:2013, to:2019 },
+      { series:'BP', from:2019, to:2099 },
+    ],
+    '6': [
+      { series:'GG', from:2002, to:2007 },
+      { series:'GH', from:2007, to:2012 },
+      { series:'GJ', from:2012, to:2022 },
+    ],
+    'cx-5': [
+      { series:'KE', from:2012, to:2017 },
+      { series:'KF', from:2017, to:2099 },
+    ],
+    'cx-9': [
+      { series:'TB', from:2007, to:2016 },
+      { series:'TC', from:2016, to:2099 },
+    ],
+    'rx-7': [
+      { series:'FB', from:1978, to:1985 },
+      { series:'FC', from:1985, to:1992 },
+      { series:'FD', from:1992, to:2002 },
+    ],
+    'mx-5': [
+      { series:'NA', from:1989, to:1997 },
+      { series:'NB', from:1997, to:2005 },
+      { series:'NC', from:2005, to:2014 },
+      { series:'ND', from:2015, to:2099 },
+    ],
+  },
+  honda: {
+    civic: [
+      { series:'EG', from:1991, to:1995 },
+      { series:'EK', from:1995, to:2001 },
+      { series:'EP', from:2001, to:2005 },
+      { series:'FD', from:2005, to:2011 },
+      { series:'FB', from:2011, to:2016 },
+      { series:'FC', from:2015, to:2021 },
+      { series:'FL', from:2021, to:2099 },
+    ],
+    crv: [
+      { series:'RD', from:1995, to:2001 },
+      { series:'RD/RE', from:2001, to:2012 },
+      { series:'RM', from:2012, to:2016 },
+      { series:'RW', from:2016, to:2022 },
+      { series:'RS', from:2022, to:2099 },
+    ],
+    jazz: [
+      { series:'GD', from:2001, to:2008 },
+      { series:'GE', from:2008, to:2014 },
+      { series:'GK', from:2014, to:2020 },
+      { series:'GR', from:2020, to:2099 },
+    ],
+  },
+  hyundai: {
+    'i30': [
+      { series:'FD', from:2007, to:2012 },
+      { series:'GD', from:2011, to:2017 },
+      { series:'PD', from:2016, to:2099 },
+    ],
+    'tucson': [
+      { series:'JM', from:2004, to:2010 },
+      { series:'LM', from:2009, to:2015 },
+      { series:'TL', from:2015, to:2020 },
+      { series:'NX4', from:2020, to:2099 },
+    ],
+    'santa fe': [
+      { series:'SM', from:2000, to:2006 },
+      { series:'CM', from:2006, to:2012 },
+      { series:'DM', from:2012, to:2018 },
+      { series:'TM', from:2018, to:2099 },
+    ],
+  },
+  kia: {
+    'sportage': [
+      { series:'JA', from:1993, to:2004 },
+      { series:'KM', from:2004, to:2010 },
+      { series:'SL', from:2010, to:2016 },
+      { series:'QL', from:2015, to:2022 },
+      { series:'NQ5', from:2021, to:2099 },
+    ],
+    'cerato': [
+      { series:'LD', from:2003, to:2008 },
+      { series:'TD', from:2008, to:2013 },
+      { series:'YD', from:2012, to:2018 },
+      { series:'BD', from:2018, to:2099 },
+    ],
+  },
+};
+
+// Map a raw model string to the correct lookup key in VEHICLE_GENERATIONS
+function getModelLineKey(make, rawModel) {
+  if (!rawModel) return null;
+  const m = String(rawModel).toLowerCase().trim();
+
+  if (make === 'bmw') {
+    // M models first (specific)
+    if (/m3/.test(m)) return 'm3';
+    if (/m4/.test(m)) return 'm4';
+    if (/m5/.test(m)) return 'm5';
+    // X models
+    if (/x1/.test(m)) return 'x1';
+    if (/x3/.test(m)) return 'x3';
+    if (/x5/.test(m)) return 'x5';
+    if (/x6/.test(m)) return 'x6';
+    if (/x7/.test(m)) return 'x7';
+    // Number series: extract leading digit from model like "320d", "318i", "520d"
+    const numLine = m.match(/\b([1-8])\d{2}/);
+    if (numLine) return numLine[1]; // '3', '5', '7' etc.
+    // Already just a number ("3 series", "3-series", "3")
+    const justNum = m.match(/^([1-8])(?:\s*series)?$/);
+    if (justNum) return justNum[1];
+    return null;
+  }
+
+  if (make === 'mercedes') {
+    if (/\bc.?class\b|\bc ?\d{3}\b|\bc63\b|\bc43\b|\bc45\b/.test(m)) return 'c-class';
+    if (/\be.?class\b|\be ?\d{3}\b|\be63\b|\be53\b/.test(m)) return 'e-class';
+    if (/\bs.?class\b|\bs ?\d{3}\b/.test(m)) return 's-class';
+    if (/\bvito\b/.test(m)) return 'vito';
+    if (/\bsprinter\b/.test(m)) return 'sprinter';
+    return m.split(' ')[0]; // fallback to first word
+  }
+
+  if (make === 'audi') {
+    // A3, S3, RS3 → a3 table
+    if (/\b[sr]?s?3\b|\ba3\b/.test(m)) return 'a3';
+    // A4, S4, RS4 → a4 table
+    if (/\b[sr]?s?4\b|\ba4\b/.test(m)) return 'a4';
+    if (/\ba6\b|\bs6\b|\brs6\b/.test(m)) return 'a6';
+    if (/\btt\b/.test(m)) return 'tt';
+    if (/\bq5\b/.test(m)) return 'q5';
+    return m.split(' ')[0];
+  }
+
+  if (make === 'volkswagen') {
+    if (/\bgolf\b/.test(m)) return 'golf';
+    if (/\bpolo\b/.test(m)) return 'polo';
+    if (/\bpassat\b/.test(m)) return 'passat';
+    if (/\btiguan\b/.test(m)) return 'tiguan';
+    if (/\bamarok\b/.test(m)) return 'amarok';
+  }
+
+  // For Toyota, Nissan, Holden, Ford, Mazda, etc. — model is usually the key directly
+  // Clean it up: "3 series" → "3", "hilux sr5" → "hilux", etc.
+  return m.replace(/\s*(sr5?|sr|glx?|dx|gl|vx|vn|executive|elite|sport|turbo|diesel|petrol|auto|manual|4wd|2wd)\s*$/i,'').trim();
+}
+
+// Sync lookup: given make+model+year, return the chassis/generation series.
+// Returns null if not found — caller can then try aiResolveGeneration().
+function lookupGenerationByYear(make, rawModel, year) {
+  if (!make || !year || year < 1960) return null;
+  const mk = String(make).toLowerCase().trim();
+  const modelKey = getModelLineKey(mk, rawModel);
+  if (!modelKey) return null;
+
+  const gens = VEHICLE_GENERATIONS[mk]?.[modelKey];
+  if (!gens || !gens.length) return null;
+
+  // Find all generations whose year range covers this year
+  const matches = gens.filter(g => year >= g.from && year <= g.to);
+  if (!matches.length) return null;
+  // Overlap (changeover year): prefer the newer generation (higher from)
+  return matches.sort((a, b) => b.from - a.from)[0].series;
+}
+
+// AI fallback: asks Gemini/Haiku to identify the generation.
+// Cached for 1 year per (make, model, year) — static automotive knowledge.
+async function aiResolveGeneration(make, model, year) {
+  if (!make || !year) return null;
+  const ck = ('gen:' + String(make) + ':' + String(model||'') + ':' + String(year)).toLowerCase().replace(/\s/g,'_');
+  try {
+    const cached = await redisGet(ck);
+    if (cached && cached.s !== undefined) return cached.s || null;
+  } catch(_) {}
+
+  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
+
+  const prompt = [
+    'You are an automotive expert. What is the chassis/generation code for this vehicle?',
+    `Year: ${year}, Make: ${make}, Model: ${model || 'unknown'}`,
+    'Examples: BMW E36, Holden VT Commodore, Ford BF Falcon, Toyota N70 HiLux, Nissan GU Patrol, VW MK4 Golf, Mazda BL Mazda3',
+    'Return ONLY JSON — no explanation: { "series": "code" } or { "series": null } if unknown.',
+  ].join('\n');
+
+  try {
+    let text = '';
+    if (GEMINI_API_KEY) {
+      const r = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents:[{parts:[{text:prompt}]}], generationConfig:{ thinkingConfig:{thinkingBudget:0} } },
+        { headers:{'Content-Type':'application/json'}, timeout:8000 });
+      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else {
+      const r = await axios.post('https://api.anthropic.com/v1/messages',
+        { model:'claude-haiku-4-5-20251001', max_tokens:60, messages:[{role:'user',content:prompt}] },
+        { headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'}, timeout:8000 });
+      text = r.data?.content?.[0]?.text || '';
+    }
+    const mj = text.match(/\{[\s\S]*?\}/);
+    const parsed = mj ? JSON.parse(mj[0]) : null;
+    const s = (parsed?.series && typeof parsed.series === 'string') ? parsed.series.trim() : null;
+    await redisSet(ck, { s }, 365 * 24 * 3600).catch(()=>{});
+    return s;
+  } catch(e) { console.error('[GenAI]', make, model, year, e.message); return null; }
+}
+
 // ── Enrich a listing with all precise vehicle identity fields ──
 // Called before upsert — fills in series, variant, bands etc
 function enrichVehicleIdentity(listing) {
@@ -360,7 +976,8 @@ function enrichVehicleIdentity(listing) {
   const title = listing.title || '';
   const desc  = listing.description || '';
 
-  const series    = listing.series    || extractSeriesFromTitle(listing.make, listing.model, title);
+  const series    = listing.series    || extractSeriesFromTitle(listing.make, listing.model, title)
+                  || lookupGenerationByYear(listing.make, listing.model, listing.year);
   const variant   = listing.variant   || extractVariantFromTitle(title);
   const bodyStyle = listing.body_style || extractBodyStyleFromTitle(title, desc);
   const fuelType  = listing.fuel_type  || extractFuelTypeFromTitle(title, desc);
