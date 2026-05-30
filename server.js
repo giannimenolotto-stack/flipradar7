@@ -577,7 +577,7 @@ function buildDealsCatChips() {
   var html = '';
   cats.forEach(function(c) {
     var active = c === _dealsCat;
-    html += '<button onclick="filterDeals(''+c+'')" style="flex-shrink:0;padding:8px 16px;border-radius:20px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s;white-space:nowrap;background:'+(active?'var(--g)':'var(--s1)')+';color:'+(active?'#000':'var(--mu)')+'">'+
+    html += '<button onclick="filterDeals(&apos;'+c+'&apos;)" style="flex-shrink:0;padding:8px 16px;border-radius:20px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s;white-space:nowrap;background:'+(active?'var(--g)':'var(--s1)')+';color:'+(active?'#000':'var(--mu)')+'">'+
       (labels[c] || c.charAt(0).toUpperCase() + c.slice(1)) + '</button>';
   });
   document.getElementById('dealsCatChips').innerHTML = html;
@@ -621,7 +621,7 @@ function renderDealsGrid(cat) {
     html += '<div class="'+(isRb?'rainbow-card':'')+'" style="padding:10px;flex:1;display:flex;flex-direction:column;background:'+(isRb?'':cardBg)+';">';
     if (badge) html += '<div style="font-size:9px;font-weight:700;color:'+tc+';letter-spacing:.5px;margin-bottom:4px">'+badge+'</div>';
     html += '<div style="font-size:12px;font-weight:700;color:#fff;line-height:1.3;margin-bottom:4px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;">'+escHtml(d.title||'—')+'</div>';
-    html += '<div style="font-family:'Bebas Neue',sans-serif;font-size:20px;color:var(--g);letter-spacing:1px;margin-top:auto">'+(d.price ? '$'+Number(d.price).toLocaleString() : '—')+'</div>';
+    html += '<div style="font-family:&apos;Bebas Neue&apos;,sans-serif;font-size:20px;color:var(--g);letter-spacing:1px;margin-top:auto">'+(d.price ? '$'+Number(d.price).toLocaleString() : '—')+'</div>';
     if (d.market_value) html += '<div style="font-size:11px;color:var(--mu);text-decoration:line-through">mkt $'+Number(d.market_value).toLocaleString()+'</div>';
     if (d.location) html += '<div style="font-size:10px;color:var(--mu);margin-top:4px;text-transform:uppercase;letter-spacing:.5px">'+escHtml(d.location)+'</div>';
     html += '</div></div>';
