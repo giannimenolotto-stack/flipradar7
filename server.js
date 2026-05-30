@@ -3180,6 +3180,12 @@ cron.schedule('0 2 * * *', async () => {
     `);
 
     // ── Step 4: Rebuild keyword_price_stats with IQR data ──
+    // GENERAL GOODS ONLY — vehicles have their own vehicle_price_stats table.
+    // Also normalise known keyword typos before grouping.
+    await pool.query(`
+      UPDATE listings SET keyword = 'holden commodore'
+      WHERE keyword = 'holden comodore'
+    `);
     await pool.query(`
       INSERT INTO keyword_price_stats
         (keyword, sample_count, raw_count, median_price, p25_price, p75_price,
@@ -3191,6 +3197,7 @@ cron.schedule('0 2 * * *', async () => {
           PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
         FROM listings
         WHERE keyword IS NOT NULL AND price > 0
+          AND category = 'general'
           AND is_offer_price = FALSE AND in_price_pool = TRUE AND is_active = TRUE
           AND scraped_at > NOW() - INTERVAL '90 days'
         GROUP BY keyword HAVING COUNT(*) >= 5
@@ -3209,6 +3216,7 @@ cron.schedule('0 2 * * *', async () => {
         FROM listings l JOIN base b ON l.keyword = b.keyword
         WHERE l.price BETWEEN GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))
                           AND (b.p75 + 1.5*(b.p75-b.p25))
+          AND l.category = 'general'
           AND l.is_offer_price = FALSE AND l.in_price_pool = TRUE
           AND l.is_active = TRUE
           AND l.scraped_at > NOW() - INTERVAL '90 days'
