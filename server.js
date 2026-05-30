@@ -1078,7 +1078,10 @@ function scoreListingQuality(listing) {
   else if (flags & (16 | 32)) quality = 'suspicious';  // price bounds
   else if (flags & 1) quality = 'offer_price';
 
-  const inPricePool = quality === 'ok';
+  // Vehicle without km data can't be placed in a cohort — exclude from pool
+  const isVehicle = !!(listing.make);
+  const hasMileage = listing.mileage && listing.mileage > 0;
+  const inPricePool = quality === 'ok' && (!isVehicle || hasMileage);
 
   return { flags, quality, inPricePool };
 }
@@ -3267,6 +3270,8 @@ cron.schedule('0 2 * * *', async () => {
           PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
         FROM listings
         WHERE make IS NOT NULL AND year_band IS NOT NULL
+          AND kms IS NOT NULL AND kms > 0
+          AND mileage_band IS NOT NULL AND mileage_band != 'unknown'
           AND price > 0 AND is_offer_price = FALSE
           AND in_price_pool = TRUE
           AND listing_status IN ('active','sold')
