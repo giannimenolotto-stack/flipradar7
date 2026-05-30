@@ -2224,7 +2224,7 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     seen[key] = Date.now();
 
     if (!userListings.find(l => l.id === listing.id)) {
-      userListings.unshift(listing);
+      userListings.push(listing);
       userListings.sort((a, b) =>
         new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt)
       );
