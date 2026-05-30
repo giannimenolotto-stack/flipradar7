@@ -1559,10 +1559,10 @@ function verificationEmail(name, email, code) {
 
 // ── Scan intervals per plan ───────────────────────────────
 const PLAN_INTERVALS = {
-  free:    2 * 60 * 60 * 1000,  // 2 hours
-  basic:   2 * 60 * 60 * 1000,  // 2 hours
-  pro:     2 * 60 * 60 * 1000,  // 2 hours
-  premium: 2 * 60 * 60 * 1000,  // 2 hours
+  free:    30 * 60 * 1000,  // 30 minutes
+  basic:   30 * 60 * 1000,  // 30 minutes
+  pro:     30 * 60 * 1000,  // 30 minutes
+  premium: 30 * 60 * 1000,  // 30 minutes
 };
 
 // ── In-memory state ───────────────────────────────────────
