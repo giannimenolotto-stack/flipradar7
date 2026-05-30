@@ -2989,6 +2989,97 @@ async function pauseInactiveUsers() {
   }
   console.log(`[AutoPause] Done — ${paused} watch(es) paused`);
 }
+
+// ── Seed scanner — runs every 2 days, stops each keyword once it has enough data ──
+// Builds the price-stats database without needing user watches.
+// Each keyword is automatically retired once it hits SEED_THRESHOLD clean listings.
+
+const SEED_THRESHOLD = 25; // min listings in price pool before a keyword is considered seeded
+
+const SEED_KEYWORDS = [
+  // Vehicles — generation resolver sorts them into correct cohorts by year
+  'holden commodore', 'ford falcon', 'toyota hilux', 'ford ranger',
+  'toyota landcruiser', 'toyota prado', 'nissan patrol', 'nissan navara',
+  'mitsubishi triton', 'subaru wrx', 'toyota kluger', 'holden ute',
+  'bmw 3 series', 'ford territory', 'toyota camry', 'toyota corolla',
+  // Power tools — brand specific for tight cohorts
+  'milwaukee m18', 'milwaukee m12', 'makita 18v', 'dewalt 18v',
+  'festool', 'hilti', 'ryobi one+',
+  // Phones & tablets
+  'iphone 14 pro', 'iphone 13', 'iphone 15', 'ipad pro',
+  'samsung galaxy s23', 'samsung galaxy s24',
+  // Gaming
+  'ps5 console', 'xbox series x', 'nintendo switch oled', 'steam deck',
+  // Computers
+  'macbook pro', 'macbook air',
+  // Home & appliances
+  'dyson v15', 'dyson v11', 'dyson airwrap', 'thermomix', 'kitchenaid',
+  // Outdoor & camping
+  'engel fridge', 'waeco fridge', 'weber bbq',
+];
+
+async function getSeedStatus() {
+  // Returns { keyword: sampleCount } for all seed keywords
+  try {
+    const placeholders = SEED_KEYWORDS.map((_, i) => `$${i + 1}`).join(',');
+    // Check actual pool-eligible listings in DB (works even before stats are rebuilt)
+    const { rows } = await pool.query(`
+      SELECT keyword, COUNT(*)::INT AS n
+      FROM listings
+      WHERE keyword = ANY($1) AND in_price_pool = TRUE AND is_active = TRUE
+      GROUP BY keyword
+    `, [SEED_KEYWORDS]);
+    const status = {};
+    SEED_KEYWORDS.forEach(kw => { status[kw] = 0; });
+    rows.forEach(r => { status[r.keyword] = r.n; });
+    return status;
+  } catch(e) {
+    console.error('[Seed] status check error:', e.message);
+    return {};
+  }
+}
+
+async function runSeedJob() {
+  console.log('[Seed] Starting seed scan run...');
+  const status = await getSeedStatus();
+  const pending = SEED_KEYWORDS.filter(kw => (status[kw] || 0) < SEED_THRESHOLD);
+  const complete = SEED_KEYWORDS.length - pending.length;
+
+  console.log(`[Seed] ${complete}/${SEED_KEYWORDS.length} keywords seeded. ${pending.length} remaining.`);
+
+  if (pending.length === 0) {
+    console.log('[Seed] All keywords seeded — seed job complete. No credits used.');
+    return;
+  }
+
+  let scanned = 0;
+  for (const keyword of pending) {
+    try {
+      // Scan using minimal opts — upsertListingToDB fires automatically inside the scan
+      await sociaVaultKeywordScan(keyword, {
+        keyword,
+        minPrice: null, maxPrice: null,
+        minYear: null, maxYear: null,
+        minKms: null, maxKms: null,
+        transmission: null,
+        excludeWords: [],
+        initialScan: true,
+      });
+      scanned++;
+      console.log(`[Seed] "${keyword}" scanned (${status[keyword] || 0} → checking...)`);
+      await new Promise(res => setTimeout(res, 400)); // small pause between calls
+    } catch(e) {
+      console.error(`[Seed] "${keyword}" error:`, e.message);
+    }
+  }
+  console.log(`[Seed] Run complete — ${scanned} keywords scanned.`);
+}
+
+// Run seed job every 2 days at 7am
+cron.schedule('0 7 */2 * *', () => {
+  runSeedJob().catch(e => console.error('[Seed] cron error:', e.message));
+});
+
 cron.schedule('0 3 * * *', () => pauseInactiveUsers().catch(e => console.error('[AutoPause]', e.message)));
 
 // ── Nightly DB stats rebuild + IQR outlier pass (2am AEST) ──
@@ -4669,4 +4760,5 @@ app.listen(PORT, async () => {
     console.log(`[DB] ${dbSummary.total_listings} listings · ${dbSummary.unique_keywords} keywords · ${dbSummary.unique_makes} vehicle makes`);
   }
   console.log('[Ready] Server fully loaded');
+  runSeedJob().catch(e => console.error('[Seed] startup run error:', e.message));
 });
