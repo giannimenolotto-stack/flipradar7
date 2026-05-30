@@ -1,4777 +1,3399 @@
-const express  = require('express');
-const webpush  = require('web-push');
-const crypto  = require('crypto');
-const cors    = require('cors');
-const axios   = require('axios');
-const bcrypt  = require('bcryptjs');
-const jwt     = require('jsonwebtoken');
-const cron    = require('node-cron');
-const { v4: uuidv4 } = require('uuid');
-const Stripe = require('stripe');
-const { Pool } = require('pg');
-const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
+// ── All AI calls go through your backend — no API keys needed in browser ──
+var API_KEY    = ''; // kept for legacy fallback only
+var GEMINI_KEY = ''; // kept for legacy fallback only
+try { API_KEY    = localStorage.getItem('fr_api_key')    || ''; } catch(e) {}
+try { GEMINI_KEY = localStorage.getItem('fr_gemini_key') || ''; } catch(e) {}
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-
-// ── PostgreSQL (Neon) ─────────────────────────────────────
-const DATABASE_URL = process.env.DATABASE_URL ||
-  'postgresql://neondb_owner:npg_XVfnxmq2HCU1@ep-spring-hall-appvfgub-pooler.c-7.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
-
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
-
-pool.on('error', (e) => console.error('[DB] Pool error:', e.message));
-
-async function initDB() {
-  try {
-    // ── Core listings table ───────────────────────────────
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS listings (
-        id              BIGSERIAL PRIMARY KEY,
-        listing_id      TEXT UNIQUE NOT NULL,
-        title           TEXT NOT NULL,
-        description     TEXT,
-        price           INTEGER,
-        is_offer_price  BOOLEAN DEFAULT FALSE,
-        currency        TEXT DEFAULT 'AUD',
-        location        TEXT,
-        state           TEXT,
-        seller_name     TEXT,
-        seller_id       TEXT,
-        image_url       TEXT,
-        url             TEXT,
-
-        -- ── Search context ────────────────────────────────
-        keyword         TEXT,   -- the search term that found this listing
-
-        -- ── Category ─────────────────────────────────────
-        category        TEXT,   -- 'vehicle' | 'general'
-
-        -- ── Vehicle identity — as precise as possible ─────
-        -- These are the dimensions that determine price cohort.
-        -- A VE Commodore SS is NOT comparable to a VE Omega.
-        -- A 2008 with 250k km is NOT comparable to a 2012 with 80k km.
-        make            TEXT,   -- e.g. 'Holden'
-        model           TEXT,   -- e.g. 'Commodore'
-        series          TEXT,   -- e.g. 'VE', 'VF', 'FG', 'BF', 'NP', 'GU'
-        variant         TEXT,   -- e.g. 'SS', 'SV6', 'Omega', 'Calais', 'XR6', 'ST'
-        body_style      TEXT,   -- e.g. 'sedan', 'wagon', 'ute', 'hatch', 'van'
-        year            INTEGER,-- manufacture year
-        year_band       TEXT,   -- bucketed: e.g. '2006-2010', '2011-2013'
-        kms             INTEGER,-- odometer reading in km
-        mileage_band    TEXT,   -- bucketed: e.g. '0-50k', '50k-100k', '100k-150k', '150k-200k', '200k+'
-        transmission    TEXT,   -- 'auto' | 'manual'
-        fuel_type       TEXT,   -- 'petrol' | 'diesel' | 'hybrid' | 'electric'
-        engine          TEXT,   -- e.g. '3.6L V6', '6.0L V8', '2.0T'
-        drive_type      TEXT,   -- '2WD' | '4WD' | 'AWD'
-        colour          TEXT,
-
-        -- ── General item fields ───────────────────────────
-        brand           TEXT,   -- for non-vehicles: e.g. 'Apple', 'Sony'
-        item_model      TEXT,   -- e.g. 'iPhone 14 Pro', 'PlayStation 5'
-        storage         TEXT,   -- for electronics: e.g. '256GB'
-        condition       TEXT,   -- 'new' | 'like new' | 'good' | 'fair' | 'poor'
-
-        -- ── Flexible attributes ───────────────────────────
-        attributes      JSONB DEFAULT '{}',
-
-        -- ── Lifecycle ─────────────────────────────────────
-        listing_status  TEXT DEFAULT 'active',
-        -- 'active'  = still live on FB
-        -- 'sold'    = gone from FB, assumed sold — STAYS in price pool
-        -- 'removed' = spam/scam, excluded from pool
-
-        -- ── Timestamps ───────────────────────────────────
-        listed_at       TIMESTAMPTZ,
-        scraped_at      TIMESTAMPTZ DEFAULT NOW(),
-        last_seen_at    TIMESTAMPTZ DEFAULT NOW(),
-        is_active       BOOLEAN DEFAULT TRUE,
-        seen_count      INTEGER DEFAULT 1,
-
-        -- ── Data quality ──────────────────────────────────
-        price_quality   TEXT DEFAULT 'unscored',
-        -- 'ok' | 'outlier' | 'not_for_sale' | 'suspicious' | 'spam' | 'offer_price'
-
-        quality_flags   INTEGER DEFAULT 0,
-        -- bit 1: damage/broken/spares
-        -- bit 2: swap/trade listing
-        -- bit 3: statistical outlier (IQR)
-        -- bit 4: price below category floor
-        -- bit 5: price above category ceiling
-        -- bit 6: spam signals
-
-        in_price_pool   BOOLEAN DEFAULT TRUE,
-        -- FALSE if any quality flag set — never used in price calculations
-
-        -- ── Price drop tracking ───────────────────────────
-        previous_price    INTEGER,               -- price before the drop
-        price_dropped_at  TIMESTAMPTZ            -- when the drop was detected
-      );
-
-      -- ── Indexes ───────────────────────────────────────────
-      -- Keyword pool index (general items)
-      CREATE INDEX IF NOT EXISTS idx_kw_pool
-        ON listings(keyword, price)
-        WHERE price > 0 AND is_offer_price = FALSE
-          AND in_price_pool = TRUE AND category = 'general';
-
-      -- Vehicle cohort index — the main one for precise vehicle matching
-      CREATE INDEX IF NOT EXISTS idx_veh_cohort
-        ON listings(make, model, series, variant, year, mileage_band, transmission)
-        WHERE make IS NOT NULL AND price > 0
-          AND is_offer_price = FALSE AND in_price_pool = TRUE;
-
-      -- Vehicle broad index — fallback when cohort is too small
-      CREATE INDEX IF NOT EXISTS idx_veh_broad
-        ON listings(make, model, year_band)
-        WHERE make IS NOT NULL AND price > 0
-          AND is_offer_price = FALSE AND in_price_pool = TRUE;
-
-      CREATE INDEX IF NOT EXISTS idx_listings_state     ON listings(state);
-      CREATE INDEX IF NOT EXISTS idx_listings_scraped   ON listings(scraped_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_listings_status    ON listings(listing_status);
-      CREATE INDEX IF NOT EXISTS idx_listings_quality   ON listings(price_quality);
-      CREATE INDEX IF NOT EXISTS idx_listings_category  ON listings(category);
-    `);
-
-    // ── Pre-computed stats tables ──────────────────────────
-    await pool.query(`
-      -- General keyword stats (IQR-cleaned, rebuilt nightly)
-      CREATE TABLE IF NOT EXISTS keyword_price_stats (
-        keyword         TEXT PRIMARY KEY,
-        sample_count    INTEGER,
-        raw_count       INTEGER,
-        median_price    INTEGER,
-        p25_price       INTEGER,
-        p75_price       INTEGER,
-        iqr             INTEGER,
-        floor_price     INTEGER,
-        ceiling_price   INTEGER,
-        low_price       INTEGER,
-        high_price      INTEGER,
-        updated_at      TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      -- Vehicle cohort stats — keyed precisely
-      -- cohort_key is the canonical lookup key built from all identity fields
-      -- e.g. 'holden|commodore|ve|ss|sedan|2008|100k-150k|auto'
-      CREATE TABLE IF NOT EXISTS vehicle_price_stats (
-        cohort_key      TEXT PRIMARY KEY,
-        make            TEXT NOT NULL,
-        model           TEXT NOT NULL,
-        series          TEXT,
-        variant         TEXT,
-        body_style      TEXT,
-        year_band       TEXT NOT NULL,   -- e.g. '2006-2010'
-        mileage_band    TEXT NOT NULL,   -- e.g. '100k-150k'
-        transmission    TEXT,
-        sample_count    INTEGER,
-        raw_count       INTEGER,
-        median_price    INTEGER,
-        p25_price       INTEGER,
-        p75_price       INTEGER,
-        iqr             INTEGER,
-        floor_price     INTEGER,
-        ceiling_price   INTEGER,
-        updated_at      TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_vps_make_model
-        ON vehicle_price_stats(make, model, series, variant);
-    `);
-
-    // ── Migrate existing tables (safe to run on already-created DBs) ──
-    const migrations = [
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS series TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS variant TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS body_style TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS year_band TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER',
-      "ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER",
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS mileage_band TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS fuel_type TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS engine TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS drive_type TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS colour TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS brand TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS item_model TEXT',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS storage TEXT',
-      "ALTER TABLE listings ADD COLUMN IF NOT EXISTS listing_status TEXT DEFAULT 'active'",
-      "ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_quality TEXT DEFAULT 'unscored'",
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS quality_flags INTEGER DEFAULT 0',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS seen_count INTEGER DEFAULT 1',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS in_price_pool BOOLEAN DEFAULT TRUE',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS previous_price INTEGER',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_dropped_at TIMESTAMPTZ',
-      'CREATE TABLE IF NOT EXISTS keyword_anchors (keyword TEXT PRIMARY KEY, anchor_price INTEGER NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())',
-      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS norm_category TEXT',
-    ];
-    for (const sql of migrations) {
-      await pool.query(sql).catch(() => {});
+// ── Backend AI proxy — calls your Render server which holds the keys ──
+function callBackendAI(endpoint, body) {
+  var url = getBackendUrl();
+  if (!url) return Promise.reject(new Error('No backend URL configured'));
+  return fetchWithRetry(url + endpoint, {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+    body: JSON.stringify(body)
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.error) throw new Error(data.error);
+    // Extract JSON from text response
+    var text = data.text || '';
+    var start = text.indexOf('{');
+    var end   = text.lastIndexOf('}');
+    if (start !== -1 && end !== -1) {
+      try { return JSON.parse(text.slice(start, end + 1)); } catch(e) {}
     }
-
-    console.log('[DB] Tables and migrations ready');
-  } catch (e) {
-    console.error('[DB] initDB error:', e.message);
-  }
-}
-
-// ── Build the precise cohort key for a vehicle ────────────
-// This is the fingerprint used to group comparable listings.
-// More fields filled in = smaller, more accurate cohort.
-// Falls back gracefully when fields are missing.
-function buildVehicleCohortKey(make, model, series, variant, yearBand, mileageBand, transmission) {
-  return [
-    (make         || 'unknown').toLowerCase().trim(),
-    (model        || 'unknown').toLowerCase().trim().replace(/\s+/g, '-'),
-    (series       || '').toLowerCase().trim(),
-    (variant      || '').toLowerCase().trim(),
-    (yearBand     || 'unknown'),
-    (mileageBand  || 'unknown'),
-    (transmission || '').toLowerCase().trim(),
-  ].join('|');
-}
-
-// ── Band a year into a range ──────────────────────────────
-// Groups close years together so small cohorts still get data
-// e.g. 2008 → '2006-2010', 2019 → '2018-2022'
-function bandYear(year) {
-  if (!year) return null;
-  // 5-year bands aligned to common AU model generations
-  const bands = [
-    [1990, 1994], [1995, 1999],
-    [2000, 2004], [2005, 2007], [2008, 2010],
-    [2011, 2013], [2014, 2016], [2017, 2019],
-    [2020, 2022], [2023, 2026],
-  ];
-  for (const [lo, hi] of bands) {
-    if (year >= lo && year <= hi) return `${lo}-${hi}`;
-  }
-  return `${year}`;
-}
-
-// ── Band mileage into a range ─────────────────────────────
-// Reflects how buyers actually think about odometer readings
-function bandMileage(mileage) {
-  if (!mileage || mileage <= 0) return 'unknown';
-  if (mileage <  50000)  return '0-50k';
-  if (mileage < 100000)  return '50k-100k';
-  if (mileage < 150000)  return '100k-150k';
-  if (mileage < 200000)  return '150k-200k';
-  if (mileage < 250000)  return '200k-250k';
-  return '250k+';
-}
-
-// ── Extract vehicle series from title ────────────────────
-// Series = body generation code, critical for AU cars
-// e.g. Commodore: VT/VX/VY/VZ/VE/VF  Falcon: AU/BA/BF/FG  Patrol: GQ/GU
-const AU_SERIES_PATTERNS = [
-  // Holden Commodore
-  { pattern: /(VT|VX|VY|VZ|VE|VF)/i,   make: 'holden',    model: 'commodore' },
-  // Ford Falcon
-  { pattern: /(AU|BA|BF|FG|FGX)/i,      make: 'ford',      model: 'falcon'    },
-  // Nissan Patrol
-  { pattern: /(GQ|GU|Y61|Y62)/i,        make: 'nissan',    model: 'patrol'    },
-  // Toyota LandCruiser
-  { pattern: /(80|100|200|300|series|HZJ|HDJ|FZJ|UZJ)/i, make: 'toyota', model: 'landcruiser' },
-  // Toyota HiLux
-  { pattern: /(N70|N80|N110|SR5|SR|Workmate|Rugged X)/i, make: 'toyota', model: 'hilux' },
-  // Ford Ranger
-  { pattern: /(PJ|PK|PX|PXII|PXIII|P703|Wildtrak|Raptor|XLT|XLS|XL)/i, make: 'ford', model: 'ranger' },
-];
-
-// ── Extract variant/grade from title ─────────────────────
-// Variant = trim level / grade, massively affects price
-const VARIANT_PATTERNS = [
-  // Holden Commodore variants
-  /(SS\s*V8|SSV|SS|SV6|Calais\s*V|Calais|Omega|Berlina|International|Equipe|Executive)/i,
-  // Ford Falcon variants  
-  /(XR8|XR6\s*Turbo|XR6T|XR6|XR5|XT|Futura|Fairmont|Ghia|Boss|G6E\s*Turbo|G6E|G6)/i,
-  // Ford Ranger variants
-  /(Raptor|Wildtrak|XLT|XLS|XL|Sport|Hi-Rider)/i,
-  // Toyota variants
-  /(SR5|SR|GX|GXL|VX|Sahara|Kakadu|WorkMate|Rugged\s*X|Rugged|Rogue)/i,
-  // General
-  /(Sport|SE|SL|SX|ST|ST-Line|GTi|GTD|R-Line|M\s*Sport|AMG|S\s*Line)/i,
-];
-
-function extractSeriesFromTitle(make, model, title) {
-  const text = (title || '').toUpperCase();
-  for (const { pattern, make: m, model: mo } of AU_SERIES_PATTERNS) {
-    if ((make || '').toLowerCase() === m && (model || '').toLowerCase().includes(mo)) {
-      const match = text.match(pattern);
-      if (match) return match[1].toUpperCase();
+    var arrStart = text.indexOf('[');
+    var arrEnd   = text.lastIndexOf(']');
+    if (arrStart !== -1 && arrEnd !== -1) {
+      try { return JSON.parse(text.slice(arrStart, arrEnd + 1)); } catch(e) {}
     }
-  }
-  return null;
-}
-
-function extractVariantFromTitle(title) {
-  const text = (title || '');
-  for (const pattern of VARIANT_PATTERNS) {
-    const match = text.match(pattern);
-    if (match) return match[1].replace(/\s+/g, ' ').trim();
-  }
-  return null;
-}
-
-function extractBodyStyleFromTitle(title, description) {
-  const text = (title + ' ' + (description || '')).toLowerCase();
-  if (/(ute|utility|tray)/.test(text))        return 'ute';
-  if (/(wagon|estate|touring)/.test(text))     return 'wagon';
-  if (/(van|cargo|commercial)/.test(text))     return 'van';
-  if (/(hatch|hatchback)/.test(text))          return 'hatch';
-  if (/(coupe|fastback)/.test(text))           return 'coupe';
-  if (/(convertible|cabriolet|roadster)/.test(text)) return 'convertible';
-  if (/(sedan|saloon)/.test(text))             return 'sedan';
-  if (/(suv|4wd|4x4|crossover)/.test(text))   return 'suv';
-  return null;
-}
-
-function extractFuelTypeFromTitle(title, description) {
-  const text = (title + ' ' + (description || '')).toLowerCase();
-  if (/(diesel|turbo\s*diesel|tdi|tdci|crd|hdi)/.test(text)) return 'diesel';
-  if (/(electric|ev|bev|phev|plug.?in)/.test(text))           return 'electric';
-  if (/(hybrid)/.test(text))                                   return 'hybrid';
-  if (/(lpg|gas|dual\s*fuel)/.test(text))                     return 'lpg';
-  return 'petrol'; // default for AU market
-}
-
-function extractEngineFromTitle(title, description) {
-  const text = (title + ' ' + (description || ''));
-  const m = text.match(/(\d+\.\d+[Ll]?\s*(?:V6|V8|V12|I4|turbo|litre|ltr)?)/i)
-         || text.match(/(V8|V6|V12|turbo|supercharged)/i);
-  return m ? m[1].trim() : null;
-}
-
-
-// ══════════════════════════════════════════════════════════════════════
-// VEHICLE GENERATION RESOLVER
-// Knows which year ranges belong to which chassis/generation code.
-// e.g. BMW 318i 1995 → E36. Holden Commodore 1999 → VT.
-// Lookup table covers AU market. AI fills the gaps and caches 1 year.
-// ══════════════════════════════════════════════════════════════════════
-
-const VEHICLE_GENERATIONS = {
-  holden: {
-    commodore: [
-      { series:'VP', from:1991, to:1993 },
-      { series:'VR', from:1993, to:1995 },
-      { series:'VS', from:1995, to:1997 },
-      { series:'VT', from:1997, to:2000 },
-      { series:'VX', from:2000, to:2002 },
-      { series:'VY', from:2002, to:2004 },
-      { series:'VZ', from:2004, to:2006 },
-      { series:'VE', from:2006, to:2013 },
-      { series:'VF', from:2013, to:2017 },
-    ],
-    colorado: [
-      { series:'RC', from:2008, to:2012 },
-      { series:'RG', from:2012, to:2020 },
-      { series:'RG Facelift', from:2016, to:2020 },
-    ],
-    captiva: [
-      { series:'CG', from:2006, to:2018 },
-    ],
-  },
-  ford: {
-    falcon: [
-      { series:'EA', from:1988, to:1991 },
-      { series:'EB', from:1991, to:1993 },
-      { series:'EF', from:1994, to:1996 },
-      { series:'EL', from:1996, to:1998 },
-      { series:'AU', from:1998, to:2002 },
-      { series:'BA', from:2002, to:2005 },
-      { series:'BF', from:2005, to:2008 },
-      { series:'FG', from:2008, to:2014 },
-      { series:'FG X', from:2014, to:2016 },
-    ],
-    ranger: [
-      { series:'PX', from:2011, to:2015 },
-      { series:'PX MkII', from:2015, to:2018 },
-      { series:'PX MkIII', from:2018, to:2022 },
-      { series:'P703', from:2022, to:2099 },
-    ],
-    territory: [
-      { series:'SX', from:2004, to:2005 },
-      { series:'SY', from:2005, to:2011 },
-      { series:'SZ', from:2011, to:2016 },
-    ],
-    everest: [
-      { series:'UA', from:2015, to:2022 },
-      { series:'UB', from:2022, to:2099 },
-    ],
-  },
-  toyota: {
-    landcruiser: [
-      { series:'40 Series', from:1960, to:1984 },
-      { series:'60 Series', from:1980, to:1987 },
-      { series:'70 Series', from:1984, to:2099 },
-      { series:'80 Series', from:1989, to:1998 },
-      { series:'100 Series', from:1997, to:2007 },
-      { series:'200 Series', from:2007, to:2021 },
-      { series:'300 Series', from:2021, to:2099 },
-    ],
-    prado: [
-      { series:'J70',  from:1984, to:1990 },
-      { series:'J80',  from:1990, to:1996 },
-      { series:'J90',  from:1996, to:2002 },
-      { series:'J120', from:2002, to:2009 },
-      { series:'J150', from:2009, to:2099 },
-    ],
-    hilux: [
-      { series:'N60',      from:1983, to:1988 },
-      { series:'5th Gen',  from:1988, to:1997 },
-      { series:'6th Gen',  from:1997, to:2005 },
-      { series:'N70',      from:2005, to:2015 },
-      { series:'N80',      from:2015, to:2099 },
-    ],
-    camry: [
-      { series:'XV10', from:1991, to:1996 },
-      { series:'XV20', from:1996, to:2001 },
-      { series:'XV30', from:2001, to:2006 },
-      { series:'XV40', from:2006, to:2011 },
-      { series:'XV50', from:2011, to:2017 },
-      { series:'XV70', from:2017, to:2099 },
-    ],
-    corolla: [
-      { series:'E100', from:1991, to:1997 },
-      { series:'E110', from:1997, to:2002 },
-      { series:'E120', from:2001, to:2007 },
-      { series:'E140', from:2006, to:2013 },
-      { series:'E170', from:2013, to:2018 },
-      { series:'E210', from:2018, to:2099 },
-    ],
-    kluger: [
-      { series:'XU20',  from:2003, to:2007 },
-      { series:'GSU40', from:2007, to:2014 },
-      { series:'GSU50', from:2014, to:2020 },
-      { series:'AXUH80',from:2020, to:2099 },
-    ],
-    'rav4': [
-      { series:'XA10', from:1994, to:2000 },
-      { series:'XA20', from:2000, to:2005 },
-      { series:'XA30', from:2005, to:2012 },
-      { series:'XA40', from:2012, to:2018 },
-      { series:'XA50', from:2018, to:2099 },
-    ],
-    'hiace': [
-      { series:'H100', from:1989, to:2004 },
-      { series:'H200', from:2004, to:2019 },
-      { series:'H300', from:2019, to:2099 },
-    ],
-    'tarago': [
-      { series:'XR50', from:2006, to:2017 },
-    ],
-  },
-  nissan: {
-    patrol: [
-      { series:'GQ', from:1987, to:1997 },
-      { series:'GU', from:1997, to:2016 },
-      { series:'Y62', from:2010, to:2099 },
-    ],
-    navara: [
-      { series:'D21', from:1986, to:1997 },
-      { series:'D22', from:1997, to:2015 },
-      { series:'D40', from:2004, to:2015 },
-      { series:'D23', from:2015, to:2099 },
-    ],
-    skyline: [
-      { series:'R31', from:1985, to:1990 },
-      { series:'R32', from:1989, to:1993 },
-      { series:'R33', from:1993, to:1998 },
-      { series:'R34', from:1998, to:2002 },
-      { series:'V35', from:2001, to:2006 },
-      { series:'V36', from:2006, to:2014 },
-    ],
-    silvia: [
-      { series:'S12', from:1984, to:1988 },
-      { series:'S13', from:1988, to:1994 },
-      { series:'S14', from:1993, to:1999 },
-      { series:'S15', from:1999, to:2002 },
-    ],
-    'x-trail': [
-      { series:'T30', from:2001, to:2007 },
-      { series:'T31', from:2007, to:2013 },
-      { series:'T32', from:2013, to:2022 },
-      { series:'T33', from:2022, to:2099 },
-    ],
-  },
-  mitsubishi: {
-    triton: [
-      { series:'Mk2/L200', from:1986, to:1996 },
-      { series:'MK',       from:1996, to:2006 },
-      { series:'ML',       from:2006, to:2009 },
-      { series:'MN',       from:2009, to:2015 },
-      { series:'MQ',       from:2015, to:2019 },
-      { series:'MR',       from:2018, to:2099 },
-    ],
-    pajero: [
-      { series:'NH/NJ/NK/NL', from:1991, to:1999 },
-      { series:'NM/NP',       from:1999, to:2006 },
-      { series:'NS/NT/NW/NX', from:2006, to:2021 },
-    ],
-    lancer: [
-      { series:'CE', from:1996, to:2003 },
-      { series:'CH', from:2002, to:2007 },
-      { series:'CJ', from:2007, to:2017 },
-    ],
-    'evolution': [
-      { series:'Evo I-III', from:1992, to:1995 },
-      { series:'Evo IV',    from:1996, to:1998 },
-      { series:'Evo V',     from:1998, to:1999 },
-      { series:'Evo VI',    from:1999, to:2001 },
-      { series:'Evo VII',   from:2001, to:2003 },
-      { series:'Evo VIII',  from:2003, to:2005 },
-      { series:'Evo IX',    from:2005, to:2007 },
-      { series:'Evo X',     from:2007, to:2016 },
-    ],
-    outlander: [
-      { series:'ZG', from:2006, to:2012 },
-      { series:'ZJ', from:2012, to:2021 },
-      { series:'ZM', from:2021, to:2099 },
-    ],
-  },
-  subaru: {
-    impreza: [
-      { series:'GC/GF',   from:1992, to:2000 },
-      { series:'GD/GG',   from:2000, to:2007 },
-      { series:'GE/GH/GR',from:2007, to:2011 },
-      { series:'GJ/GP',   from:2011, to:2016 },
-      { series:'GT',      from:2016, to:2023 },
-    ],
-    wrx: [
-      { series:'GC WRX',  from:1994, to:2000 },
-      { series:'GD WRX',  from:2000, to:2007 },
-      { series:'GE WRX',  from:2007, to:2014 },
-      { series:'VA',      from:2014, to:2021 },
-      { series:'VB',      from:2021, to:2099 },
-    ],
-    'wrx sti': [
-      { series:'GC STI',  from:1994, to:2000 },
-      { series:'GD STI',  from:2000, to:2007 },
-      { series:'GR STI',  from:2007, to:2014 },
-      { series:'VA STI',  from:2014, to:2021 },
-    ],
-    forester: [
-      { series:'SF', from:1997, to:2002 },
-      { series:'SG', from:2002, to:2008 },
-      { series:'SH', from:2008, to:2012 },
-      { series:'SJ', from:2012, to:2018 },
-      { series:'SK', from:2018, to:2099 },
-    ],
-    outback: [
-      { series:'BH', from:1999, to:2003 },
-      { series:'BP', from:2003, to:2009 },
-      { series:'BR', from:2009, to:2014 },
-      { series:'BS', from:2014, to:2020 },
-      { series:'BT', from:2020, to:2099 },
-    ],
-    liberty: [
-      { series:'BH', from:1998, to:2003 },
-      { series:'BP', from:2003, to:2009 },
-      { series:'BR', from:2009, to:2014 },
-      { series:'BS', from:2014, to:2020 },
-    ],
-  },
-  bmw: {
-    // 3 series: 316-340, M3
-    '3': [
-      { series:'E21', from:1975, to:1983 },
-      { series:'E30', from:1982, to:1994 },
-      { series:'E36', from:1990, to:2000 },
-      { series:'E46', from:1997, to:2006 },
-      { series:'E90', from:2004, to:2013 },
-      { series:'F30', from:2011, to:2019 },
-      { series:'G20', from:2018, to:2099 },
-    ],
-    // 5 series: 518-550, M5
-    '5': [
-      { series:'E28', from:1981, to:1988 },
-      { series:'E34', from:1987, to:1996 },
-      { series:'E39', from:1995, to:2003 },
-      { series:'E60', from:2003, to:2010 },
-      { series:'F10', from:2009, to:2017 },
-      { series:'G30', from:2016, to:2099 },
-    ],
-    // 7 series: 728-760
-    '7': [
-      { series:'E23', from:1977, to:1986 },
-      { series:'E32', from:1986, to:1994 },
-      { series:'E38', from:1994, to:2001 },
-      { series:'E65', from:2001, to:2008 },
-      { series:'F01', from:2008, to:2015 },
-      { series:'G11', from:2015, to:2099 },
-    ],
-    // 1 series
-    '1': [
-      { series:'E87', from:2004, to:2012 },
-      { series:'F20', from:2011, to:2019 },
-      { series:'F40', from:2019, to:2099 },
-    ],
-    // 2 series
-    '2': [
-      { series:'F22', from:2013, to:2021 },
-      { series:'G42', from:2021, to:2099 },
-    ],
-    // 4 series (coupe/convertible of 3)
-    '4': [
-      { series:'F32', from:2013, to:2020 },
-      { series:'G22', from:2020, to:2099 },
-    ],
-    // X models
-    'x1': [
-      { series:'E84', from:2009, to:2015 },
-      { series:'F48', from:2015, to:2022 },
-      { series:'U11', from:2022, to:2099 },
-    ],
-    'x3': [
-      { series:'E83', from:2003, to:2010 },
-      { series:'F25', from:2010, to:2017 },
-      { series:'G01', from:2017, to:2099 },
-    ],
-    'x5': [
-      { series:'E53', from:1999, to:2006 },
-      { series:'E70', from:2006, to:2013 },
-      { series:'F15', from:2013, to:2018 },
-      { series:'G05', from:2018, to:2099 },
-    ],
-    'x6': [
-      { series:'E71', from:2008, to:2014 },
-      { series:'F16', from:2014, to:2019 },
-      { series:'G06', from:2019, to:2099 },
-    ],
-    'm3': [
-      { series:'E30 M3', from:1986, to:1991 },
-      { series:'E36 M3', from:1992, to:1999 },
-      { series:'E46 M3', from:2000, to:2006 },
-      { series:'E92 M3', from:2007, to:2013 },
-      { series:'F80 M3', from:2014, to:2018 },
-      { series:'G80 M3', from:2020, to:2099 },
-    ],
-    'm4': [
-      { series:'F82 M4', from:2014, to:2020 },
-      { series:'G82 M4', from:2020, to:2099 },
-    ],
-  },
-  mercedes: {
-    'c-class': [
-      { series:'W202', from:1993, to:2000 },
-      { series:'W203', from:2000, to:2007 },
-      { series:'W204', from:2007, to:2014 },
-      { series:'W205', from:2014, to:2022 },
-      { series:'W206', from:2021, to:2099 },
-    ],
-    'e-class': [
-      { series:'W124', from:1984, to:1997 },
-      { series:'W210', from:1995, to:2002 },
-      { series:'W211', from:2002, to:2009 },
-      { series:'W212', from:2009, to:2016 },
-      { series:'W213', from:2016, to:2099 },
-    ],
-    's-class': [
-      { series:'W126', from:1979, to:1991 },
-      { series:'W140', from:1991, to:1998 },
-      { series:'W220', from:1998, to:2005 },
-      { series:'W221', from:2005, to:2013 },
-      { series:'W222', from:2013, to:2020 },
-      { series:'W223', from:2020, to:2099 },
-    ],
-    'sprinter': [
-      { series:'T1N', from:1995, to:2006 },
-      { series:'W906', from:2006, to:2018 },
-      { series:'W907', from:2018, to:2099 },
-    ],
-    'vito': [
-      { series:'W638', from:1996, to:2003 },
-      { series:'W639', from:2003, to:2014 },
-      { series:'W447', from:2014, to:2099 },
-    ],
-  },
-  audi: {
-    'a3': [
-      { series:'8L', from:1996, to:2003 },
-      { series:'8P', from:2003, to:2013 },
-      { series:'8V', from:2012, to:2020 },
-      { series:'8Y', from:2020, to:2099 },
-    ],
-    'a4': [
-      { series:'B5', from:1994, to:2001 },
-      { series:'B6', from:2000, to:2004 },
-      { series:'B7', from:2004, to:2008 },
-      { series:'B8', from:2007, to:2015 },
-      { series:'B9', from:2015, to:2099 },
-    ],
-    'a6': [
-      { series:'C4', from:1994, to:1997 },
-      { series:'C5', from:1997, to:2004 },
-      { series:'C6', from:2004, to:2011 },
-      { series:'C7', from:2011, to:2018 },
-      { series:'C8', from:2018, to:2099 },
-    ],
-    'tt': [
-      { series:'8N', from:1998, to:2006 },
-      { series:'8J', from:2006, to:2014 },
-      { series:'8S', from:2014, to:2023 },
-    ],
-    'q5': [
-      { series:'8R', from:2008, to:2017 },
-      { series:'FY', from:2016, to:2099 },
-    ],
-  },
-  volkswagen: {
-    golf: [
-      { series:'MK1', from:1974, to:1983 },
-      { series:'MK2', from:1983, to:1992 },
-      { series:'MK3', from:1992, to:1998 },
-      { series:'MK4', from:1998, to:2006 },
-      { series:'MK5', from:2004, to:2009 },
-      { series:'MK6', from:2008, to:2014 },
-      { series:'MK7', from:2012, to:2020 },
-      { series:'MK8', from:2020, to:2099 },
-    ],
-    polo: [
-      { series:'9N', from:2001, to:2009 },
-      { series:'6R', from:2009, to:2014 },
-      { series:'6C', from:2014, to:2017 },
-      { series:'AW', from:2017, to:2099 },
-    ],
-    passat: [
-      { series:'B5', from:1996, to:2005 },
-      { series:'B6', from:2005, to:2010 },
-      { series:'B7', from:2010, to:2014 },
-      { series:'B8', from:2014, to:2099 },
-    ],
-    tiguan: [
-      { series:'5N', from:2007, to:2016 },
-      { series:'AD', from:2016, to:2099 },
-    ],
-    amarok: [
-      { series:'2H', from:2010, to:2022 },
-      { series:'NF', from:2022, to:2099 },
-    ],
-  },
-  mazda: {
-    '3': [
-      { series:'BK', from:2003, to:2009 },
-      { series:'BL', from:2009, to:2013 },
-      { series:'BM', from:2013, to:2019 },
-      { series:'BP', from:2019, to:2099 },
-    ],
-    '6': [
-      { series:'GG', from:2002, to:2007 },
-      { series:'GH', from:2007, to:2012 },
-      { series:'GJ', from:2012, to:2022 },
-    ],
-    'cx-5': [
-      { series:'KE', from:2012, to:2017 },
-      { series:'KF', from:2017, to:2099 },
-    ],
-    'cx-9': [
-      { series:'TB', from:2007, to:2016 },
-      { series:'TC', from:2016, to:2099 },
-    ],
-    'rx-7': [
-      { series:'FB', from:1978, to:1985 },
-      { series:'FC', from:1985, to:1992 },
-      { series:'FD', from:1992, to:2002 },
-    ],
-    'mx-5': [
-      { series:'NA', from:1989, to:1997 },
-      { series:'NB', from:1997, to:2005 },
-      { series:'NC', from:2005, to:2014 },
-      { series:'ND', from:2015, to:2099 },
-    ],
-  },
-  honda: {
-    civic: [
-      { series:'EG', from:1991, to:1995 },
-      { series:'EK', from:1995, to:2001 },
-      { series:'EP', from:2001, to:2005 },
-      { series:'FD', from:2005, to:2011 },
-      { series:'FB', from:2011, to:2016 },
-      { series:'FC', from:2015, to:2021 },
-      { series:'FL', from:2021, to:2099 },
-    ],
-    crv: [
-      { series:'RD', from:1995, to:2001 },
-      { series:'RD/RE', from:2001, to:2012 },
-      { series:'RM', from:2012, to:2016 },
-      { series:'RW', from:2016, to:2022 },
-      { series:'RS', from:2022, to:2099 },
-    ],
-    jazz: [
-      { series:'GD', from:2001, to:2008 },
-      { series:'GE', from:2008, to:2014 },
-      { series:'GK', from:2014, to:2020 },
-      { series:'GR', from:2020, to:2099 },
-    ],
-  },
-  hyundai: {
-    'i30': [
-      { series:'FD', from:2007, to:2012 },
-      { series:'GD', from:2011, to:2017 },
-      { series:'PD', from:2016, to:2099 },
-    ],
-    'tucson': [
-      { series:'JM', from:2004, to:2010 },
-      { series:'LM', from:2009, to:2015 },
-      { series:'TL', from:2015, to:2020 },
-      { series:'NX4', from:2020, to:2099 },
-    ],
-    'santa fe': [
-      { series:'SM', from:2000, to:2006 },
-      { series:'CM', from:2006, to:2012 },
-      { series:'DM', from:2012, to:2018 },
-      { series:'TM', from:2018, to:2099 },
-    ],
-  },
-  kia: {
-    'sportage': [
-      { series:'JA', from:1993, to:2004 },
-      { series:'KM', from:2004, to:2010 },
-      { series:'SL', from:2010, to:2016 },
-      { series:'QL', from:2015, to:2022 },
-      { series:'NQ5', from:2021, to:2099 },
-    ],
-    'cerato': [
-      { series:'LD', from:2003, to:2008 },
-      { series:'TD', from:2008, to:2013 },
-      { series:'YD', from:2012, to:2018 },
-      { series:'BD', from:2018, to:2099 },
-    ],
-  },
-};
-
-// Map a raw model string to the correct lookup key in VEHICLE_GENERATIONS
-function getModelLineKey(make, rawModel) {
-  if (!rawModel) return null;
-  const m = String(rawModel).toLowerCase().trim();
-
-  if (make === 'bmw') {
-    // M models first (specific)
-    if (/m3/.test(m)) return 'm3';
-    if (/m4/.test(m)) return 'm4';
-    if (/m5/.test(m)) return 'm5';
-    // X models
-    if (/x1/.test(m)) return 'x1';
-    if (/x3/.test(m)) return 'x3';
-    if (/x5/.test(m)) return 'x5';
-    if (/x6/.test(m)) return 'x6';
-    if (/x7/.test(m)) return 'x7';
-    // Number series: extract leading digit from model like "320d", "318i", "520d"
-    const numLine = m.match(/\b([1-8])\d{2}/);
-    if (numLine) return numLine[1]; // '3', '5', '7' etc.
-    // Already just a number ("3 series", "3-series", "3")
-    const justNum = m.match(/^([1-8])(?:\s*series)?$/);
-    if (justNum) return justNum[1];
-    return null;
-  }
-
-  if (make === 'mercedes') {
-    if (/\bc.?class\b|\bc ?\d{3}\b|\bc63\b|\bc43\b|\bc45\b/.test(m)) return 'c-class';
-    if (/\be.?class\b|\be ?\d{3}\b|\be63\b|\be53\b/.test(m)) return 'e-class';
-    if (/\bs.?class\b|\bs ?\d{3}\b/.test(m)) return 's-class';
-    if (/\bvito\b/.test(m)) return 'vito';
-    if (/\bsprinter\b/.test(m)) return 'sprinter';
-    return m.split(' ')[0]; // fallback to first word
-  }
-
-  if (make === 'audi') {
-    // A3, S3, RS3 → a3 table
-    if (/\b[sr]?s?3\b|\ba3\b/.test(m)) return 'a3';
-    // A4, S4, RS4 → a4 table
-    if (/\b[sr]?s?4\b|\ba4\b/.test(m)) return 'a4';
-    if (/\ba6\b|\bs6\b|\brs6\b/.test(m)) return 'a6';
-    if (/\btt\b/.test(m)) return 'tt';
-    if (/\bq5\b/.test(m)) return 'q5';
-    return m.split(' ')[0];
-  }
-
-  if (make === 'volkswagen') {
-    if (/\bgolf\b/.test(m)) return 'golf';
-    if (/\bpolo\b/.test(m)) return 'polo';
-    if (/\bpassat\b/.test(m)) return 'passat';
-    if (/\btiguan\b/.test(m)) return 'tiguan';
-    if (/\bamarok\b/.test(m)) return 'amarok';
-  }
-
-  // For Toyota, Nissan, Holden, Ford, Mazda, etc. — model is usually the key directly
-  // Clean it up: "3 series" → "3", "hilux sr5" → "hilux", etc.
-  return m.replace(/\s*(sr5?|sr|glx?|dx|gl|vx|vn|executive|elite|sport|turbo|diesel|petrol|auto|manual|4wd|2wd)\s*$/i,'').trim();
-}
-
-// Sync lookup: given make+model+year, return the chassis/generation series.
-// Returns null if not found — caller can then try aiResolveGeneration().
-function lookupGenerationByYear(make, rawModel, year) {
-  if (!make || !year || year < 1960) return null;
-  const mk = String(make).toLowerCase().trim();
-  const modelKey = getModelLineKey(mk, rawModel);
-  if (!modelKey) return null;
-
-  const gens = VEHICLE_GENERATIONS[mk]?.[modelKey];
-  if (!gens || !gens.length) return null;
-
-  // Find all generations whose year range covers this year
-  const matches = gens.filter(g => year >= g.from && year <= g.to);
-  if (!matches.length) return null;
-  // Overlap (changeover year): prefer the newer generation (higher from)
-  return matches.sort((a, b) => b.from - a.from)[0].series;
-}
-
-// AI fallback: asks Gemini/Haiku to identify the generation.
-// Cached for 1 year per (make, model, year) — static automotive knowledge.
-async function aiResolveGeneration(make, model, year) {
-  if (!make || !year) return null;
-  const ck = ('gen:' + String(make) + ':' + String(model||'') + ':' + String(year)).toLowerCase().replace(/\s/g,'_');
-  try {
-    const cached = await redisGet(ck);
-    if (cached && cached.s !== undefined) return cached.s || null;
-  } catch(_) {}
-
-  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
-
-  const prompt = [
-    'You are an automotive expert. What is the chassis/generation code for this vehicle?',
-    `Year: ${year}, Make: ${make}, Model: ${model || 'unknown'}`,
-    'Examples: BMW E36, Holden VT Commodore, Ford BF Falcon, Toyota N70 HiLux, Nissan GU Patrol, VW MK4 Golf, Mazda BL Mazda3',
-    'Return ONLY JSON — no explanation: { "series": "code" } or { "series": null } if unknown.',
-  ].join('\n');
-
-  try {
-    let text = '';
-    if (GEMINI_API_KEY) {
-      const r = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents:[{parts:[{text:prompt}]}], generationConfig:{ thinkingConfig:{thinkingBudget:0} } },
-        { headers:{'Content-Type':'application/json'}, timeout:8000 });
-      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    } else {
-      const r = await axios.post('https://api.anthropic.com/v1/messages',
-        { model:'claude-haiku-4-5-20251001', max_tokens:60, messages:[{role:'user',content:prompt}] },
-        { headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'}, timeout:8000 });
-      text = r.data?.content?.[0]?.text || '';
-    }
-    const mj = text.match(/\{[\s\S]*?\}/);
-    const parsed = mj ? JSON.parse(mj[0]) : null;
-    const s = (parsed?.series && typeof parsed.series === 'string') ? parsed.series.trim() : null;
-    await redisSet(ck, { s }, 365 * 24 * 3600).catch(()=>{});
-    return s;
-  } catch(e) { console.error('[GenAI]', make, model, year, e.message); return null; }
-}
-
-// ── Enrich a listing with all precise vehicle identity fields ──
-// Called before upsert — fills in series, variant, bands etc
-function enrichVehicleIdentity(listing) {
-  if (!listing.make) return listing;
-
-  const title = listing.title || '';
-  const desc  = listing.description || '';
-
-  const series    = listing.series    || extractSeriesFromTitle(listing.make, listing.model, title)
-                  || lookupGenerationByYear(listing.make, listing.model, listing.year);
-  const variant   = listing.variant   || extractVariantFromTitle(title);
-  const bodyStyle = listing.body_style || extractBodyStyleFromTitle(title, desc);
-  const fuelType  = listing.fuel_type  || extractFuelTypeFromTitle(title, desc);
-  const engine    = listing.engine     || extractEngineFromTitle(title, desc);
-  const yearBand    = listing.year ? bandYear(listing.year)   : null;
-  const mileageBand = listing.mileage ? bandMileage(listing.mileage) : 'unknown';
-  const transmission = listing.transmission
-    ? (listing.transmission.toLowerCase().includes('man') ? 'manual' : 'auto')
-    : null;
-
-  return {
-    ...listing,
-    series,
-    variant,
-    body_style:   bodyStyle,
-    fuel_type:    fuelType,
-    engine,
-    year_band:    yearBand,
-    mileage_band: mileageBand,
-    transmission,
-    // kms stays as-is from the listing object
-  };
-}
-
-// ── Listing quality scoring ──────────────────────────────
-// Run before DB write — returns { flags, quality, inPricePool }
-// Catches bad listings BEFORE they pollute the price pool
-
-// Category price floors/ceilings — reject physically impossible prices
-const CATEGORY_PRICE_BOUNDS = {
-  vehicle:     { floor: 200,  ceiling: 500000 },
-  electronics: { floor: 5,    ceiling: 30000  },
-  general:     { floor: 1,    ceiling: 100000 },
-};
-
-// Title patterns that signal a listing should never enter the price pool
-const DAMAGE_PATTERNS    = /\b(broken|cracked|faulty|damaged|spares?|repairs?|parts? only|not working|doesn'?t work|dead|seized|blown|written off|wrecked|flood|hail|smash|project car|needs work|no rego|unregistered|as.?is|as is)\b/i;
-const SWAP_PATTERNS      = /\b(swap|swaps|trade|trades|pto|part trade|part swap|swopping|swop)\b/i;
-const SPAM_PATTERNS      = /\b(follow|instagram|whatsapp|contact me|dm me|text me|call me|click link|bit\.ly|t\.me|telegram)\b/i;
-const PLACEHOLDER_TITLES = /^(car|item|stuff|thing|product|misc|other|test|listing)\s*$/i;
-
-// Catches accessories, parts, bundles — keeps them OUT of the price pool
-const ACCESSORY_PATTERNS = /\b(controller|dualsense|dualshock|joy.?con|charger|charging dock|cable|hdmi|adapter|case|cover|skin|sticker|decal|faceplate|stand|mount|bracket|holder|bag|sleeve|strap|screen protector|tempered glass|remote|headset|earbuds?|game|games|disc|cartridge|manual|box only|empty box|wrecking|wrecked|parts?|spare|callipers?|caliper|rims?|wheels?|tyres?|tires?|bonnet|bumper|door trim|tail light|head light|headlight|taillight|grille|radiator|compressor|alternator|starter motor|diff|gearbox|engine only|motor only|air filter|brake pads?|suspension|strut|control arm|steering rack|window|glass|seat|seats|carpet|floor mat|number plate|reg plate|rego plate|sticker|banner|flag|poster|toy|model|die.?cast|miniature|collectible|hot wheels|merchandise)\b/i;
-const BUNDLE_PATTERNS = /\b(bundle|lot of|job.?lot|x ?\d{1,2} games?|\+ games?|with games?|plus games?|collection of|\d+ items?)\b/i;
-
-// Scrub personal contact info from listing text before storing
-function scrubPII(text) {
-  if (!text) return text;
-  let t = String(text);
-  t = t.replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[removed]');
-  t = t.replace(/\b(?:\+?61[\s-]?|0)4\d{2}[\s-]?\d{3}[\s-]?\d{3}\b/g, '[removed]');
-  t = t.replace(/\(?\b0[2-8]\)?[\s-]?\d{4}[\s-]?\d{4}\b/g, '[removed]');
-  t = t.replace(/\b(wa\.me|t\.me|m\.me)\S*/gi, '[removed]');
-  return t;
-}
-
-function scoreListingQuality(listing) {
-  const price = listing.price || 0;
-  const title = (listing.title || '').toLowerCase();
-  const desc  = (listing.description || '').toLowerCase();
-  const full  = title + ' ' + desc;
-  let flags = 0;
-
-  // Bit 0 — already handled by isOfferPrice, but double-check
-  if (isOfferPrice(price)) flags |= 1;
-
-  // Bit 1 — damage / broken / spares
-  if (DAMAGE_PATTERNS.test(full)) flags |= 2;
-
-  // Bit 2 — swap / trade listings (not a sale price)
-  if (SWAP_PATTERNS.test(full)) flags |= 4;
-
-  // Bit 4 — price below category floor (too cheap to be real)
-  const category = listing.make ? 'vehicle' : 'general';
-  const bounds   = CATEGORY_PRICE_BOUNDS[category] || CATEGORY_PRICE_BOUNDS.general;
-  if (price > 0 && price < bounds.floor)   flags |= 16;
-
-  // Bit 5 — price above category ceiling (data entry error / scam)
-  if (price > 0 && price > bounds.ceiling) flags |= 32;
-
-  // Bit 6 — spam signals in title/description
-  if (SPAM_PATTERNS.test(full)) flags |= 64;
-
-  // Placeholder titles that give no useful signal
-  if (PLACEHOLDER_TITLES.test(listing.title || '')) flags |= 64;
-
-  // Bit 7 — accessory, part, or bundle — not the product itself
-  if (ACCESSORY_PATTERNS.test(full) || BUNDLE_PATTERNS.test(full)) flags |= 128;
-
-  // Vehicle-specific: mileage sanity (> 900k km is almost certainly a data error)
-  if (listing.mileage && listing.mileage > 900000) flags |= 8;
-
-  // Determine quality label
-  let quality = 'ok';
-  if (flags & 64) quality = 'spam';
-  else if (flags & 128) quality = 'accessory';
-  else if (flags & (2 | 4)) quality = 'not_for_sale';  // damage or swap
-  else if (flags & (16 | 32)) quality = 'suspicious';  // price bounds
-  else if (flags & 1) quality = 'offer_price';
-
-  // Vehicle without km data can't be placed in a cohort — exclude from pool
-  const isVehicle = !!(listing.make);
-  const hasMileage = listing.mileage && listing.mileage > 0;
-  const inPricePool = quality === 'ok' && (!isVehicle || hasMileage);
-
-  return { flags, quality, inPricePool };
-}
-
-async function upsertListingToDB(rawListing) {
-  try {
-    // Enrich with precise vehicle identity fields before writing
-    const listing = rawListing.make ? enrichVehicleIdentity(rawListing) : rawListing;
-
-    const price      = (listing.price && !isOfferPrice(listing.price)) ? listing.price : null;
-    const offerPrice = isOfferPrice(listing.price);
-    const { flags, quality, inPricePool } = scoreListingQuality({ ...listing, price: listing.price });
-
-    await pool.query(`
-      INSERT INTO listings
-        (listing_id, title, description, price, is_offer_price, location, state,
-         seller_name, image_url, url, keyword, category,
-         make, model, series, variant, body_style, year, year_band,
-         kms, mileage_band, transmission, fuel_type, engine,
-         price_quality, quality_flags, in_price_pool,
-         listed_at, scraped_at, last_seen_at, is_active, listing_status, seen_count)
-      VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-        $13,$14,$15,$16,$17,$18,$19,
-        $20,$21,$22,$23,$24,
-        $25,$26,$27,
-        $28,NOW(),NOW(),TRUE,'active',1
-      )
-      ON CONFLICT (listing_id) DO UPDATE SET
-        price          = EXCLUDED.price,
-        last_seen_at   = NOW(),
-        is_active      = TRUE,
-        listing_status = 'active',
-        seen_count     = listings.seen_count + 1,
-        -- Enrich identity fields if we now have better data
-        series         = COALESCE(EXCLUDED.series,      listings.series),
-        variant        = COALESCE(EXCLUDED.variant,     listings.variant),
-        body_style     = COALESCE(EXCLUDED.body_style,  listings.body_style),
-        kms            = COALESCE(EXCLUDED.kms,          listings.kms),
-        mileage_band   = COALESCE(EXCLUDED.mileage_band,listings.mileage_band),
-        fuel_type      = COALESCE(EXCLUDED.fuel_type,   listings.fuel_type),
-        engine         = COALESCE(EXCLUDED.engine,      listings.engine),
-        description    = COALESCE(EXCLUDED.description, listings.description),
-        price_quality  = EXCLUDED.price_quality,
-        quality_flags  = EXCLUDED.quality_flags,
-        in_price_pool  = EXCLUDED.in_price_pool
-    `, [
-      listing.id,
-      scrubPII(listing.title),
-      scrubPII(listing.description)   || null,
-      price,
-      offerPrice,
-      listing.location      || null,
-      extractState(listing.location),
-      null,
-      listing.image         || null,
-      listing.url           || null,
-      listing.keyword       ? listing.keyword.toLowerCase().trim() : null,
-      listing.make          ? 'vehicle' : 'general',
-      // Vehicle identity
-      listing.make          || null,
-      listing.model         || null,
-      listing.series        || null,
-      listing.variant       || null,
-      listing.body_style    || null,
-      listing.year          || null,
-      listing.year_band     || null,
-      listing.mileage       || null,
-      listing.mileage_band  || null,
-      listing.transmission  || null,
-      listing.fuel_type     || null,
-      listing.engine        || null,
-      // Quality
-      quality,
-      flags,
-      inPricePool,
-      listing.listedAt      ? new Date(listing.listedAt) : null,
-    ]);
-  } catch (e) {
-    if (!e.message.includes('duplicate')) {
-      console.error('[DB] upsertListing error:', e.message.slice(0, 120));
-    }
-  }
-}
-
-async function getDBPriceStats(keyword, minSamples = 5) {
-  try {
-    const kw = keyword.toLowerCase().trim();
-
-    // ── Fast path: pre-computed IQR-cleaned stats ──────────
-    const fast = await pool.query(
-      `SELECT * FROM keyword_price_stats WHERE keyword = $1`, [kw]
-    );
-    if (fast.rows.length && fast.rows[0].sample_count >= minSamples) {
-      const r = fast.rows[0];
-      return {
-        count:       r.sample_count,
-        rawCount:    r.raw_count || r.sample_count,
-        median:      r.median_price,
-        p25:         r.p25_price,
-        p75:         r.p75_price,
-        iqr:         r.iqr,
-        floor:       r.floor_price,
-        ceiling:     r.ceiling_price,
-        low:         r.low_price,
-        high:        r.high_price,
-        source:      'flipradar_db',
-        sourceLabel: `FlipRadar DB · ${r.sample_count} verified sales`,
-      };
-    }
-
-    // ── Live path: IQR outlier removal in SQL ──────────────
-    // Step 1: get raw percentiles from the clean pool
-    const percResult = await pool.query(`
-      SELECT
-        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
-        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75,
-        COUNT(*)::INT AS raw_count
-      FROM listings
-      WHERE keyword = $1
-        AND price > 0
-        AND is_offer_price = FALSE
-        AND in_price_pool = TRUE
-        AND is_active = TRUE
-        AND scraped_at > NOW() - INTERVAL '90 days'
-    `, [kw]);
-
-    const perc = percResult.rows[0];
-    if (!perc || perc.raw_count < minSamples) return null;
-
-    const iqr      = perc.p75 - perc.p25;
-    const fence_lo = Math.max(0, perc.p25 - 1.5 * iqr);
-    const fence_hi = perc.p75 + 1.5 * iqr;
-
-    // Step 2: stats using only prices within IQR fences
-    const result = await pool.query(`
-      SELECT
-        COUNT(*)::INT                                                    AS cnt,
-        PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY price)::INT        AS median,
-        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT        AS p25,
-        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT        AS p75,
-        MIN(price)::INT                                                  AS low,
-        MAX(price)::INT                                                  AS high
-      FROM listings
-      WHERE keyword = $1
-        AND price BETWEEN $2 AND $3
-        AND is_offer_price = FALSE
-        AND in_price_pool = TRUE
-        AND is_active = TRUE
-        AND scraped_at > NOW() - INTERVAL '90 days'
-    `, [kw, Math.round(fence_lo), Math.round(fence_hi)]);
-
-    const row = result.rows[0];
-    if (!row || row.cnt < minSamples) return null;
-
-    return {
-      count:       row.cnt,
-      rawCount:    perc.raw_count,
-      median:      row.median,
-      p25:         row.p25,
-      p75:         row.p75,
-      iqr,
-      floor:       Math.round(fence_lo),
-      ceiling:     Math.round(fence_hi),
-      low:         row.low,
-      high:        row.high,
-      source:      'flipradar_db',
-      sourceLabel: `FlipRadar DB · ${row.cnt} verified comparables`,
-    };
-  } catch (e) {
-    console.error('[DB] getDBPriceStats error:', e.message);
-    return null;
-  }
-}
-
-// ── IQR-clean stats from a set of prices ─────────────────
-// Used by all vehicle lookup tiers — same logic every time
-function calcIQRStats(prices) {
-  if (!prices || prices.length < 3) return null;
-  const sorted = [...prices].sort((a, b) => a - b);
-  const p25 = sorted[Math.floor(sorted.length * 0.25)];
-  const p75 = sorted[Math.floor(sorted.length * 0.75)];
-  const iqr  = p75 - p25;
-  const lo   = Math.max(0, p25 - 1.5 * iqr);
-  const hi   = p75 + 1.5 * iqr;
-  const clean = sorted.filter(p => p >= lo && p <= hi);
-  if (clean.length < 3) return null;
-  const median = clean[Math.floor(clean.length / 2)];
-  return {
-    count:    clean.length,
-    rawCount: sorted.length,
-    median,
-    p25:      clean[Math.floor(clean.length * 0.25)],
-    p75:      clean[Math.floor(clean.length * 0.75)],
-    low:      clean[0],
-    high:     clean[clean.length - 1],
-    iqr:      Math.round(iqr),
-    floor:    Math.round(lo),
-    ceiling:  Math.round(hi),
-  };
-}
-
-// ── Run IQR-cleaned price query for any WHERE clause ──────
-async function queryCleanPrices(whereSql, params) {
-  const r = await pool.query(`
-    SELECT price FROM listings
-    WHERE ${whereSql}
-      AND price > 0 AND is_offer_price = FALSE
-      AND in_price_pool = TRUE
-      AND listing_status IN ('active','sold')
-  `, params);
-  return r.rows.map(r => r.price);
-}
-
-// ── Vehicle price lookup — precision-first waterfall ──────
-//
-// Tries increasingly broad cohorts until it finds enough data.
-// Narrow cohort = more accurate.  Broad cohort = more samples.
-//
-// Tier 1 (most precise): make + model + series + variant + year_band + mileage_band + transmission
-// Tier 2:                make + model + series + variant + year_band + mileage_band
-// Tier 3:                make + model + series + variant + year_band
-// Tier 4:                make + model + series + year_band + mileage_band
-// Tier 5:                make + model + year_band + mileage_band
-// Tier 6 (broadest):     make + model + year_band
-//
-// Each tier needs DB_MIN_SAMPLES to be accepted.
-// Falls back to AI if no tier has enough data.
-
-async function getDBVehicleStats(make, model, year, mileage, opts = {}) {
-  if (!make || !year) return null;
-
-  const { series, variant, transmission } = opts;
-  const yearBand    = bandYear(year);
-  const mileageBand = mileage ? bandMileage(mileage) : null;
-  const MIN         = DB_MIN_SAMPLES;
-
-  // ── Fast path: pre-computed cohort stats table ──────────
-  // Check for the most precise cohort key first, then widen
-  const cohortKey = buildVehicleCohortKey(make, model, series, variant, yearBand, mileageBand || 'unknown', transmission);
-  const fastResult = await pool.query(
-    `SELECT * FROM vehicle_price_stats WHERE cohort_key = $1`, [cohortKey]
-  );
-  if (fastResult.rows.length && fastResult.rows[0].sample_count >= MIN) {
-    const r = fastResult.rows[0];
-    return formatVehicleStats(r.median_price, r.p25_price, r.p75_price,
-      r.sample_count, r.raw_count, r.iqr, r.floor_price, r.ceiling_price,
-      make, model, series, variant, yearBand, mileageBand, r.cohort_key, 'precomputed');
-  }
-
-  // ── Live waterfall — try each tier in order ─────────────
-
-  // Helper: run a tier query and return stats if enough data
-  async function tryTier(label, whereSql, params) {
-    const prices = await queryCleanPrices(whereSql, params);
-    const stats  = calcIQRStats(prices);
-    if (stats && stats.count >= MIN) {
-      console.log(`[VehiclePrice] ${make} ${model} ${year} — Tier ${label}: ${stats.count} samples`);
-      return { ...stats, tierLabel: label };
-    }
-    return null;
-  }
-
-  let result = null;
-
-  // Tier 1 — fully precise
-  if (!result && series && variant && mileageBand && transmission) {
-    result = await tryTier('1 (exact)',
-      `make=$1 AND model=$2 AND series=$3 AND variant=$4 AND year_band=$5 AND mileage_band=$6 AND transmission=$7`,
-      [make, model, series, variant, yearBand, mileageBand, transmission]
-    );
-  }
-
-  // Tier 2 — drop transmission
-  if (!result && series && variant && mileageBand) {
-    result = await tryTier('2 (no transmission)',
-      `make=$1 AND model=$2 AND series=$3 AND variant=$4 AND year_band=$5 AND mileage_band=$6`,
-      [make, model, series, variant, yearBand, mileageBand]
-    );
-  }
-
-  // Tier 3 — drop mileage band
-  if (!result && series && variant) {
-    result = await tryTier('3 (no mileage)',
-      `make=$1 AND model=$2 AND series=$3 AND variant=$4 AND year_band=$5`,
-      [make, model, series, variant, yearBand]
-    );
-  }
-
-  // Tier 4 — drop variant, keep series + mileage
-  if (!result && series && mileageBand) {
-    result = await tryTier('4 (series+mileage)',
-      `make=$1 AND model=$2 AND series=$3 AND year_band=$4 AND mileage_band=$5`,
-      [make, model, series, yearBand, mileageBand]
-    );
-  }
-
-  // Tier 5 — make + model + year band + mileage band (no series/variant)
-  if (!result && mileageBand) {
-    result = await tryTier('5 (model+mileage)',
-      `make=$1 AND model=$2 AND year_band=$3 AND mileage_band=$4`,
-      [make, model, yearBand, mileageBand]
-    );
-  }
-
-  // Tier 6 — make + model + year band only (broadest)
-  if (!result) {
-    result = await tryTier('6 (model+year)',
-      `make=$1 AND model=$2 AND year_band=$3`,
-      [make, model, yearBand]
-    );
-  }
-
-  if (!result) {
-    console.log(`[VehiclePrice] No data for ${make} ${model} ${year} — AI needed`);
-    return null;
-  }
-
-  return formatVehicleStats(
-    result.median, result.p25, result.p75,
-    result.count, result.rawCount, result.iqr, result.floor, result.ceiling,
-    make, model, series, variant, yearBand, mileageBand, null, result.tierLabel
-  );
-}
-
-function formatVehicleStats(median, p25, p75, count, rawCount, iqr, floor, ceiling,
-  make, model, series, variant, yearBand, mileageBand, cohortKey, tier) {
-  const label = [make, model, series, variant].filter(Boolean).join(' ');
-  const mileageStr = mileageBand && mileageBand !== 'unknown' ? ` · ${mileageBand} km` : '';
-  return {
-    marketMedian:    median,
-    marketLow:       p25,
-    marketHigh:      p75,
-    samples:         count,
-    rawSamples:      rawCount || count,
-    iqr,
-    floor,
-    ceiling,
-    yearBand,
-    mileageBand,
-    cohortKey,
-    tier,
-    source:          'flipradar_db',
-    sourceLabel:     `FlipRadar DB · ${count} comparable ${label}${mileageStr}`,
-    confidence:      calcConfidence('vpx', count),
-    make, model, series, variant,
-  };
-}
-
-async function getDBComparables(keyword, limit = 10) {
-  try {
-    const result = await pool.query(`
-      SELECT listing_id, title, price, location, state, url, listed_at, scraped_at
-      FROM listings
-      WHERE keyword = $1 AND price > 0 AND is_offer_price = FALSE
-        AND is_active = TRUE AND scraped_at > NOW() - INTERVAL '60 days'
-      ORDER BY scraped_at DESC LIMIT $2
-    `, [keyword.toLowerCase().trim(), limit]);
-    return result.rows;
-  } catch (e) { return []; }
-}
-
-async function getDBSummary() {
-  try {
-    const r = await pool.query(`
-      SELECT COUNT(*)::INT AS total_listings,
-        COUNT(DISTINCT keyword)::INT AS unique_keywords,
-        COUNT(DISTINCT make)::INT    AS unique_makes,
-        COUNT(*) FILTER (WHERE is_active)::INT AS active_listings,
-        MAX(scraped_at) AS last_scraped
-      FROM listings
-    `);
-    return r.rows[0];
-  } catch (e) { return null; }
-}
-
-// ── Upstash Redis ─────────────────────────────────────────
-// ── Upstash Redis ─────────────────────────────────────────
-const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL;
-const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-
-async function redisGet(key) {
-  if (!REDIS_URL) return null;
-  try {
-    const res = await axios.get(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
-    });
-    if (!res.data.result) return null;
-    let parsed = JSON.parse(res.data.result);
-    if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed); } catch(e) {} }
-    return parsed;
-  } catch (e) { console.error('[Redis] GET error:', e.message); return null; }
-}
-
-async function redisSet(key, value, ttlSeconds = null) {
-  if (!REDIS_URL) return;
-  try {
-    const qs = ttlSeconds ? `?ex=${ttlSeconds}` : '';
-    await axios.post(
-      `${REDIS_URL}/set/${encodeURIComponent(key)}${qs}`,
-      JSON.stringify(value),
-      { headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' } }
-    );
-  } catch (e) { console.error('[Redis] SET error:', e.message); }
-}
-
-async function redisDel(key) {
-  if (!REDIS_URL) return;
-  try {
-    await axios.post(`${REDIS_URL}/del/${encodeURIComponent(key)}`, null, {
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
-    });
-  } catch (e) { console.error('[Redis] DEL error:', e.message); }
-}
-
-// Redis key helpers
-const K = {
-  user:        id  => `fr:user:${id}`,
-  emailIdx:    em  => `fr:email:${em.toLowerCase()}`,
-  userWatches: uid => `fr:user-watches:${uid}`,
-  watch:       id  => `fr:watch:${id}`,
-  listings:    uid => `fr:listings:${uid}`,
-  seen:        uid => `fr:seen:${uid}`,
-  prices:      kw  => `fr:prices:${kw.toLowerCase().trim()}`,
-  sharedScan:  kw  => `fr:scan:${kw.toLowerCase().trim()}`,  // shared scan cache across all users
-  enrich:      id  => `fr:enrich:${id}`,                     // slim enrichment data per listing (7-day TTL)
-  blocked:     uid => `fr:blocked:${uid}`,
-  // Appraisal result cache — keyed by listing ID (most specific) or content hash
-  appraisalById:   (listingId) => `fr:apr:id:${listingId}`,
-  appraisalByHash: (hash)      => `fr:apr:h:${hash}`,
-  // Price history per listing — tracks last known price for drop detection
-  listingPrice:    (id)        => `fr:lp:${id}`,
-};
-
-// ── Auth ──────────────────────────────────────────────────
-const JWT_SECRET     = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
-const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
-// ── Stripe ────────────────────────────────────────────────
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || null;
-const PRICE_IDS = {
-  basic_weekly:    'price_1Ta7LcPDjYUYNInHPy2AMqba',
-  basic_monthly:   'price_1Ta7MLPDjYUYNInHYru4vO5M',
-  basic_yearly:    'price_1Ta7MdPDjYUYNInHu5k5kiOU',
-  pro_weekly:      'price_pro_weekly_placeholder',    // TODO: replace with real Stripe price ID
-  pro_monthly:     'price_pro_monthly_placeholder',   // TODO: replace with real Stripe price ID
-  pro_yearly:      'price_pro_yearly_placeholder',    // TODO: replace with real Stripe price ID
-  premium_weekly:  'price_1Ta7PsPDjYUYNInHMvbMiWvV',
-  premium_monthly: 'price_1Ta7QDPDjYUYNInHDQTp70Mt',
-  premium_yearly:  'price_1Ta7QSPDjYUYNInHLG2F4aT3',
-};
-const PRICE_TO_PLAN = {};
-Object.entries(PRICE_IDS).forEach(([key, priceId]) => {
-  if (key.startsWith('basic'))   PRICE_TO_PLAN[priceId] = 'basic';
-  else if (key.startsWith('pro')) PRICE_TO_PLAN[priceId] = 'pro';
-  else                            PRICE_TO_PLAN[priceId] = 'premium';
-});
-const PLAN_APPRAISAL_LIMITS = { free: 999, basic: 999, pro: 999, premium: 999 }; // TEMP — reset before launch
-const PLAN_WATCHLIST_LIMITS = { free: 0, basic: 2, pro: 2, premium: 5 };
-const FROM_EMAIL    = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.com>';
-const INACTIVE_DAYS = 7;
-const BCRYPT_ROUNDS = 10;
-
-const SEEN_TTL_MS         = 48 * 60 * 60 * 1000;
-const SEEN_MAX_ENTRIES    = 5000;
-
-
-
-// ── Owner account — always premium, no payment required ──
-const OWNER_EMAIL = 'giannimenolotto@gmail.com';
-let ownerUserId = null; // resolved at boot
-function isOwner(userOrWatcher) {
-  if (!userOrWatcher) return false;
-  if (userOrWatcher.email && userOrWatcher.email.toLowerCase() === OWNER_EMAIL) return true;
-  if (ownerUserId && userOrWatcher.userId === ownerUserId) return true;
-  return false;
-}
-// Use this everywhere instead of user.plan — owner always gets premium
-function getEffectivePlan(userOrWatcher) {
-  if (isOwner(userOrWatcher)) return 'premium';
-  return userOrWatcher?.plan || 'free';
-}
-
-
-function makeToken(userId) {
-  return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '90d' });
-}
-function verifyToken(token) {
-  try { return jwt.verify(token, JWT_SECRET).sub; } catch { return null; }
-}
-function authMiddleware(req, res, next) {
-  const header = req.headers['authorization'] || '';
-  const token  = header.replace('Bearer ', '').trim();
-  const userId = verifyToken(token);
-  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-  req.userId = userId;
-  next();
-}
-
-// ── User helpers ──────────────────────────────────────────
-async function getUser(userId)  { return redisGet(K.user(userId)); }
-async function saveUser(user)   { await redisSet(K.user(user.id), user); }
-
-// ── In-memory user cache — avoids Redis round-trip on rapid appraisal bursts ──
-const _userCache = new Map();
-const USER_CACHE_TTL_MS = 8000;
-function _getUserCached(userId) {
-  const hit = _userCache.get(userId);
-  if (hit && (Date.now() - hit.ts) < USER_CACHE_TTL_MS) return Promise.resolve(JSON.parse(JSON.stringify(hit.data)));
-  return getUser(userId).then(u => {
-    if (u) _userCache.set(userId, { data: JSON.parse(JSON.stringify(u)), ts: Date.now() });
-    return u;
+    // Return raw text if no JSON found
+    return { _raw: text };
   });
 }
-function _invalidateUserCache(userId) { _userCache.delete(userId); }
 
-async function consumeAppraisal(userId) {
-  const user = await _getUserCached(userId);
-  if (!user) return { ok: false, status: 404, error: 'User not found' };
-  const today = new Date().toISOString().slice(0, 10);
-  if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
-  const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
-  if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
-    return { ok: false, status: 429, error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) };
-  user.appraisalsToday = (user.appraisalsToday || 0) + 1;
-  await saveUser(user);
-  _invalidateUserCache(userId);
-  return { ok: true, user, used: user.appraisalsToday, limit: limit === Infinity ? -1 : limit };
-}
-async function getUserByEmail(email) {
-  const uid = await redisGet(K.emailIdx(email));
-  if (!uid) return null;
-  return getUser(uid);
+// Legacy Gemini direct call — only used if no backend URL set
+function callGemini(parts) {
+  if (!GEMINI_KEY) return null;
+  var url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + GEMINI_KEY;
+  return fetchWithRetry(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: parts }] })
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.error) throw new Error(data.error.message || 'Gemini error');
+    var text = data.candidates && data.candidates[0] ? (data.candidates[0].content.parts[0].text || '') : '';
+    var start = text.indexOf('{'); var end = text.lastIndexOf('}');
+    if (start !== -1 && end !== -1) { try { return JSON.parse(text.slice(start, end + 1)); } catch(e) {} }
+    throw new Error('Could not read Gemini response');
+  });
 }
 
-// ── Per-user watch helpers ────────────────────────────────
-async function getUserWatchIds(userId) {
-  const ids = await redisGet(K.userWatches(userId));
-  return Array.isArray(ids) ? ids : [];
-}
-async function addWatchId(userId, watchId) {
-  const ids = await getUserWatchIds(userId);
-  if (!ids.includes(watchId)) ids.push(watchId);
-  await redisSet(K.userWatches(userId), ids);
-}
-async function removeWatchId(userId, watchId) {
-  const ids = await getUserWatchIds(userId);
-  await redisSet(K.userWatches(userId), ids.filter(id => id !== watchId));
-}
-async function getWatch(watchId)    { return redisGet(K.watch(watchId)); }
-async function saveWatch(watch)     { await redisSet(K.watch(watch.id), watch); }
-async function deleteWatch(watchId) { await redisDel(K.watch(watchId)); }
-async function getUserWatches(userId) {
-  const ids = await getUserWatchIds(userId);
-  const watches = await Promise.all(ids.map(getWatch));
-  return watches.filter(Boolean);
+function toGeminiImage(block) {
+  return { inline_data: { mime_type: block.source.media_type || 'image/jpeg', data: block.source.data } };
 }
 
-// ── Per-user listings helpers ─────────────────────────────
-async function getUserListings(userId) {
-  const l = await redisGet(K.listings(userId));
-  return Array.isArray(l) ? l : [];
-}
-async function saveUserListings(userId, items) {
-  await redisSet(K.listings(userId), items);
-}
-async function getUserSeen(userId) {
-  const s = await redisGet(K.seen(userId));
-  return (s && typeof s === 'object' && !Array.isArray(s)) ? s : {};
-}
-// merge=true (default): re-reads current Redis state and merges before writing.
-// This prevents concurrent keyword-scan calls from overwriting each other's entries —
-// each setInterval fires independently, so two keywords for the same user can race.
-// merge=false: replace entirely (used when clearing seen entries for a keyword).
-async function saveUserSeen(userId, seen, { merge = true } = {}) {
-  const cutoff = Date.now() - SEEN_TTL_MS;
-  let base = seen;
-  if (merge) {
-    const current = await getUserSeen(userId);
-    // Local entries win — they carry the freshest timestamps
-    base = { ...current, ...seen };
-  }
-  const pruned = Object.fromEntries(
-    Object.entries(base)
-      .filter(([, ts]) => ts > cutoff)
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, SEEN_MAX_ENTRIES)
-  );
-  await redisSet(K.seen(userId), pruned);
-}
-
-// ── Our own scan price history ────────────────────────────
-// Every time we see a listing for a keyword, store its price
-// ── AI field extraction for DB storage ───────────────────
-// Called when regex extraction missed key fields from the title.
-// Uses a cheap single AI call to pull year, kms, make, model,
-// series, variant from the raw title — only fires when needed.
-async function aiExtractVehicleFields(title, keyword, description = '') {
-  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
-  try {
-    const prompt = [
-      'Extract vehicle details from this Australian Facebook Marketplace listing title.',
-      'Return ONLY valid JSON, no markdown, no extra text.',
-      `Title: "${title}"`,
-      description ? `Description: "${String(description).slice(0, 400)}"` : '',
-      'Search keyword: "' + keyword + '"',
-      '{',
-      '  "year": number or null,',
-      '  "make": "brand name or null",',
-      '  "model": "model name or null",',
-      '  "series": "generation code e.g. VE, FG, GU, NP, BF or null",',
-      '  "variant": "trim level e.g. SS, XR6, SV6, Calais, SR5 or null",',
-      '  "kms": number or null,',
-      '  "transmission": "auto or manual or null",',
-      '  "body_style": "sedan/wagon/ute/hatch/suv/van/coupe or null",',
-      '  "fuel_type": "petrol/diesel/hybrid/electric or null",',
-      '  "engine": "e.g. 3.6L V6 or null"',
-      '}',
-    ].join('\n');
-
-    let text = '';
-    if (GEMINI_API_KEY) {
-      const res = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
-      );
-      text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    } else {
-      const res = await axios.post('https://api.anthropic.com/v1/messages', {
-        model: 'claude-haiku-4-5-20251001', max_tokens: 300,
-        messages: [{ role: 'user', content: prompt }],
-      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 10000 });
-      text = res.data?.content?.[0]?.text || '';
-    }
-    const match = text.match(/\{[\s\S]*\}/);
-    return match ? JSON.parse(match[0]) : null;
-  } catch (e) {
-    console.error('[AIExtract] Error:', e.message);
-    return null;
-  }
-}
-
-// ── Price drop detection ─────────────────────────────────
-// Checks the last known price for a listing against the current price.
-// If the price dropped, flags the listing and persists to Neon.
-// Stored in Redis with a 14-day TTL — long enough to catch slow drops.
-const PRICE_TTL_SECS = 14 * 24 * 3600;
-
-async function checkPriceDrop(listing) {
-  if (!listing.id || !listing.price || listing.isOfferPrice) return listing;
-  try {
-    const key      = K.listingPrice(listing.id);
-    const lastData = await redisGet(key);
-    const lastPrice = lastData?.price || null;
-
-    // Store current price for next scan
-    await redisSet(key, { price: listing.price, seenAt: Date.now() }, PRICE_TTL_SECS);
-
-    // No previous price — first time we've seen this listing
-    if (!lastPrice || lastPrice === listing.price) return listing;
-
-    // Price went up or stayed same — not a drop
-    if (listing.price >= lastPrice) return listing;
-
-    // Price dropped — flag it
-    const dropAmount  = lastPrice - listing.price;
-    const dropPercent = Math.round((dropAmount / lastPrice) * 100);
-    console.log(`[PriceDrop] ${listing.title?.slice(0,40)} — $${lastPrice} → $${listing.price} (-$${dropAmount}, -${dropPercent}%)`);
-
-    // Update Neon with previous price
-    pool.query(
-      `UPDATE listings SET previous_price = $1, price_dropped_at = NOW() WHERE listing_id = $2`,
-      [lastPrice, listing.id]
-    ).catch(() => {});
-
-    return {
-      ...listing,
-      priceDropped:  true,
-      previousPrice: lastPrice,
-      dropAmount,
-      dropPercent,
-    };
-  } catch (e) {
-    console.error('[PriceDrop] Error:', e.message);
-    return listing;
-  }
-}
-
-async function storeScanPrice(keyword, listing) {
-  // Only write to DB if the listing has a real price.
-  if (!listing.price || listing.price <= 0 || listing.isOfferPrice) return;
-
-  // For vehicle listings, fill in missing fields with AI if regex missed them.
-  // Only fires when key fields are absent — most titles regex just fine.
-  let enriched = { ...listing, keyword };
-  const isVehicle = listing.make || isVehicleKeyword(keyword);
-
-  if (isVehicle && (!listing.year || !listing.mileage || !listing.make || !listing.model)) {
-    const aiFields = await aiExtractVehicleFields(listing.title, keyword).catch(() => null);
-    if (aiFields) {
-      enriched = {
-        ...enriched,
-        year:         enriched.year         || aiFields.year         || null,
-        make:         enriched.make         || aiFields.make         || null,
-        model:        enriched.model        || aiFields.model        || null,
-        series:       enriched.series       || aiFields.series       || null,
-        variant:      enriched.variant      || aiFields.variant      || null,
-        mileage:      enriched.mileage       || aiFields.kms          || null,
-        transmission: enriched.transmission || aiFields.transmission || null,
-        body_style:   enriched.body_style   || aiFields.body_style   || null,
-        fuel_type:    enriched.fuel_type    || aiFields.fuel_type    || null,
-        engine:       enriched.engine       || aiFields.engine       || null,
-      };
-      console.log(`[AIExtract] "${listing.title.slice(0,50)}" → year:${enriched.year} mileage:${enriched.mileage} make:${enriched.make} model:${enriched.model} series:${enriched.series}`);
-    }
-  }
-
-  upsertListingToDB(enriched).catch(() => {});
-}
-
-// VPX / Carsales / AutoGrab removed — FlipRadar DB is the only pricing source
-
-// ── Appraisal result cache ────────────────────────────────
-// Stores full AI appraisal results so identical listings cost 0 points for subsequent users.
-// Cache key priority:
-//   1. Listing ID  — exact match, most reliable (7-day TTL)
-//   2. Content hash — title + normalised price + keyword (3-day TTL, catches reposts)
-const APPRAISAL_CACHE_TTL_BY_ID   = 7 * 24 * 3600;   // 7 days — listing unlikely to change
-const APPRAISAL_CACHE_TTL_BY_HASH = 3 * 24 * 3600;   // 3 days — same item, different listing
-
-function buildAppraisalHash(title, price, keyword) {
-  // Normalise inputs so minor differences don't bust the cache
-  const normTitle   = (title   || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 80);
-  const normKeyword = (keyword || '').toLowerCase().trim().slice(0, 30);
-  const normPrice   = Math.round((parseFloat(price) || 0) / 50) * 50; // round to nearest $50
-  const raw = `${normKeyword}|${normTitle}|${normPrice}`;
-  return crypto.createHash('sha1').update(raw).digest('hex').slice(0, 16);
-}
-
-async function getAppraisalCache(listingId, title, price, keyword) {
-  // Try listing ID first (exact match)
-  if (listingId) {
-    const hit = await redisGet(K.appraisalById(listingId));
-    if (hit) {
-      console.log(`[AprCache] HIT by listingId: ${listingId}`);
-      return { ...hit, fromCache: true };
-    }
-  }
-  // Fall back to content hash
-  const hash = buildAppraisalHash(title, price, keyword);
-  const hit  = await redisGet(K.appraisalByHash(hash));
-  if (hit) {
-    console.log(`[AprCache] HIT by hash: ${hash} (${keyword}, ~$${price})`);
-    return { ...hit, fromCache: true };
-  }
-  return null;
-}
-
-async function setAppraisalCache(listingId, title, price, keyword, result) {
-  // Strip fields that shouldn't be cached (per-user, transient)
-  const toCache = { ...result };
-  delete toCache.fromCache;
-  delete toCache.usedCache;
-
-  if (listingId) {
-    await redisSet(K.appraisalById(listingId), toCache, APPRAISAL_CACHE_TTL_BY_ID);
-  }
-  const hash = buildAppraisalHash(title, price, keyword);
-  await redisSet(K.appraisalByHash(hash), toCache, APPRAISAL_CACHE_TTL_BY_HASH);
-  console.log(`[AprCache] Stored: listingId=${listingId || 'none'} hash=${hash}`);
-}
-
-// AutoGrab removed — DB is the only pricing source
-
-
-// ── DB vs AI decision engine ─────────────────────────────
-//
-// The DB only wins when it's genuinely more reliable than AI.
-// AI has broad training data but no real-time AU market prices.
-// Our DB has real AU listings but needs enough of them, from a
-// tight-enough cohort, to beat AI's generalised knowledge.
-//
-// Score is 0–100. We use DB if score >= DB_TRUST_THRESHOLD.
-//
-// Scoring factors:
-//   Cohort precision  — tier 1 (exact match) >> tier 6 (broad)
-//   Sample count      — more samples = more reliable
-//   IQR tightness     — narrow spread = consistent market = reliable
-//   Recency           — handled by listing_status filter in queries
-//
-// We never expose this score to the user.
-
-const DB_TRUST_THRESHOLD = 65; // minimum score to prefer DB over AI
-
-function scoreDBResult(stats) {
-  if (!stats || !stats.samples) return 0;
-
-  let score = 0;
-
-  // ── Cohort precision (0–35 points) ─────────────────────
-  // Tier 1 = exact match on all fields = most valuable
-  // Tier 6 = just make+model+year = barely better than AI
-  const tierScores = {
-    '1 (exact)':             35,
-    '2 (no transmission)':   30,
-    '3 (no mileage)':        22,
-    '4 (series+mileage)':    25,
-    '5 (model+mileage)':     18,
-    '6 (model+year)':        10,
-    'precomputed':           30, // precomputed = was already a good cohort
-  };
-  score += tierScores[stats.tier] || 10;
-
-  // ── Sample count (0–35 points) ──────────────────────────
-  // Need at least 8 to be useful; 30+ is solid; 60+ is excellent
-  const n = stats.samples;
-  if      (n >= 60) score += 35;
-  else if (n >= 30) score += 28;
-  else if (n >= 20) score += 22;
-  else if (n >= 12) score += 16;
-  else if (n >=  8) score += 10;
-  else              score +=  0; // < 8: not enough
-
-  // ── IQR tightness (0–30 points) ─────────────────────────
-  // Tight IQR = consistent market = we trust the median
-  // Wide IQR = noisy / mixed cohort = AI might do better
-  // Measured as IQR / median (coefficient of variation proxy)
-  if (stats.iqr != null && stats.marketMedian > 0) {
-    const cv = stats.iqr / stats.marketMedian;
-    if      (cv < 0.10) score += 30; // very tight — e.g. ±5% of median
-    else if (cv < 0.20) score += 22;
-    else if (cv < 0.30) score += 14;
-    else if (cv < 0.45) score +=  7;
-    else                score +=  0; // too wide — AI likely better
-  }
-
-  return Math.min(100, score);
-}
-
-function scoreDBKeywordResult(stats) {
-  if (!stats || !stats.count) return 0;
-  let score = 0;
-  const n = stats.count;
-  if      (n >= 50) score += 50;
-  else if (n >= 30) score += 40;
-  else if (n >= 20) score += 30;
-  else if (n >= 12) score += 20;
-  else if (n >=  8) score += 10;
-  if (stats.iqr != null && stats.median > 0) {
-    const cv = stats.iqr / stats.median;
-    if      (cv < 0.15) score += 50;
-    else if (cv < 0.25) score += 35;
-    else if (cv < 0.40) score += 20;
-    else if (cv < 0.55) score += 10;
-  }
-  return Math.min(100, score);
-}
-
-async function fetchBestVehiclePrice(make, model, year, mileage, opts = {}) {
-  const dbVehicle = await getDBVehicleStats(make, model, year, mileage, opts);
-  if (!dbVehicle) {
-    console.log(`[VehiclePrice] No DB data for ${make} ${model} ${year} — using AI`);
-    return null;
-  }
-  const score = scoreDBResult(dbVehicle);
-  if (score >= DB_TRUST_THRESHOLD) {
-    console.log(`[VehiclePrice] DB preferred (score ${score}) — ${make} ${model} ${year} tier ${dbVehicle.tier} n=${dbVehicle.samples}`);
-    return dbVehicle;
-  }
-  console.log(`[VehiclePrice] DB score ${score} < ${DB_TRUST_THRESHOLD} — AI preferred for ${make} ${model} ${year}`);
-  // Still return it so the AI route can use it to sanity-check its output
-  return { ...dbVehicle, belowThreshold: true };
-}
-
-async function getPriceCacheForKeyword(keyword) {
-  const dbStats = await getDBPriceStats(keyword);
-  if (!dbStats) {
-    console.log(`[PriceCache] "${keyword}" → no DB data, using AI`);
-    return null;
-  }
-  const score = scoreDBKeywordResult(dbStats);
-  if (score >= DB_TRUST_THRESHOLD) {
-    console.log(`[PriceCache] "${keyword}" → DB preferred (score ${score}, n=${dbStats.count})`);
-    return { ...dbStats, low: dbStats.p25 || dbStats.low, high: dbStats.p75 || dbStats.high };
-  }
-  console.log(`[PriceCache] "${keyword}" → DB score ${score} < ${DB_TRUST_THRESHOLD} — AI preferred`);
-  return null;
-}
-
-// Build a verdict from price data alone (no AI)
-function buildCacheVerdict(listingPrice, priceData) {
-  const { low, median, high, count, source } = priceData;
-
-  const roi = median > 0 ? Math.round(((median - listingPrice) / listingPrice) * 100) : 0;
-  const estimatedProfit = Math.round(median - listingPrice);
-
-  let verdict, oneLiner, dealScore;
-  if (roi >= 50) {
-    verdict   = 'STEAL';
-    oneLiner  = `Listed ${roi}% below median sold — incredible flip potential`;
-    dealScore = 95;
-  } else if (roi >= 30) {
-    verdict   = 'GOOD DEAL';
-    oneLiner  = `Listed ${roi}% below median sold price — strong flip potential`;
-    dealScore = 80;
-  } else if (roi >= 10) {
-    verdict   = 'GOOD DEAL';
-    oneLiner  = `Priced below market — room to profit`;
-    dealScore = 65;
-  } else if (roi >= 0) {
-    verdict   = 'FAIR';
-    oneLiner  = `Around market rate — slim margin`;
-    dealScore = 45;
-  } else {
-    verdict   = 'PASS';
-    oneLiner  = `Listed ${Math.abs(roi)}% above typical sold prices — negotiate hard or pass`;
-    dealScore = 20;
-  }
-
-  return {
-    verdict,
-    dealScore,
-    oneLiner,
-    estimatedResellLow:  low,
-    estimatedResellHigh: high,
-    recommendedOffer:    Math.round(listingPrice * 0.85),
-    walkAwayPrice:       Math.round(median * 1.05),
-    estimatedProfit:     Math.max(0, estimatedProfit),
-    roiPercent:          roi,
-    dataPoints:          count,
-    source,
-    low, median, high,
-    negotiationScript:   `Similar listings sell for around $${median} — would you take $${Math.round(listingPrice * 0.85)}?`,
-  };
-}
-
-// Mileage-aware verdict from DB price data (used when DB beats AI threshold).
-function buildVehicleVerdict(listingPrice, priceSource, mileage) {
-  const { marketMedian, marketLow, marketHigh, mileageAdjusted, make, model, year } = priceSource;
-
-  const feeAdj          = marketMedian * 0.92;  // ~8% selling fees (FB/Gumtree)
-  const roi             = marketMedian > 0 ? Math.round(((feeAdj - listingPrice) / listingPrice) * 100) : 0;
-  const estimatedProfit = Math.max(0, Math.round(feeAdj - listingPrice));
-
-  let verdict, oneLiner, dealScore;
-  if (roi >= 50) {
-    verdict = 'STEAL'; dealScore = 95;
-    oneLiner = `Listed ${roi}% below market median — exceptional flip potential`;
-  } else if (roi >= 30) {
-    verdict = 'GOOD DEAL'; dealScore = 82;
-    oneLiner = `Listed ${roi}% below market — strong flip potential`;
-  } else if (roi >= 15) {
-    verdict = 'GOOD DEAL'; dealScore = 68;
-    oneLiner = `Priced below market — solid room to profit`;
-  } else if (roi >= 0) {
-    verdict = 'FAIR'; dealScore = 45;
-    oneLiner = `Around market rate — slim margin`;
-  } else {
-    verdict = 'PASS'; dealScore = 18;
-    oneLiner = `Listed ${Math.abs(roi)}% above market — negotiate hard or pass`;
-  }
-
-  let timeToSell;
-  if (dealScore >= 80)      timeToSell = '1–3 days';
-  else if (dealScore >= 60) timeToSell = '3–7 days';
-  else if (dealScore >= 40) timeToSell = '1–2 weeks';
-  else                      timeToSell = '2–4 weeks';
-
-  let demandLevel;
-  if (dealScore >= 80)      demandLevel = '🔥 High';
-  else if (dealScore >= 55) demandLevel = '📈 Moderate';
-  else                      demandLevel = '📉 Low';
-
-  if (!mileageAdjusted)          dealScore = Math.max(0, dealScore - 8);
-  if (mileage && mileage > 200000) dealScore = Math.max(0, dealScore - 5);  // mileage param = kms value
-
-  const carLabel         = [year, make, model].filter(Boolean).join(' ');
-  const mileageWarning   = !mileageAdjusted ? ' Kms not listed — actual value may vary.' : '';
-  const whyItsWorth      = `Based on comparable ${carLabel} listings currently on the AU market.${mileageWarning}`;
-
-  return {
-    verdict,
-    dealScore,
-    oneLiner,
-    estimatedMarketValue: marketMedian,
-    estimatedResellLow:   marketLow,
-    estimatedResellHigh:  marketHigh,
-    recommendedOffer:     Math.round(listingPrice * 0.82),
-    walkAwayPrice:        Math.round(marketMedian * 0.95),
-    estimatedProfit,
-    roiPercent:           roi,
-    timeToSell,
-    demandLevel,
-    whyItsWorth,
-    greenFlags:          [],
-    redFlags:            [],
-    whatToCheckInPerson: [],
-    low:    marketLow,
-    median: marketMedian,
-    high:   marketHigh,
-    negotiationScript: `Similar ${carLabel}s are going for around $${marketMedian.toLocaleString()} — would you take $${Math.round(listingPrice * 0.82).toLocaleString()}?`,
-  };
-}
-
-// ── Email (Resend) ────────────────────────────────────────
-async function sendEmail(to, subject, html) {
-  if (!RESEND_API_KEY) { console.log(`[Email] No RESEND_API_KEY — skipping email to ${to}`); return; }
-  try {
-    const res = await axios.post('https://api.resend.com/emails', {
-      from: FROM_EMAIL, to, subject, html,
-    }, {
-      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      timeout: 10000,
-    });
-    console.log(`[Email] Sent "${subject}" to ${to}`);
-    return res.data;
-  } catch (e) {
-    console.error(`[Email] Failed to send to ${to}:`, e.response?.data || e.message);
-  }
-}
-
-function welcomeEmail(name, email) {
-  return sendEmail(email, 'Welcome to FlipRadar 👀', `
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#07070e;font-family:'Helvetica Neue',Arial,sans-serif">
-  <div style="max-width:520px;margin:0 auto;padding:40px 24px">
-    <div style="font-size:32px;font-weight:900;letter-spacing:2px;color:#fff;margin-bottom:32px">
-      Flip<span style="color:#00ff88">Radar</span>
-    </div>
-    <div style="background:linear-gradient(135deg,rgba(0,255,136,.12),rgba(0,255,136,.04));border:1px solid rgba(0,255,136,.25);border-radius:20px;padding:32px;margin-bottom:24px">
-      <div style="font-size:40px;margin-bottom:12px">👋</div>
-      <h1 style="color:#fff;font-size:24px;font-weight:800;margin:0 0 8px">Hey ${name}, you're in!</h1>
-      <p style="color:#888;font-size:15px;line-height:1.6;margin:0">
-        FlipRadar is now scanning Facebook Marketplace for you. Add your first watchlist keyword and we'll notify you the moment something worth flipping shows up.
-      </p>
-    </div>
-    <div style="margin-bottom:24px">
-      <div style="color:#555;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px">Get started in 3 steps</div>
-      ${[
-        ['👁️', 'Add a watchlist', 'Type in what you\'re hunting — e.g. "ps5", "bmw e30", "vintage levis"'],
-        ['📡', 'We scan for you', 'FlipRadar checks Marketplace every 30 minutes and sends you new listings instantly'],
-        ['💸', 'Flip for profit', 'Use the Sell Scanner to appraise anything and generate a listing description'],
-      ].map(([icon, title, desc]) => `
-      <div style="display:flex;gap:14px;margin-bottom:16px">
-        <div style="font-size:24px;flex-shrink:0;width:36px;text-align:center">${icon}</div>
-        <div>
-          <div style="color:#fff;font-weight:700;font-size:14px;margin-bottom:3px">${title}</div>
-          <div style="color:#666;font-size:13px;line-height:1.5">${desc}</div>
-        </div>
-      </div>`).join('')}
-    </div>
-    <div style="text-align:center;margin-bottom:32px">
-      <a href="https://flip-radar.app" style="display:inline-block;background:#00ff88;color:#000;font-weight:800;font-size:16px;padding:16px 40px;border-radius:14px;text-decoration:none;letter-spacing:.5px">
-        Open FlipRadar →
-      </a>
-    </div>
-    <div style="border-top:1px solid #1a1a2e;padding-top:20px;color:#444;font-size:12px;line-height:1.6">
-      You're receiving this because you signed up at FlipRadar.<br>
-      Questions? Just reply to this email.
-    </div>
-  </div>
-</body>
-</html>
-`);
-}
-
-function verificationEmail(name, email, code) {
-  return sendEmail(email, `${code} — Verify your FlipRadar email`, `
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#07070e;font-family:'Helvetica Neue',Arial,sans-serif">
-  <div style="max-width:520px;margin:0 auto;padding:40px 24px">
-    <div style="font-size:32px;font-weight:900;letter-spacing:2px;color:#fff;margin-bottom:32px">
-      Flip<span style="color:#00ff88">Radar</span>
-    </div>
-    <div style="background:#0d0d1a;border:1px solid #1a1a2e;border-radius:20px;padding:32px;margin-bottom:24px;text-align:center">
-      <div style="font-size:40px;margin-bottom:16px">✉️</div>
-      <h2 style="color:#fff;font-size:20px;font-weight:800;margin:0 0 8px">Verify your email</h2>
-      <p style="color:#666;font-size:14px;margin:0 0 28px">Enter this code in the app to verify your email address. It expires in 15 minutes.</p>
-      <div style="background:#00ff88;color:#000;font-size:36px;font-weight:900;letter-spacing:10px;border-radius:14px;padding:20px 24px;display:inline-block;font-family:'Courier New',monospace">
-        ${code}
-      </div>
-    </div>
-    <div style="color:#444;font-size:12px;text-align:center">
-      If you didn't sign up for FlipRadar, you can safely ignore this email.
-    </div>
-  </div>
-</body>
-</html>
-`);
-}
-
-// ── Scan intervals per plan ───────────────────────────────
-const PLAN_INTERVALS = {
-  free:    30 * 60 * 1000,  // 30 minutes
-  basic:   30 * 60 * 1000,  // 30 minutes
-  pro:     30 * 60 * 1000,  // 30 minutes
-  premium: 30 * 60 * 1000,  // 30 minutes
+var VD = {
+  'STEAL':    {e:'🌈',c:'#ffc800',bg:'rgba(255,50,50,0.22)',bo:'rgba(255,50,50,0.6)',g:'rgba(255,80,0,0.15)'},
+  'GOOD DEAL':{e:'✅',c:'#00dd55',bg:'rgba(0,221,85,0.22)',bo:'rgba(0,221,85,0.55)',g:'rgba(0,200,70,0.15)'},
+  'FAIR':     {e:'⚖️',c:'#ffc800',bg:'rgba(255,200,0,0.20)',bo:'rgba(255,200,0,0.55)',g:'rgba(255,200,0,0.12)'},
+  'PASS':     {e:'🚫',c:'#ff4f4f',bg:'rgba(255,60,60,0.22)',bo:'rgba(255,60,60,0.6)',g:'rgba(255,60,60,0.12)'}
 };
 
-// ── In-memory state ───────────────────────────────────────
-let watchlist     = [];
-let lastScanTime  = null;
-let lastScanCount = 0;
-
-// ── Pushover ──────────────────────────────────────────────
-async function sendPushover(token, user, title, message, url) {
-  if (!token || !user) return;
-  try {
-    const payload = { token, user, title: title.slice(0,250), message: message.slice(0,1024), sound: 'cashregister' };
-    if (url) payload.url = url;
-    await axios.post('https://api.pushover.net/1/messages.json', payload);
-  } catch (e) { console.error('[Pushover] Error:', e.message); }
+// Clamp appraisal results for offer/placeholder price listings.
+// ROI and profit figures are meaningless when the listed price is fake ($1, $1234, $9999, etc.).
+// Verdict forced to 'OFFER PRICE' so VD fallback yields neutral yellow styling.
+function normalizeOfferPriceResult(r) {
+  r.verdict             = 'MAKE OFFER';
+  r.dealScore           = Math.min(r.dealScore || 0, 35);
+  r.roiPercent          = 0;
+  r.estimatedProfit     = 0;
+  if (r.median) {
+    r.recommendedOffer = Math.round(r.median * 0.85);
+    r.oneLiner = 'Offer $' + r.recommendedOffer.toLocaleString() + ' — that\'s a good deal on this item';
+  }
+  r.isOfferPriceListing = true;
+  return r;
 }
 
-// ── SociaVault ────────────────────────────────────────────
-const SOCIAVAULT_API_KEY = process.env.SOCIAVAULT_API_KEY || null;
-const SOCIAVAULT_BASE    = 'https://api.sociavault.com/v1/scrape/facebook-marketplace';
+// ── Sell Scanner ──────────────────────────────────────────
+var _sellPhotoBase64 = null;
+var _sellPrices = [];
+var _selectedSellPrice = 0;
+var _sellListingTitle = '';
+var _sellListingDesc = '';
 
-// Cache city → {latitude, longitude} to avoid repeated location lookups
-const _cityCoordCache = new Map();
+function handleSellPhoto(input) {
+  var file = input.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var dataUrl = e.target.result;
+    _sellPhotoBase64 = dataUrl.split(',')[1];
+    document.getElementById('sellPreviewImg').src = dataUrl;
+    document.getElementById('sellPreview').style.display = 'block';
+    document.getElementById('sellUploadArea').style.display = 'none';
+    document.getElementById('sellAnalyseBtn').style.display = 'block';
+    document.getElementById('sellResults').style.display = 'none';
+  };
+  reader.readAsDataURL(file);
+}
 
-async function resolveCity(city) {
-  const key = (city || 'Melbourne').toLowerCase().trim();
-  if (_cityCoordCache.has(key)) return _cityCoordCache.get(key);
-  try {
-    const res = await axios.get(`${SOCIAVAULT_BASE}/location-search`, {
-      params: { query: city || 'Melbourne, Australia' },
-      headers: { 'x-api-key': SOCIAVAULT_API_KEY },
-      timeout: 10000,
-    });
-    const loc = (res.data?.locations || [])[0];
-    if (!loc) return null;
-    const coords = { latitude: loc.latitude, longitude: loc.longitude };
-    _cityCoordCache.set(key, coords);
-    return coords;
-  } catch (e) {
-    console.error('[SociaVault] Location lookup failed:', e.message);
-    return null;
+function clearSellPhoto() {
+  _sellPhotoBase64 = null;
+  var c = document.getElementById('sellPhotoInputCamera');
+  var lb = document.getElementById('sellPhotoInputLibrary');
+  if (c) c.value = '';
+  if (lb) lb.value = '';
+  document.getElementById('sellPreview').style.display = 'none';
+  document.getElementById('sellUploadArea').style.display = 'block';
+  document.getElementById('sellAnalyseBtn').style.display = 'none';
+  document.getElementById('sellResults').style.display = 'none';
+  document.getElementById('sellLoading').style.display = 'none';
+}
+
+function selectSellPrice(idx) {
+  _selectedSellPrice = idx;
+  var cards = ['sellPrice1','sellPrice2','sellPrice3'];
+  cards.forEach(function(id, i) {
+    var el = document.getElementById(id);
+    if (el) el.style.borderColor = i === idx ? '#00ff88' : 'var(--bd)';
+  });
+  // Update description with selected price
+  if (_sellPrices[idx]) {
+    document.getElementById('sellListingTitle').textContent = _sellListingTitle + ' - $' + _sellPrices[idx].price;
   }
 }
 
-async function sociaVaultKeywordScan(keyword, opts = {}) {
-  if (!SOCIAVAULT_API_KEY) return [];
-  const t0  = Date.now();
-  const cap = opts.initialScan ? 50 : 96;  // 50 on first seed, max on ongoing
-  try {
-    // Resolve city to coordinates
-    const city   = opts.city || 'Melbourne';
-    const coords = await resolveCity(city) || { latitude: -37.8136, longitude: 144.9631 }; // Melbourne fallback
+function copySellListing() {
+  var price = _sellPrices[_selectedSellPrice] ? '$' + _sellPrices[_selectedSellPrice].price : '';
+  var text = _sellListingTitle + ' - ' + price + '\n\n' + _sellListingDesc;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(function() { toast('📋 Copied to clipboard!'); });
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast('📋 Copied!');
+  }
+}
 
-    const params = {
-      query:       keyword,
-      lat:         coords.latitude,
-      lng:         coords.longitude,
-      radius_km:   opts.radius || 50,
-      count:       cap,
-      sort_by:     'creation_time_descend',  // newest first
-      ...(opts.initialScan ? { date_listed: 'last_7_days' } : {}),
-      // Pass price filters to SociaVault so all 24 results are already in range
-      ...(opts.minPrice ? { min_price: opts.minPrice } : {}),
-      ...(opts.maxPrice ? { max_price: opts.maxPrice } : {}),
-    };
+function analyseSellPhoto() {
+  if (!_sellPhotoBase64) { toast('Upload a photo first'); return; }
+  checkAppraisalLimit().then(function(allowed) { if (allowed) _doAnalyseSellPhoto(); });
+}
+function _doAnalyseSellPhoto() {
+  if (!_sellPhotoBase64) { toast('Upload a photo first'); return; }
+  document.getElementById('sellAnalyseBtn').style.display = 'none';
+  document.getElementById('sellLoading').style.display = 'block';
+  document.getElementById('sellResults').style.display = 'none';
 
-    const res = await axios.get(`${SOCIAVAULT_BASE}/search`, {
-      params,
-      headers: { 'x-api-key': SOCIAVAULT_API_KEY },
-      timeout: 30000,
-    });
+  var userDesc = document.getElementById('sellUserDesc') ? document.getElementById('sellUserDesc').value.trim() : '';
+  var prompt = 'You are an expert Australian secondhand market appraiser. Look at this photo and: 1) Identify the exact item (brand, model, year if visible, condition), 2) Suggest 3 REALISTIC sell prices based on actual Australian Facebook Marketplace and Gumtree prices - be conservative and realistic, most secondhand items sell for significantly less than RRP. A quick sale price should be what it would genuinely sell for in 2-3 days. Maximum price is the absolute top of the market for that exact item in that condition. 3) Write a compelling Facebook Marketplace listing description. ' + (userDesc ? 'Additional context from seller: ' + userDesc + '. ' : '') + 'Use web search to check current Australian market prices if possible. Reply ONLY as valid JSON: {"item":"exact item name and year","condition":"condition assessment","prices":[{"label":"Quick Sale","price":number,"timeframe":"1-3 days","reasoning":"why this price"},{"label":"Good Profit","price":number,"timeframe":"1-2 weeks","reasoning":"typical market price"},{"label":"Maximum","price":number,"timeframe":"3-6 weeks","reasoning":"top of market"}],"listingTitle":"short catchy title","listingDescription":"full marketplace description with condition, specs, what is included and pickup/postage details"}';
 
-    const elapsed  = Date.now() - t0;
-    const listings = res.data?.data?.listings || res.data?.listings || {};
-    // SociaVault returns listings as an object with numeric keys
-    const allRows  = Object.values(listings);
-    const raw      = allRows.filter(r => !r.is_sold && r.is_live !== false).slice(0, cap);
-    console.log(`[SociaVault] "${keyword}" → ${raw.length}/${allRows.length} items in ${elapsed}ms`);
-    const withDesc = raw.filter(r => r.description && r.description.trim().length > 0).length;
-    console.log(`[SociaVault] "${keyword}" → ${withDesc}/${raw.length} items have description in search results`);
+  // ── Use backend proxy — keys stored on server, not browser ──
+  var useBackend = !!getBackendUrl();
+  var apiPromise = useBackend
+    ? callBackendAI('/ai/image', { parts: [
+        { inline_data: { mime_type: 'image/jpeg', data: _sellPhotoBase64 } },
+        { text: prompt }
+      ]})
+    : (GEMINI_KEY
+        ? callGemini([
+            { inline_data: { mime_type: 'image/jpeg', data: _sellPhotoBase64 } },
+            { text: prompt }
+          ])
+        : fetchWithRetry('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type':'application/json','x-api-key':API_KEY,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true' },
+            body: JSON.stringify({ model:'claude-haiku-4-5-20251001', max_tokens:1500, messages:[{ role:'user', content:[
+              { type:'image', source:{ type:'base64', media_type:'image/jpeg', data:_sellPhotoBase64 } },
+              { type:'text', text:prompt }
+            ]}]})
+          }).then(function(r){return r.json();}).then(function(data){
+            var text = '';
+            if (data.content) data.content.forEach(function(b){ if(b.type==='text') text+=b.text; });
+            var m = text.match(/\{[\s\S]*\}/); if(!m) throw new Error('no json');
+            return JSON.parse(m[0]);
+          }));
 
-    return raw.map(item => {
-      const id = item.id || (() => {
-        const m = (item.url || '').match(/\/item\/(\d+)\//);
-        return m ? m[1] : null;
-      })();
+  apiPromise
+  .then(function(result) {
+    document.getElementById('sellLoading').style.display = 'none';
+    if (!result) { toast('Could not analyse photo. Try again.'); document.getElementById('sellAnalyseBtn').style.display = 'block'; return; }
+    try {
+      _sellPrices = result.prices || [];
+      _sellListingTitle = result.listingTitle || result.item || '';
+      _sellListingDesc = result.listingDescription || '';
 
-      const rawTitle    = item.title || '';
-      const description = item.description || null;
-      const rawPrice    = item.price?.amount ?? parsePrice(item.price);
+      document.getElementById('sellItemName').textContent = result.item || '—';
+      document.getElementById('sellItemCondition').textContent = result.condition || '';
 
-      // Decide if this listing is vehicle-like
-      const isVehicle = isVehicleKeyword(keyword) || isVehicleListing(keyword, rawTitle, description);
+      var priceIds = ['P1','P2','P3'];
+      var timeIds  = ['T1','T2','T3'];
+      _sellPrices.forEach(function(p, i) {
+        var pel = document.getElementById('sell' + priceIds[i]);
+        var tel = document.getElementById('sell' + timeIds[i]);
+        if (pel) pel.textContent = '$' + p.price;
+        if (tel) tel.textContent = p.timeframe + (p.reasoning ? ' · ' + p.reasoning : '');
+      });
 
-      // Vehicle-specific fields via regex fallback (SociaVault doesn't return structured vehicle data)
-      const year  = isVehicle ? extractYear(rawTitle, description)      : null;
-      const make  = isVehicle ? extractMake(keyword, rawTitle)          : null;
-      const model = isVehicle ? extractModel(make, rawTitle)            : null;
-      const title = isVehicle ? normalizeVehicleTitle(rawTitle, year, make) : rawTitle;
+      document.getElementById('sellListingTitle').textContent = _sellListingTitle + ' - $' + (_sellPrices[1] ? _sellPrices[1].price : '');
+      document.getElementById('sellListingDesc').textContent = _sellListingDesc;
+      document.getElementById('sellResults').style.display = 'block';
+      selectSellPrice(1); // default to middle option
 
-      // Date — SociaVault doesn't return listing_date in search results, use foundAt
-      const listedAt        = new Date().toISOString();
-      const listedAtUnknown = true;
-
-      // Extract series and variant from title for vehicle listings
-      const series  = isVehicle ? extractSeriesFromTitle(make, model, rawTitle) : null;
-      const variant = isVehicle ? extractVariantFromTitle(rawTitle)             : null;
-      const mileage = isVehicle ? (item.mileage?.value || extractMileage(rawTitle, description)) : null;
-
-      return {
-        id,
-        title,
-        price:         rawPrice,
-        isOfferPrice:  isOfferPrice(rawPrice),
-        url:           item.url || `https://www.facebook.com/marketplace/item/${id}/`,
-        image:         item.primary_photo?.url || null,
-        location:      item.location?.city || item.location?.display_name || null,
-        description,
-        keyword,
-        listedAt,
-        listedAtUnknown,
-        foundAt:       new Date().toISOString(),
-        // Vehicle-specific — mileage kept for frontend compatibility, stored as kms in Neon
-        mileage,
-        year,
-        make,
-        model,
-        series,
-        variant,
-        transmission:  isVehicle ? extractTransmission(rawTitle, description) : null,
-        body_style:    isVehicle ? extractBodyStyleFromTitle(rawTitle, description) : null,
-        fuel_type:     isVehicle ? extractFuelTypeFromTitle(rawTitle, description) : null,
-        engine:        isVehicle ? extractEngineFromTitle(rawTitle, description)   : null,
-        // General marketplace fields
-        condition:     item.condition || null,
-        brand:         null,
-        category:      null,
+      // Save to history so it appears in flip tracker
+      var sellEntry = {
+        id: Date.now(),
+        title: result.item || _sellListingTitle,
+        price: _sellPrices[1] ? _sellPrices[1].price : 0,
+        image: null,
+        url: null,
+        date: new Date().toLocaleDateString('en-AU'),
+        source: 'sell_scanner',
+        result: {
+          verdict: 'SELL',
+          dealScore: 80,
+          extractedTitle: result.item || _sellListingTitle,
+          extractedPrice: _sellPrices[1] ? _sellPrices[1].price : 0,
+          oneLiner: result.condition || 'Your item — ready to sell',
+          buyPrice: null,
+          offerPrice: _sellPrices[0] ? _sellPrices[0].price : null,
+          negotiationScript: 'Listed at $' + (_sellPrices[1] ? _sellPrices[1].price : '') + '. Quick sale at $' + (_sellPrices[0] ? _sellPrices[0].price : '') + '.',
+          estimatedProfit: _sellPrices[2] ? _sellPrices[2].price - (_sellPrices[0] ? _sellPrices[0].price : 0) : 0,
+          sellPrices: _sellPrices,
+          listingTitle: _sellListingTitle,
+          listingDesc: _sellListingDesc
+        }
       };
-    }).filter(l => l.id);
-  } catch (e) {
-    const status = e.response?.status;
-    if (status === 503 || status === 502 || status === 504) {
-      console.warn(`[SociaVault] "${keyword}" — server unavailable (${status}), will retry next scan`);
-    } else if (status === 402) {
-      console.error(`[SociaVault] OUT OF CREDITS — top up at sociavault.com/dashboard`);
-    } else if (status === 401) {
-      console.error(`[SociaVault] INVALID API KEY — check SOCIAVAULT_API_KEY in Render env vars`);
-    } else {
-      console.error(`[SociaVault] Error for "${keyword}" (${Date.now()-t0}ms):`, e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message);
+      hist.unshift(sellEntry);
+      sv();
+      updatePill();
+    } catch(e) {
+      document.getElementById('sellAnalyseBtn').style.display = 'block';
+      toast('Error parsing results. Try again.');
     }
-    return [];
+  })
+  .catch(function(e) {
+    document.getElementById('sellLoading').style.display = 'none';
+    document.getElementById('sellAnalyseBtn').style.display = 'block';
+    toast('Error: ' + e.message);
+  });
+}
+
+
+// ── Manual Flip Logger ────────────────────────────────────
+var manualFlips = {};
+try { manualFlips = JSON.parse(localStorage.getItem('fr_manual_flips') || '{}'); } catch(e) { manualFlips = {}; }
+function saveManualFlips() { try { localStorage.setItem('fr_manual_flips', JSON.stringify(manualFlips)); } catch(e) {} }
+
+function openManualFlip() {
+  document.getElementById('mfTitle').value = '';
+  document.getElementById('mfBought').value = '';
+  document.getElementById('mfSold').value = '';
+  document.getElementById('mfNotes').value = '';
+  document.getElementById('manualFlipPanel').style.display = 'block';
+}
+
+function closeManualFlip() {
+  document.getElementById('manualFlipPanel').style.display = 'none';
+}
+
+function saveManualFlip() {
+  var title  = document.getElementById('mfTitle').value.trim();
+  var bought = parseFloat(document.getElementById('mfBought').value);
+  var sold   = parseFloat(document.getElementById('mfSold').value) || null;
+  var notes  = document.getElementById('mfNotes').value.trim();
+  if (!title) { toast('Enter an item name'); return; }
+  if (!bought || bought <= 0) { toast('Enter what you paid'); return; }
+  var id = 'manual_' + Date.now();
+  manualFlips[id] = { id, title, bought, sold, notes, date: new Date().toLocaleDateString('en-AU') };
+  saveManualFlips();
+  updateFlipStats();
+  renderManualFlips();
+  closeManualFlip();
+  var profit = sold ? ' · +$' + (sold - bought) + ' profit' : '';
+  toast('✅ Logged: ' + title + profit);
+}
+
+function deleteManualFlip(id) {
+  delete manualFlips[id];
+  saveManualFlips();
+  updateFlipStats();
+  renderManualFlips();
+}
+
+function renderManualFlips() {
+  var existing = document.getElementById('manualFlipList');
+  if (!existing) return;
+  var items = Object.values(manualFlips).sort(function(a,b) { return b.id.localeCompare(a.id); });
+  if (!items.length) { existing.innerHTML = ''; return; }
+  existing.onclick = function(ev) { var btn = ev.target.closest('.del-manual-btn'); if (btn) { deleteManualFlip(btn.getAttribute('data-mid')); } };
+  existing.innerHTML = items.map(function(f) {
+    var profit = f.sold ? f.sold - f.bought : null;
+    var profitStr = profit !== null ? '<span style="color:var(--g);font-size:12px">+$' + profit + ' profit</span>' : '<span style="color:var(--mu);font-size:12px">not sold yet</span>';
+    return '<div class="hi" style="flex-direction:column;gap:6px">' +
+      '<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+        '<div>' +
+          '<div class="hit">' + f.title + '</div>' +
+          '<div class="him">Bought $' + f.bought + (f.sold ? ' · Sold $' + f.sold : '') + ' · ' + f.date + '</div>' +
+          (f.notes ? '<div style="font-size:11px;color:var(--mu);margin-top:2px">' + f.notes + '</div>' : '') +
+        '</div>' +
+        profitStr +
+      '</div>' +
+      '<button data-mid="' + f.id + '" class="del-manual-btn" style="width:100%;padding:7px;background:rgba(255,79,79,.08);border:1px solid rgba(255,79,79,.2);border-radius:8px;color:#ff4f4f;font-size:11px;cursor:pointer">Remove</button>' +
+    '</div>';
+  }).join('');
+}
+
+
+// ── Flip Tracker ──────────────────────────────────────────
+var flips = {};
+try { flips = JSON.parse(localStorage.getItem('fr_flips') || '{}'); } catch(e) { flips = {}; }
+function saveFlips() { try { localStorage.setItem('fr_flips', JSON.stringify(flips)); } catch(e) {} }
+
+var savedListings = {};
+try { savedListings = JSON.parse(localStorage.getItem('fr_saved') || '{}'); } catch(e) { savedListings = {}; }
+function saveSavedListings() { try { localStorage.setItem('fr_saved', JSON.stringify(savedListings)); } catch(e) {} }
+function toggleSaved(listing) {
+  if (savedListings[listing.id]) {
+    delete savedListings[listing.id];
+    toast('Removed from saved');
+  } else {
+    savedListings[listing.id] = listing;
+    toast('⭐ Saved!');
   }
+  saveSavedListings();
+  // Refresh feed to update heart icons
+  var cached = getCachedListings();
+  var ratings = getCachedRatings();
+  if (cached.length) renderListingsFeed(cached, ratings);
+}
+function isSaved(id) { return !!savedListings[id]; }
+
+var _trackingId = null;
+
+function openTrackPanel(id) {
+  _trackingId = id;
+  var e = null;
+  for (var i = 0; i < hist.length; i++) { if (hist[i].id === id) { e = hist[i]; break; } }
+  if (!e) return;
+
+  document.getElementById('trackTitle').textContent = e.title;
+  document.getElementById('trackItemName').textContent = 'Asking $' + e.price + ' · ' + e.date;
+
+  var flip = flips[id] || {};
+
+  // Status bar
+  var statusBar = document.getElementById('trackStatusBar');
+  var paidColor = flip.paidPrice ? '#00ff88' : 'var(--mu)';
+  var soldColor = flip.soldPrice ? '#00ff88' : 'var(--mu)';
+  statusBar.innerHTML =
+    '<div style="background:var(--s2);border:1px solid ' + paidColor + ';border-radius:10px;padding:10px;text-align:center">' +
+      '<div style="font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:1px">Bought</div>' +
+      '<div style="font-family:Bebas Neue,sans-serif;font-size:20px;color:' + paidColor + '">' + (flip.paidPrice ? '$' + flip.paidPrice : '—') + '</div>' +
+    '</div>' +
+    '<div style="background:var(--s2);border:1px solid ' + soldColor + ';border-radius:10px;padding:10px;text-align:center">' +
+      '<div style="font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:1px">Sold</div>' +
+      '<div style="font-family:Bebas Neue,sans-serif;font-size:20px;color:' + soldColor + '">' + (flip.soldPrice ? '$' + flip.soldPrice : '—') + '</div>' +
+    '</div>';
+
+  // Reset sections
+  document.getElementById('trackBuySection').style.display = 'none';
+  document.getElementById('trackSellSection').style.display = 'none';
+  document.getElementById('trackSoldDisplay').style.display = 'none';
+
+  if (flip.soldPrice) {
+    document.getElementById('trackSoldDisplay').style.display = 'block';
+    var profit = flip.soldPrice - flip.paidPrice;
+    document.getElementById('trackProfitDisplay').textContent = (profit >= 0 ? '+' : '') + '$' + profit;
+    document.getElementById('trackProfitDetail').textContent = 'Bought $' + flip.paidPrice + ' · Sold $' + flip.soldPrice;
+  } else if (flip.paidPrice) {
+    document.getElementById('trackSellSection').style.display = 'block';
+    showSellSuggestions(e, flip.paidPrice);
+  } else {
+    document.getElementById('trackBuySection').style.display = 'block';
+    document.getElementById('trackPaidInput').value = '';
+  }
+
+  document.getElementById('trackPanel').style.display = 'block';
 }
 
-async function scrapeKeyword(keyword, opts = {}) {
-  return sociaVaultKeywordScan(keyword, opts);
+function closeTrackPanel() {
+  document.getElementById('trackPanel').style.display = 'none';
+  _trackingId = null;
 }
 
-// Fetch full listing details from SociaVault item endpoint (1 credit)
-// Returns enriched fields: description, creation_time, all photos, attributes (condition)
-async function fetchListingDetails(listingId, listingUrl) {
-  if (!SOCIAVAULT_API_KEY || (!listingId && !listingUrl)) return null;
+function savePaidPrice() {
+  var paid = parseFloat(document.getElementById('trackPaidInput').value);
+  if (!paid || paid <= 0) { toast('Enter the price you paid'); return; }
+  if (!flips[_trackingId]) flips[_trackingId] = {};
+  flips[_trackingId].paidPrice = paid;
+  saveFlips();
+
+  // Get the history item for suggestions
+  var e = null;
+  for (var i = 0; i < hist.length; i++) { if (hist[i].id === _trackingId) { e = hist[i]; break; } }
+
+  document.getElementById('trackBuySection').style.display = 'none';
+  document.getElementById('trackSellSection').style.display = 'block';
+  // Update status bar
+  var sb = document.getElementById('trackStatusBar');
+  if (sb) {
+    var first = sb.firstChild;
+    if (first) { first.style.borderColor = '#00ff88'; first.lastChild.textContent = '$' + paid; first.lastChild.style.color = '#00ff88'; }
+  }
+  showSellSuggestions(e, paid);
+  updateFlipStats();
+  renderHist();
+  toast('✅ Bought price saved!');
+}
+
+function showSellSuggestions(item, paidPrice) {
+  var el = document.getElementById('trackSuggestions');
+  el.innerHTML = '<div style="font-size:12px;color:var(--mu)">Getting suggestions...</div>';
+
+  var prompt = 'You are an Australian secondhand market expert. Someone bought a "' + item.title + '" for $' + paidPrice + ' AUD. Suggest 3 sell prices with realistic timeframes for the Australian market. Return ONLY valid JSON array: [{"label":"Quick Sale","price":number,"timeframe":"1-3 days","reason":"string"},{"label":"Good Profit","price":number,"timeframe":"1-2 weeks","reason":"string"},{"label":"Maximum","price":number,"timeframe":"3-4 weeks","reason":"string"}]';
+
+  var aiCall = getBackendUrl()
+    ? callBackendAI('/ai/text', { prompt: prompt, max_tokens: 400 }).then(function(d) { return d._raw || JSON.stringify(d); })
+    : fetchWithRetry('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json','x-api-key':API_KEY,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true' },
+        body: JSON.stringify({ model:'claude-haiku-4-5-20251001', max_tokens:400, messages:[{role:'user',content:prompt}] })
+      }).then(function(r){return r.json();}).then(function(d){ return d.content && d.content[0] ? d.content[0].text : ''; });
+
+  aiCall.then(function(text) {
+    try {
+      var match = text.match(/\[[\s\S]*\]/);
+      if (!match) throw new Error('no json');
+      var suggestions = JSON.parse(match[0]);
+      var profit;
+      el.innerHTML = suggestions.map(function(s) {
+        profit = s.price - paidPrice;
+        return '<div onclick="document.getElementById(\'trackSoldInput\').value=' + s.price + '" style="background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center">' +
+          '<div><div style="font-weight:600;color:#fff;font-size:13px">' + s.label + '</div>' +
+          '<div style="font-size:11px;color:var(--mu);margin-top:2px">' + s.timeframe + ' · ' + s.reason + '</div></div>' +
+          '<div style="text-align:right">' +
+          '<div style="font-family:Bebas Neue,sans-serif;font-size:18px;color:var(--g)">$' + s.price + '</div>' +
+          '<div style="font-size:11px;color:var(--g)">+$' + profit + '</div>' +
+          '</div></div>';
+      }).join('');
+    } catch(e) {
+      el.innerHTML = '<div style="font-size:12px;color:var(--mu)">Could not get suggestions</div>';
+    }
+  }).catch(function() {
+    el.innerHTML = '<div style="font-size:12px;color:var(--mu)">Could not get suggestions</div>';
+  });
+}
+
+function markSold() {
+  var sold = parseFloat(document.getElementById('trackSoldInput').value);
+  if (!sold || sold <= 0) { toast('Enter the price you sold for'); return; }
+  if (!flips[_trackingId]) flips[_trackingId] = {};
+  flips[_trackingId].soldPrice = sold;
+  flips[_trackingId].soldAt = new Date().toISOString();
+  saveFlips();
+
+  var profit = sold - (flips[_trackingId].paidPrice || 0);
+  document.getElementById('trackSellSection').style.display = 'none';
+  document.getElementById('trackSoldDisplay').style.display = 'block';
+  document.getElementById('trackProfitDisplay').textContent = (profit >= 0 ? '+' : '') + '$' + profit;
+  updateFlipStats();
+  renderHist();
+  toast('🎉 Flip complete! +$' + profit);
+}
+
+function resetFlip() {
+  if (!_trackingId) return;
+  delete flips[_trackingId];
+  saveFlips();
+  updateFlipStats();
+  renderHist();
+  closeTrackPanel();
+  toast('Flip reset');
+}
+
+function updateFlipStats() {
+  var bought = 0, sold = 0, profit = 0;
+  // From history flip tracker
+  for (var id in flips) {
+    if (flips[id].paidPrice) bought++;
+    if (flips[id].soldPrice) {
+      sold++;
+      profit += (flips[id].soldPrice - flips[id].paidPrice);
+    }
+  }
+  // From manual flips
+  for (var mid in manualFlips) {
+    bought++;
+    if (manualFlips[mid].sold) {
+      sold++;
+      profit += (manualFlips[mid].sold - manualFlips[mid].bought);
+    }
+  }
+  var bEl = document.getElementById('ftBought');
+  var sEl = document.getElementById('ftSold');
+  var pEl = document.getElementById('ftProfit');
+  var pEl2 = document.getElementById('ftProfitDisplay');
+  if (bEl) bEl.textContent = bought;
+  if (sEl) sEl.textContent = sold;
+  if (pEl) pEl.textContent = (profit >= 0 ? '+' : '') + '$' + profit;
+  if (pEl2) pEl2.textContent = Math.abs(profit).toLocaleString();
+  updatePill();
+  renderManualFlips();
+}
+
+
+
+// ── DEALS SCREEN ────────────────────────────────────────────────────────────
+var _dealsPage = 1;
+var _dealsTotal = 0;
+var _dealsCat = 'all';
+var _dealsData = [];
+
+function initDealsScreen() {
+  var isPrem = (userPlan === 'premium' || userPlan === 'pro');
+  document.getElementById('dealsPremGate').style.display = isPrem ? 'none' : 'block';
+  document.getElementById('dealsContent').style.display = isPrem ? 'block' : 'none';
+  if (isPrem && _dealsData.length === 0) loadDeals();
+}
+
+async function loadDeals(refresh) {
+  if (refresh) { _dealsPage = 1; _dealsData = []; _dealsCat = 'all'; }
+  var loading = document.getElementById('dealsLoading');
+  var empty   = document.getElementById('dealsEmpty');
+  var grid    = document.getElementById('dealsGrid');
+  var more    = document.getElementById('dealsLoadMore');
+  loading.style.display = 'block';
+  grid.innerHTML = '';
+  empty.style.display = 'none';
+  more.style.display = 'none';
   try {
-    const params = listingId ? { id: listingId } : { url: listingUrl };
-    const res = await axios.get(`${SOCIAVAULT_BASE}/item`, {
-      params,
-      headers: { 'x-api-key': SOCIAVAULT_API_KEY },
-      timeout: 15000,
+    var res = await fetch('/api/deals?page=' + _dealsPage + '&limit=24', {
+      headers: { 'Authorization': 'Bearer ' + authToken }
     });
-    const d = res.data?.data;
-    if (!d) return null;
-    // Extract condition from attributes array/object
-    const attrs = d.attributes ? Object.values(d.attributes) : [];
-    const conditionAttr = attrs.find(a => a.attribute_name === 'Condition');
-    // Extract all photo URLs
-    const photos = d.photos ? Object.values(d.photos).map(p => p.url).filter(Boolean) : [];
-    return {
-      description:  d.description  || null,
-      creationTime: d.creation_time || null,
-      condition:    conditionAttr?.label || null,
-      photos,
-      locationText: d.location_text || null,
-      vehicle:      parseVehicleInfoFields(d),
-    };
-  } catch (e) {
-    console.error(`[SociaVault] fetchListingDetails error (${listingId || listingUrl}):`, e.message);
-    return null;
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed');
+    _dealsData = data.deals || [];
+    _dealsTotal = data.total || 0;
+    loading.style.display = 'none';
+    if (_dealsData.length === 0) { empty.style.display = 'block'; return; }
+    buildDealsCatChips();
+    renderDealsGrid(_dealsCat);
+    if (_dealsTotal > _dealsData.length) more.style.display = 'block';
+  } catch(e) {
+    loading.style.display = 'none';
+    empty.style.display = 'block';
+    console.error('[Deals]', e.message);
   }
 }
 
+async function loadMoreDeals() {
+  _dealsPage++;
+  var res = await fetch('/api/deals?page=' + _dealsPage + '&limit=24', {
+    headers: { 'Authorization': 'Bearer ' + authToken }
+  }).then(r => r.json());
+  var newDeals = res.deals || [];
+  _dealsData = _dealsData.concat(newDeals);
+  renderDealsGrid(_dealsCat);
+  if (_dealsData.length >= (res.total || 0)) {
+    document.getElementById('dealsLoadMore').style.display = 'none';
+  }
+}
 
-// ── Vehicle helpers ───────────────────────────────────────
-const VEHICLE_KEYWORDS = ['car','ute','van','truck','motorcycle','suv','4wd','wagon',
+function buildDealsCatChips() {
+  var cats = ['all'];
+  _dealsData.forEach(function(d) {
+    var c = d.category === 'vehicle' ? 'vehicles' : (d.norm_cat || d.category || 'general');
+    if (!cats.includes(c)) cats.push(c);
+  });
+  var labels = { all:'All', vehicle:'Vehicles', vehicles:'Vehicles', power_tool:'Tools',
+    phone:'Phones', gaming:'Gaming', computer:'Computers', audio:'Audio',
+    vacuum:'Appliances', outdoor:'Outdoor', general:'General' };
+  var html = '';
+  cats.forEach(function(c) {
+    var active = c === _dealsCat;
+    html += '<button onclick="filterDeals(''+c+'')" style="flex-shrink:0;padding:8px 16px;border-radius:20px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s;white-space:nowrap;background:'+(active?'var(--g)':'var(--s1)')+';color:'+(active?'#000':'var(--mu)')+'">'+
+      (labels[c] || c.charAt(0).toUpperCase() + c.slice(1)) + '</button>';
+  });
+  document.getElementById('dealsCatChips').innerHTML = html;
+}
+
+function filterDeals(cat) {
+  _dealsCat = cat;
+  buildDealsCatChips();
+  renderDealsGrid(cat);
+}
+
+function renderDealsGrid(cat) {
+  var grid = document.getElementById('dealsGrid');
+  var filtered = cat === 'all' ? _dealsData : _dealsData.filter(function(d) {
+    var c = d.category === 'vehicle' ? 'vehicles' : (d.norm_cat || d.category || 'general');
+    return c === cat;
+  });
+  if (filtered.length === 0) {
+    grid.innerHTML = '<div style="text-align:center;padding:40px 0;color:var(--mu);font-size:14px">No '+cat+' deals right now</div>';
+    return;
+  }
+
+  var html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">';
+  filtered.forEach(function(d) {
+    var disc = parseFloat(d.discount_pct) || 0;
+    var isRb = disc >= 35;
+    var cardBg = isRb ? '' : disc >= 22 ? 'rgba(0,221,85,0.11)' : disc >= 12 ? 'rgba(255,200,0,0.10)' : 'var(--s1)';
+    var tc = disc >= 22 ? '#00dd55' : disc >= 12 ? '#ffc800' : 'var(--mu)';
+    var badge = disc >= 35 ? 'GREAT DEAL' : disc >= 22 ? 'GOOD DEAL' : disc >= 12 ? 'FAIR' : '';
+    var watched = d.match_type === 'watched';
+    var imgHtml = d.image_url
+      ? '<img src="'+d.image_url+'" style="width:100%;height:100%;object-fit:cover;display:block">'
+      : '<div style="width:100%;height:100%;background:var(--s2);display:flex;align-items:center;justify-content:center;font-size:28px">🏷️</div>';
+
+    html += '<div class="'+(isRb?'rainbow-card':'')+'" data-lid="'+d.listing_id+'" onclick="openDealListing(this)" style="background:'+(isRb?'':cardBg)+';border:none;border-radius:14px;overflow:hidden;display:flex;flex-direction:column;cursor:pointer">';
+    html += '<div style="width:100%;height:155px;overflow:hidden;flex-shrink:0;position:relative">'+imgHtml;
+    if (watched) html += '<div style="position:absolute;top:8px;left:8px;background:rgba(0,255,136,.25);border:1px solid var(--g);border-radius:6px;padding:2px 7px;font-size:10px;font-weight:700;color:var(--g);letter-spacing:.5px">WATCHED</div>';
+    html += '<div style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.6);border-radius:6px;padding:2px 7px;font-size:10px;font-weight:700;color:#fff">'+Math.round(disc)+'% OFF</div>';
+    html += '</div>';
+
+    html += '<div class="'+(isRb?'rainbow-card':'')+'" style="padding:10px;flex:1;display:flex;flex-direction:column;background:'+(isRb?'':cardBg)+';">';
+    if (badge) html += '<div style="font-size:9px;font-weight:700;color:'+tc+';letter-spacing:.5px;margin-bottom:4px">'+badge+'</div>';
+    html += '<div style="font-size:12px;font-weight:700;color:#fff;line-height:1.3;margin-bottom:4px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;">'+escHtml(d.title||'—')+'</div>';
+    html += '<div style="font-family:'Bebas Neue',sans-serif;font-size:20px;color:var(--g);letter-spacing:1px;margin-top:auto">'+(d.price ? '$'+Number(d.price).toLocaleString() : '—')+'</div>';
+    if (d.market_value) html += '<div style="font-size:11px;color:var(--mu);text-decoration:line-through">mkt $'+Number(d.market_value).toLocaleString()+'</div>';
+    if (d.location) html += '<div style="font-size:10px;color:var(--mu);margin-top:4px;text-transform:uppercase;letter-spacing:.5px">'+escHtml(d.location)+'</div>';
+    html += '</div></div>';
+  });
+  html += '</div>';
+  grid.innerHTML = html;
+}
+
+function openDealListing(el) {
+  var lid = el.getAttribute('data-lid');
+  var deal = _dealsData.find(function(d) { return d.listing_id == lid; });
+  if (deal && deal.url) window.open(deal.url, '_blank');
+}
+
+function escHtml(s) {
+  return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Feed state ───────────────────────────────────────────
+var _feedItems = [];
+
+// ── History ──────────────────────────────────────────────
+var hist = [];
+try { hist = JSON.parse(localStorage.getItem('fr5') || '[]'); } catch(e) { hist = []; }
+// Update pill on load with real profit
+setTimeout(function() { if (typeof updateFlipStats === 'function') updateFlipStats(); }, 100);
+function sv() { try { localStorage.setItem('fr5', JSON.stringify(hist.slice(0,100))); } catch(e) {} }
+
+// ── Image state ──────────────────────────────────────────
+var imgFiles = [];
+var scanMode = 'text'; // 'text' | 'image'
+
+function setMode(m) {
+  scanMode = m;
+  document.getElementById('mode-text').style.display  = m === 'text'  ? 'block' : 'none';
+  document.getElementById('mode-image').style.display = m === 'image' ? 'block' : 'none';
+  document.getElementById('mtab-text').classList.toggle('on',  m === 'text');
+  document.getElementById('mtab-image').classList.toggle('on', m === 'image');
+  // Show img-panel via its own class too
+  var ip = document.getElementById('mode-image');
+  if (m === 'image') ip.classList.add('on'); else ip.classList.remove('on');
+}
+setMode('text');
+
+// ── File handling ────────────────────────────────────────
+function addFiles(files) {
+  var slots = 5 - imgFiles.length;
+  var arr = Array.from(files).slice(0, slots);
+  imgFiles = imgFiles.concat(arr);
+  renderThumbs();
+}
+
+function removeImg(i) {
+  imgFiles.splice(i, 1);
+  renderThumbs();
+}
+
+function renderThumbs() {
+  var grid = document.getElementById('thumbGrid');
+  var zone = document.getElementById('dropZone');
+  var tip  = document.getElementById('imgTip');
+  var lbl  = document.getElementById('dzLabel');
+  var sub  = document.getElementById('dzSub');
+  grid.innerHTML = '';
+
+  imgFiles.forEach(function(f, i) {
+    var url = URL.createObjectURL(f);
+    var wrap = document.createElement('div');
+    wrap.className = 'tw';
+    var img = document.createElement('img');
+    img.src = url;
+    var del = document.createElement('button');
+    del.className = 'del';
+    del.textContent = '×';
+    del.onclick = function(e) { e.stopPropagation(); removeImg(i); };
+    wrap.appendChild(img);
+    wrap.appendChild(del);
+    grid.appendChild(wrap);
+  });
+
+  if (imgFiles.length > 0 && imgFiles.length < 5) {
+    var addBtn = document.createElement('button');
+    addBtn.className = 'add-more';
+    addBtn.textContent = '+';
+    addBtn.onclick = function(e) { e.stopPropagation(); document.getElementById('imgInput').click(); };
+    grid.appendChild(addBtn);
+  }
+
+  var hasImgs = imgFiles.length > 0;
+  zone.classList.toggle('has-imgs', hasImgs);
+  tip.classList.toggle('on', hasImgs);
+
+  if (hasImgs) {
+    lbl.textContent = imgFiles.length + ' screenshot' + (imgFiles.length > 1 ? 's' : '') + ' ready';
+    sub.textContent = imgFiles.length + '/5 · tap to add more';
+  } else {
+    lbl.textContent = 'Upload listing screenshots';
+    sub.textContent = 'Tap to choose · drag & drop · JPG PNG HEIC · up to 5';
+  }
+}
+
+// ── Convert file to base64 ───────────────────────────────
+function fileToBase64(file) {
+  return new Promise(function(resolve, reject) {
+    var reader = new FileReader();
+    reader.onload  = function() { resolve(reader.result.split(',')[1]); };
+    reader.onerror = function() { reject(new Error('Could not read image')); };
+    reader.readAsDataURL(file);
+  });
+}
+
+function fileToDataUrl(file) {
+  return new Promise(function(resolve, reject) {
+    var reader = new FileReader();
+    reader.onload = function() { resolve(reader.result); };
+    reader.onerror = function() { reject(new Error('Could not read image')); };
+    reader.readAsDataURL(file);
+  });
+}
+
+function compressHistoryImage(file) {
+  return fileToDataUrl(file).then(function(dataUrl) {
+    return new Promise(function(resolve) {
+      var img = new Image();
+      img.onload = function() {
+        try {
+          var max = 700;
+          var scale = Math.min(1, max / Math.max(img.width, img.height));
+          var canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(img.width * scale));
+          canvas.height = Math.max(1, Math.round(img.height * scale));
+          var ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL('image/jpeg', 0.72));
+        } catch(e) {
+          resolve(dataUrl);
+        }
+      };
+      img.onerror = function() { resolve(dataUrl); };
+      img.src = dataUrl;
+    });
+  });
+}
+
+function captureHistoryImages(files) {
+  return Promise.all(files.map(compressHistoryImage)).catch(function() { return []; });
+}
+
+function compressImageForAI(file) {
+  return fileToDataUrl(file).then(function(dataUrl) {
+    return new Promise(function(resolve) {
+      var fallbackType = file.type && file.type.startsWith('image/') ? file.type : 'image/jpeg';
+      if (fallbackType === 'image/heic' || fallbackType === 'image/heif') fallbackType = 'image/jpeg';
+      function fallback() {
+        fileToBase64(file).then(function(b64) {
+          resolve({ type: 'image', source: { type: 'base64', media_type: fallbackType, data: b64 } });
+        });
+      }
+      var img = new Image();
+      img.onload = function() {
+        try {
+          var max = 1400;
+          var scale = Math.min(1, max / Math.max(img.width, img.height));
+          var canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(img.width * scale));
+          canvas.height = Math.max(1, Math.round(img.height * scale));
+          var ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          var out = canvas.toDataURL('image/jpeg', 0.82);
+          resolve({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: out.split(',')[1] } });
+        } catch(e) {
+          fallback();
+        }
+      };
+      img.onerror = fallback;
+      img.src = dataUrl;
+    });
+  });
+}
+
+// ── Navigation ───────────────────────────────────────────
+function tab(t) {
+  var tabs = ['scan','watch','feed','history','sell','deals','settings'];
+  for (var i = 0; i < tabs.length; i++) {
+    var x = tabs[i];
+    var nav = document.getElementById('n' + x.charAt(0).toUpperCase() + x.slice(1));
+    var scr = document.getElementById('scr' + x.charAt(0).toUpperCase() + x.slice(1));
+    if (nav) nav.classList.remove('on');
+    if (scr) scr.classList.remove('on');
+  }
+  var selNav = document.getElementById('n' + t.charAt(0).toUpperCase() + t.slice(1));
+  var selScr = document.getElementById('scr' + t.charAt(0).toUpperCase() + t.slice(1));
+  if (selNav) selNav.classList.add('on');
+  if (selScr) selScr.classList.add('on');
+  document.getElementById('lw').classList.remove('on');
+  document.getElementById('rw').classList.remove('on');
+  document.getElementById('main').scrollTop = 0;
+  if (t === 'history') { renderHist(); updateFlipStats(); }
+  if (t === 'deals') { initDealsScreen(); }
+  if (t === 'feed') { renderWatchlistTabs(); refreshListings(); }
+  if (t === 'watch') { hideNewWatch(); loadWatchlist(); }
+  if (t === 'settings') { loadSettingsInfo(); }
+}
+
+function toast(m, d) {
+  d = d || 2500;
+  var t = document.getElementById('ts');
+  t.textContent = m;
+  t.classList.add('on');
+  setTimeout(function() { t.classList.remove('on'); }, d);
+}
+
+function showErr(m) {
+  var e = document.getElementById('er');
+  e.textContent = m;
+  e.classList.add('on');
+}
+function hideErr() { document.getElementById('er').classList.remove('on'); }
+
+// ── Scan trigger ─────────────────────────────────────────
+function go() {
+  window._appraisalContext = null; // clear any context left from a prior feed appraisal
+  hideErr();
+
+  // Validate
+  if (scanMode === 'text') {
+    var txt = document.getElementById('box').value.trim();
+    if (txt.length < 15) { showErr('⚠️ Paste the full listing — title, price and description.'); return; }
+  } else {
+    if (imgFiles.length === 0) { showErr('⚠️ Upload at least one listing screenshot.'); return; }
+  }
+
+  // Show loading
+  document.getElementById('scrScan').classList.remove('on');
+  document.getElementById('rw').classList.remove('on');
+  document.getElementById('lw').classList.add('on');
+  document.getElementById('main').scrollTop = 0;
+
+  var ps = ['p1','p2','p3','p4'];
+  for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp';
+  document.getElementById('p1').classList.add('ac');
+  var si = 0;
+  var stepTimer = setInterval(function() {
+    if (si < ps.length - 1) {
+      document.getElementById(ps[si]).className = 'stp dn';
+      si++;
+      document.getElementById(ps[si]).classList.add('ac');
+    }
+  }, 900);
+
+  var historyImagesPromise = scanMode === 'image' ? captureHistoryImages(imgFiles.slice(0, 5)) : Promise.resolve([]);
+  var apiPromise = scanMode === 'image' ? callAI_image() : callAI_text(document.getElementById('box').value.trim());
+
+  apiPromise.then(function(r) {
+    return historyImagesPromise.then(function(historyImages) {
+      clearInterval(stepTimer);
+      for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
+      var entry = { id: Date.now(), title: r.extractedTitle || 'Unknown', price: r.extractedPrice || 0, image: historyImages[0] || null, images: historyImages, result: r, date: new Date().toLocaleDateString('en-AU') };
+      hist.unshift(entry);
+      sv();
+      updatePill();
+      setTimeout(function() {
+        render(r);
+        document.getElementById('lw').classList.remove('on');
+        document.getElementById('rw').classList.add('on');
+        document.getElementById('main').scrollTop = 0;
+        var _bb = document.getElementById('rwBackBar');
+        if (_bb) _bb.style.display = window._appraiseFromFeed ? 'block' : 'none';
+        // Add listing image + FB link to result screen
+        var existingHeader = document.getElementById('listingHeader');
+        if (existingHeader) existingHeader.remove();
+        var rw = document.getElementById('rw');
+        if (rw && (window._currentListingImage || window._currentListingUrl)) {
+          var header = document.createElement('div');
+          header.id = 'listingHeader';
+          header.style = 'margin-bottom:16px;border-radius:14px;overflow:hidden;border:1px solid var(--bd)';
+          var inner = '';
+          if (window._currentListingImage) {
+            inner += '<div style="width:100%;height:260px;position:relative;overflow:hidden"><img src="' + window._currentListingImage + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(16px) brightness(0.45);transform:scale(1.1)"><img src="' + window._currentListingImage + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain"></div>';
+          }
+          if (window._currentListingUrl) {
+            inner += '<a href="' + window._currentListingUrl + '" target="_blank" style="display:block;padding:12px;background:rgba(0,255,136,.12);border-top:1px solid rgba(0,255,136,.2);color:var(--g);text-align:center;font-weight:700;font-size:14px;text-decoration:none">&#x1F517; View on Facebook Marketplace</a>';
+          }
+          header.innerHTML = inner;
+          rw.insertBefore(header, rw.firstChild);
+        }
+      }, 400);
+    });
+  }).catch(function(e) {
+    clearInterval(stepTimer);
+    document.getElementById('lw').classList.remove('on');
+    document.getElementById('scrScan').classList.add('on');
+    showErr('❌ Error: ' + e.message);
+  });
+}
+
+// ── AI call — text mode (proxied through backend) ───────
+function callAI_text(txt, keyword) {
+  var url = getBackendUrl();
+  var prompt = 'You are an expert Australian Facebook Marketplace flipper. Give a sharp appraisal based on Australian resale market pricing. For vehicles, mileage/odometer is critical. If the item is broken, "for parts", "not working", "as-is", or needs significant repair, set isBrokenOrProject true and estimate repairEstimate in AUD — subtract it from estimatedProfit and cap the verdict at FAIR unless margins after full repairs are exceptional.\n\nLISTING:\n"""\n' + txt + '\n"""\n\nReturn ONLY valid JSON:\n{"extractedTitle":string,"extractedPrice":number,"extractedMileage":number or null,"verdict":"STEAL" or "GOOD DEAL" or "FAIR" or "PASS","dealScore":number 0-100,"roiPercent":number,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"timeToSell":string,"demandLevel":string,"oneLiner":string,"whyItsWorth":string,"greenFlags":["string"],"redFlags":["string"],"whatToCheckInPerson":["string"],"negotiationScript":string,"isBrokenOrProject":false,"repairEstimate":0}';
+
+  if (url) {
+    var ctx = window._appraisalContext || null;
+    var imagePayload = ctx
+      ? (ctx.imageB64 ? { imageB64: ctx.imageB64, mediaType: ctx.mediaType } : {})
+      : { imageUrl: window._currentListingImage || null };
+    return callBackendAI('/ai/text-image', Object.assign({ prompt: prompt }, imagePayload))
+      .then(function(r) {
+        if (!r || typeof r !== 'object' || !r.verdict) {
+          console.error('[Appraise] Bad response from AI:', JSON.stringify(r).slice(0, 200));
+          throw new Error('Could not read the scan result. Try again.');
+        }
+        return r;
+      });
+  }
+
+  var imgUrl = window._currentListingImage || null;
+
+  function doAppraise(base64data, mediaType) {
+    var msgContent;
+    if (base64data) {
+      msgContent = [
+        { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64data } },
+        { type: 'text', text: prompt }
+      ];
+    } else {
+      msgContent = prompt;
+    }
+    return fetchWithRetry('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1500,
+        messages: [{ role: 'user', content: msgContent }]
+      })
+    }).then(parseAPIResponse);
+  }
+
+  if (imgUrl) {
+    var backendUrl = getBackendUrl();
+    if (backendUrl) {
+      return fetch(backendUrl + '/proxy-image?url=' + encodeURIComponent(imgUrl))
+        .then(function(r) { return r.json(); })
+        .then(function(d) { return doAppraise(d.base64, d.mediaType); })
+        .catch(function() { return doAppraise(null, null); });
+    }
+  }
+  return doAppraise(null, null);
+}
+
+// ── AI call — image mode (proxied through backend) ───────
+function callAI_image() {
+  var extraText = (document.getElementById('imgExtra').value || '').trim();
+
+  return Promise.all(imgFiles.map(compressImageForAI)).then(function(imageBlocks) {
+    var textPrompt = 'You are an expert Australian Facebook Marketplace flipper.\n\nAnalyse the listing screenshot(s) provided. Read ALL visible text carefully — title, asking price, condition, location, description, seller notes. For vehicles, look carefully for odometer/mileage/km readings — they are critical to the valuation. If the item is broken, "for parts", "not working", "as-is", or needs significant repair, set isBrokenOrProject true and estimate repairEstimate in AUD — subtract it from estimatedProfit and cap the verdict at FAIR unless margins after full repairs are exceptional.\n' +
+      (extraText ? '\nExtra context:\n"""\n' + extraText + '\n"""\n' : '') +
+      '\nRespond with ONLY a raw JSON object. No explanation. No markdown. No code fences. Start your response with { and end with }.\n\n' +
+      '{"extractedTitle":string,"extractedPrice":number,"extractedMileage":number or null,"verdict":"STEAL" or "GOOD DEAL" or "FAIR" or "PASS","dealScore":number 0-100,"roiPercent":number,"estimatedMarketValue":number,"estimatedResellLow":number,"estimatedResellHigh":number,"recommendedOffer":number,"walkAwayPrice":number,"estimatedProfit":number,"timeToSell":string,"demandLevel":string,"oneLiner":string,"whyItsWorth":string,"greenFlags":["string"],"redFlags":["string"],"whatToCheckInPerson":["string"],"negotiationScript":string,"isBrokenOrProject":false,"repairEstimate":0}';
+
+    // ── Backend proxy path (preferred — keys on server) ───
+    if (getBackendUrl()) {
+      var geminiParts = imageBlocks.map(toGeminiImage).concat([{ text: textPrompt }]);
+      return callBackendAI('/ai/image', { parts: geminiParts });
+    }
+
+    // ── Legacy: Gemini direct ─────────────────────────────
+    if (GEMINI_KEY) {
+      var parts = imageBlocks.map(toGeminiImage).concat([{ text: textPrompt }]);
+      return callGemini(parts);
+    }
+
+    // ── Legacy: Anthropic direct ──────────────────────────
+    var content = imageBlocks.concat([{ type: 'text', text: textPrompt }]);
+    return fetchWithRetry('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json','x-api-key':API_KEY,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true' },
+      body: JSON.stringify({ model:'claude-haiku-4-5-20251001', max_tokens:1400, messages:[{ role:'user', content:content }] })
+    }).then(parseAPIResponse);
+  });
+}
+
+// ── Retry helper — handles 529 overload + 500/503 with backoff ──
+function fetchWithRetry(url, options, maxRetries) {
+  maxRetries = maxRetries || 3;
+  var attempt = 0;
+
+  function tryFetch() {
+    attempt++;
+    return fetch(url, options).then(function(res) {
+      if ((res.status === 529 || res.status === 503 || res.status === 500) && attempt < maxRetries) {
+        var delay = attempt * 5000;
+        return new Promise(function(resolve) {
+          setTimeout(function() { resolve(tryFetch()); }, delay);
+        });
+      }
+      return res;
+    }).catch(function(err) {
+      if (attempt < maxRetries) {
+        var delay = attempt * 3000;
+        return new Promise(function(resolve) {
+          setTimeout(function() { resolve(tryFetch()); }, delay);
+        });
+      }
+      throw err;
+    });
+  }
+
+  return tryFetch();
+}
+
+function parseAPIResponse(res) {
+  if (!res.ok) {
+    return res.json().then(function(d) {
+      var msg = d.error ? d.error.message : 'API error ' + res.status;
+      if (res.status === 529) msg = 'The AI service is busy right now. FlipRadar retried a few times, so wait about 30 seconds and scan again.';
+      if (res.status === 500 || res.status === 503) msg = 'The AI service is temporarily unavailable. Wait a moment and scan again.';
+      throw new Error(msg);
+    }).catch(function(e) { throw e; });
+  }
+  return res.json().then(function(d) {
+    var raw = '';
+    for (var i = 0; i < d.content.length; i++) {
+      if (d.content[i].type === 'text') { raw = d.content[i].text; break; }
+    }
+    // Robustly extract JSON — find first { and last }
+    var start = raw.indexOf('{');
+    var end   = raw.lastIndexOf('}');
+    if (start === -1 || end === -1) throw new Error('No JSON found in response. Try adding text in the extra field.');
+    raw = raw.slice(start, end + 1);
+    try {
+      return JSON.parse(raw);
+    } catch(e) {
+      throw new Error('Could not read the scan result. Try adding listing text in the extra field.');
+    }
+  });
+}
+
+
+// ── Render results ───────────────────────────────────────
+function render(r) {
+  var v = VD[r.verdict] || VD['FAIR'];
+  if (r.isOfferPriceListing) v = {e:'🤝',c:'var(--mu)',bg:'rgba(150,150,150,0.12)',bo:'rgba(150,150,150,0.28)',g:'rgba(150,150,150,0.08)'}; // offer price always grey
+  if (r.isBrokenOrProject) v = VD['FAIR'];   // broken/project items never get rainbow/green
+  // Confidence-based border cap: don't show rainbow/green when data quality is too weak
+  var hasMarketAnchor = r.confidence != null && r.confidence > 0;
+  if (r.aiGenerated && !hasMarketAnchor) {
+    // Pure AI guess with no market data anchor — cap positive verdicts to neutral yellow
+    if (r.verdict === 'STEAL' || r.verdict === 'GOOD DEAL') v = VD['FAIR'];
+  } else if (r.confidence != null && r.confidence < 0.45 && r.verdict === 'STEAL') {
+    // Explicit low confidence — downgrade STEAL one level
+    v = VD['GOOD DEAL'];
+  }
+  var el = document.getElementById('vc');
+  el.style.cssText = '--vc:' + v.c + ';--vg:' + v.g + ';background:' + v.bg + ';border:1px solid ' + v.bo;
+  document.getElementById('rE').textContent = v.e;
+  document.getElementById('rL').textContent = r.isOfferPriceListing ? 'MAKE OFFER' : (r.verdict || '—');
+  var priceEl = document.getElementById('rPrice');
+  if (priceEl) priceEl.textContent = r.extractedPrice ? '$' + r.extractedPrice.toLocaleString() : '';
+  document.getElementById('rT').textContent = r.extractedTitle || '';
+  document.getElementById('rO').textContent = r.oneLiner || '';
+  setTimeout(function() {
+    document.getElementById('sf').style.width = (r.dealScore || 0) + '%';
+    document.getElementById('sn').textContent = (r.dealScore || 0) + '/100';
+  }, 200);
+  document.getElementById('rOf').textContent = '$' + (r.recommendedOffer || 0);
+  document.getElementById('rWa').textContent = '$' + (r.walkAwayPrice || 0);
+  document.getElementById('rRs').textContent = '$' + (r.estimatedResellLow || 0) + '–$' + (r.estimatedResellHigh || 0);
+  var p = r.estimatedProfit || 0;
+  document.getElementById('rPr').textContent = (p >= 0 ? '+' : '') + '$' + p;
+  document.getElementById('rPr').style.color = p >= 0 ? 'var(--g)' : 'var(--red)';
+  document.getElementById('rRoi').textContent = (r.roiPercent || 0) + '% ROI';
+  document.getElementById('rTm').textContent = r.timeToSell || '—';
+  document.getElementById('rDm').textContent = r.demandLevel || '—';
+  var miCard = document.getElementById('rMiCard');
+  var miEl = document.getElementById('rMi');
+  if (r.extractedMileage) {
+    miEl.textContent = r.extractedMileage.toLocaleString() + ' km';
+    miEl.style.color = r.extractedMileage < 80000 ? 'var(--g)' : r.extractedMileage < 150000 ? 'var(--gold)' : 'var(--red)';
+    miCard.style.display = 'block';
+  } else {
+    miCard.style.display = 'none';
+  }
+  // ── Market Intelligence block ─────────────────────────
+  var ebayEl = document.getElementById('rEbayStats');
+  if (ebayEl) {
+    var mLow = r.low || r.marketLow, mMed = r.median || r.marketMedian, mHi = r.high || r.marketHigh;
+    if (mLow && mMed && mHi) {
+      document.getElementById('rEbayLow').textContent    = '$' + mLow.toLocaleString();
+      document.getElementById('rEbayMedian').textContent = '$' + mMed.toLocaleString();
+      document.getElementById('rEbayHigh').textContent   = '$' + mHi.toLocaleString();
+      var dpLabel = '';
+      if (r.dataPoints) {
+        var unitWord = (r.source === 'vpx' || r.source === 'csales') ? ' comparable' + (r.dataPoints !== 1 ? 's' : '') : ' sold';
+        dpLabel = '· ' + r.dataPoints + unitWord;
+      }
+      document.getElementById('rEbayCount').textContent = dpLabel;
+      var srcEl = document.getElementById('rEbaySource');
+      if (r.sourceLabel) {
+        srcEl.textContent = r.sourceLabel;
+      } else if (r.source === 'own_history') {
+        srcEl.textContent = '📈 FlipRadar price history';
+      } else if (r.source === 'autograb') {
+        srcEl.textContent = '🚗 RedBook valuation (AutoGrab)';
+      } else if (r.source === 'vpx') {
+        srcEl.textContent = '📊 FlipRadar AU vehicle index';
+      } else if (r.source === 'csales') {
+        srcEl.textContent = '🏷️ Carsales AU market data';
+      } else {
+        srcEl.textContent = '📦 Sold listings';
+      }
+      var confWrap = document.getElementById('rConfWrap');
+      if (confWrap && r.confidence) {
+        var confPct = Math.round(r.confidence * 100);
+        var confBar = document.getElementById('rConfBar');
+        confBar.style.width = confPct + '%';
+        confBar.style.background = confPct >= 75 ? '#00ff88' : confPct >= 50 ? 'var(--gold)' : '#ff6b6b';
+        document.getElementById('rConfPct').textContent = confPct + '%';
+        confWrap.style.display = 'flex';
+      } else if (confWrap) {
+        confWrap.style.display = 'none';
+      }
+      ebayEl.style.display = 'block';
+    } else {
+      ebayEl.style.display = 'none';
+    }
+  }
+  var gr = r.greenFlags || [];
+  document.getElementById('rGr').innerHTML = gr.length ? gr.map(function(f) { return '<div class="fi"><span style="color:var(--g);flex-shrink:0">▸</span>' + f + '</div>'; }).join('') : '<div class="fi" style="color:var(--mu)"><span>▸</span>None found</div>';
+  var rd = r.redFlags || [];
+  if (r.isBrokenOrProject && r.repairEstimate > 0) {
+    rd = ['⚠️ Broken/project item — est. repair cost $' + r.repairEstimate.toLocaleString() + (r.repairNotes ? ' · ' + r.repairNotes : '')].concat(rd);
+  }
+  document.getElementById('rRd').innerHTML = rd.length ? rd.map(function(f) { return '<div class="fi"><span style="color:var(--red);flex-shrink:0">▸</span>' + f + '</div>'; }).join('') : '<div class="fi" style="color:var(--mu)"><span>▸</span>None found</div>';
+  var ch = r.whatToCheckInPerson || [];
+  document.getElementById('rCh').innerHTML = ch.map(function(c, i) { return '<div class="ci"><div class="cn">' + (i+1) + '</div><div class="ct">' + c + '</div></div>'; }).join('');
+  document.getElementById('rWy').textContent = r.whyItsWorth || '';
+  document.getElementById('ngs').dataset.s = r.negotiationScript || '';
+  document.getElementById('ngsTxt').textContent = '"' + (r.negotiationScript || '') + '"';
+}
+
+function cpNeg() {
+  var s = document.getElementById('ngs').dataset.s;
+  if (!s) return;
+  navigator.clipboard.writeText(s).catch(function(){});
+  document.getElementById('cfl').classList.add('on');
+  setTimeout(function() { document.getElementById('cfl').classList.remove('on'); }, 1800);
+}
+
+function goNew() {
+  document.getElementById('rw').classList.remove('on');
+  document.getElementById('box').value = '';
+  document.getElementById('chc').textContent = '0';
+  document.getElementById('imgExtra').value = '';
+  imgFiles = [];
+  renderThumbs();
+  hideErr();
+  tab('scan');
+}
+
+var _histFilter = 'all';
+function filterHistory(f) {
+  _histFilter = f;
+  renderHist();
+  // Highlight active filter
+  var cards = document.querySelectorAll('.ps .psi, #scrHistory [onclick^="filterHistory"]');
+  cards.forEach(function(c) { c.style.borderColor = 'var(--bd)'; });
+}
+
+function renderHist() {
+  document.getElementById('psT').textContent = hist.length;
+  var seenSteals = {};
+  var stealCount = 0;
+  hist.forEach(function(h) {
+    if (h.result && h.result.verdict === 'STEAL') {
+      var k = (h.title || '').toLowerCase().trim();
+      if (!seenSteals[k]) { seenSteals[k] = true; stealCount++; }
+    }
+  });
+  document.getElementById('psS').textContent = stealCount;
+  // Real profit from tracked flips
+  var realProfit = 0;
+  for (var fid in flips) { if (flips[fid].soldPrice && flips[fid].paidPrice) realProfit += flips[fid].soldPrice - flips[fid].paidPrice; }
+  var psP = document.getElementById('psP'); if (psP) psP.textContent = '$' + Math.max(0, realProfit);
+  // Filter history
+  var filtered = hist;
+  // Update saved count
+  var savedCount = Object.keys(savedListings).length;
+  var psSaved = document.getElementById('psSaved');
+  if (psSaved) psSaved.textContent = savedCount;
+
+  if (_histFilter === 'steals') {
+    var seen = {};
+    filtered = hist.filter(function(h) {
+      if (!(h.result && h.result.verdict === 'STEAL')) return false;
+      var key = (h.title || '').toLowerCase().trim();
+      if (seen[key]) return false;
+      seen[key] = true;
+      return true;
+    });
+  }
+  if (_histFilter === 'saved') {
+    // Show saved listings from feed as cards
+    var l = document.getElementById('hl');
+    var savedItems = Object.values(savedListings);
+    if (!savedItems.length) {
+      l.innerHTML = '<div class="he"><span class="big">⭐</span>No saved listings yet.<br>Hit the ⭐ on any Feed card to save it.</div>';
+    } else {
+      l.innerHTML = savedItems.map(function(sl) {
+        var priceStr = sl.isOfferPrice ? 'Make Offer' : (sl.price ? '$' + sl.price.toLocaleString() : 'Price unknown');
+        var imgHtml = sl.image ? '<img src="' + sl.image + '" style="width:44px;height:44px;object-fit:cover;border-radius:8px;flex-shrink:0;border:1px solid var(--bd)">' : '<div style="width:44px;height:44px;border-radius:8px;background:var(--s2);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">🏷️</div>';
+        return '<div class="hi" style="gap:10px;align-items:center">' +
+          imgHtml +
+          '<div style="flex:1;min-width:0">' +
+            '<div class="hit" style="white-space:normal;line-height:1.3">' + sl.title + '</div>' +
+            '<div class="him">' + priceStr + (sl.location ? ' · ' + sl.location : '') + '</div>' +
+          '</div>' +
+          '<div style="display:flex;flex-direction:column;gap:5px;flex-shrink:0">' +
+            '<a href="' + (sl.url||'#') + '" target="_blank" style="padding:5px 10px;background:rgba(255,255,255,.07);border:1px solid var(--bd);border-radius:8px;color:#fff;font-size:11px;text-decoration:none;text-align:center">🔗 View</a>' +
+            '<button data-sid="' + sl.id + '" class="unsave-btn" style="padding:5px 10px;background:rgba(255,200,0,.1);border:1px solid rgba(255,200,0,.3);border-radius:8px;color:#ffc800;font-size:11px;cursor:pointer">✕ Remove</button>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+      l.onclick = function(ev) {
+        var btn = ev.target.closest('.unsave-btn');
+        if (btn) {
+          var sid = btn.getAttribute('data-sid');
+          delete savedListings[sid];
+          saveSavedListings();
+          renderHist();
+        }
+      };
+    }
+    return;
+  }
+  else if (_histFilter === 'flips') filtered = hist.filter(function(h) { return flips[h.id] && flips[h.id].soldPrice; });
+  else if (_histFilter === 'bought') filtered = hist.filter(function(h) { return flips[h.id] && flips[h.id].paidPrice; });
+  else if (_histFilter === 'sold') filtered = hist.filter(function(h) { return flips[h.id] && flips[h.id].soldPrice; });
+  var l = document.getElementById('hl');
+  // Build manual flip cards for relevant filters BEFORE checking if filtered is empty
+  var mHtml = '';
+  if (_histFilter !== 'steals' && _histFilter !== 'all') {
+    var mItems = Object.values(manualFlips).sort(function(a,b) { return b.id.localeCompare(a.id); });
+    if (_histFilter === 'sold' || _histFilter === 'flips') mItems = mItems.filter(function(f){ return f.sold; });
+    if (_histFilter === 'bought') mItems = mItems.filter(function(f){ return f.bought; });
+    mHtml = mItems.map(function(f) {
+      var profit = f.sold ? f.sold - f.bought : null;
+      var badge = f.sold ? '<span style="font-size:10px;background:rgba(0,255,136,.15);border:1px solid rgba(0,255,136,.3);border-radius:6px;padding:2px 6px;color:var(--g);margin-left:6px">SOLD</span>' : '<span style="font-size:10px;background:rgba(255,200,0,.15);border:1px solid rgba(255,200,0,.3);border-radius:6px;padding:2px 6px;color:#ffc800;margin-left:6px">BOUGHT</span>';
+      return '<div class="hi" style="flex-direction:column;gap:6px">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center">' +
+          '<div><div class="hit">' + f.title + badge + '</div><div class="him">Bought $' + f.bought + (f.sold ? ' · Sold $' + f.sold : '') + ' · ' + f.date + '</div>' + (f.notes ? '<div style="font-size:11px;color:var(--mu)">' + f.notes + '</div>' : '') + '</div>' +
+          (profit !== null ? '<span style="color:var(--g);font-size:13px;font-weight:700">+$' + profit + '</span>' : '<span style="color:var(--mu);font-size:12px">not sold</span>') +
+        '</div>' +
+        '<button data-mid="' + f.id + '" class="del-manual-btn2" style="width:100%;padding:7px;background:rgba(255,79,79,.08);border:1px solid rgba(255,79,79,.2);border-radius:8px;color:#ff4f4f;font-size:11px;cursor:pointer">Remove</button>' +
+      '</div>';
+    }).join('');
+  }
+
+  if (!filtered.length && !mHtml) { l.innerHTML = '<div class="he"><span class="big">📭</span>' + (_histFilter === 'all' ? 'No deals scanned yet.' : 'No items in this filter.') + '</div>'; return; }
+  l.innerHTML = filtered.map(function(e) {
+    var v = VD[e.result && e.result.verdict] || VD['FAIR'];
+    var p = 0; // real profit shown in flip tracker only
+    var flip = flips[e.id] || {};
+    var flipBadge = '';
+    if (flip.soldPrice) {
+      var fp = flip.soldPrice - flip.paidPrice;
+      flipBadge = '<span style="font-size:10px;background:rgba(0,255,136,.15);border:1px solid rgba(0,255,136,.3);border-radius:6px;padding:2px 6px;color:var(--g);margin-left:6px">SOLD +$' + fp + '</span>';
+    } else if (flip.paidPrice) {
+      flipBadge = '<span style="font-size:10px;background:rgba(255,200,0,.15);border:1px solid rgba(255,200,0,.3);border-radius:6px;padding:2px 6px;color:#ffc800;margin-left:6px">BOUGHT</span>';
+    }
+    var imgHtml = e.image
+      ? '<img src="' + e.image + '" style="width:44px;height:44px;object-fit:cover;border-radius:8px;flex-shrink:0;border:1px solid var(--bd)">'
+      : '<div class="hie">' + v.e + '</div>';
+    return '<div class="hi" style="flex-direction:column;gap:8px"><div style="display:flex;align-items:center;gap:8px;width:100%" onclick="openMod(' + e.id + ')">' + imgHtml + '<div class="hib"><div class="hit">' + e.title + flipBadge + '</div><div class="him">$' + e.price + ' asking · ' + e.date + '</div></div><div class="hir"><div class="hiv" style="color:' + v.c + '">' + (e.result && e.result.verdict || '—') + '</div></div><span style="color:var(--mu);font-size:18px;margin-left:4px">›</span></div>' +
+      '<button onclick="event.stopPropagation();openTrackPanel(' + e.id + ')" style="width:100%;padding:8px;background:rgba(0,255,136,.1);border:1px solid rgba(0,255,136,.25);border-radius:8px;color:var(--g);font-size:12px;font-weight:600;cursor:pointer">' + (flip.soldPrice ? '✅ View Flip' : flip.paidPrice ? '📈 Track Sale' : '💰 Track Flip') + '</button></div>';
+  }).join('') + mHtml;
+  if (mHtml) {
+    l.onclick = function(ev) { var btn = ev.target.closest('.del-manual-btn2'); if (btn) { deleteManualFlip(btn.getAttribute('data-mid')); } };
+  }
+}
+
+function updatePill() {
+  // Match exactly what ftProfit shows (flips + manual flips)
+  var profit = 0;
+  for (var id in flips) {
+    if (flips[id].soldPrice && flips[id].paidPrice) profit += flips[id].soldPrice - flips[id].paidPrice;
+  }
+  for (var mid in manualFlips) {
+    if (manualFlips[mid].sold) profit += manualFlips[mid].sold - manualFlips[mid].bought;
+  }
+  var el = document.getElementById('pill');
+  if (el) el.textContent = '$' + Math.max(0, profit) + ' profit';
+}
+
+function renderHistoryImages(e) {
+  var imgs = (e.images && e.images.length) ? e.images : (e.image ? [e.image] : []);
+  if (!imgs.length) return '';
+  return '<div style="display:grid;grid-template-columns:repeat(' + Math.min(imgs.length, 3) + ',1fr);gap:6px;margin-bottom:14px">' +
+    imgs.map(function(src) {
+      return '<img src="' + src + '" style="width:100%;height:120px;object-fit:cover;border-radius:10px;border:1px solid var(--bd);background:var(--s2)">';
+    }).join('') +
+  '</div>';
+}
+function openMod(id) {
+  var e = null;
+  for (var i = 0; i < hist.length; i++) { if (hist[i].id === id) { e = hist[i]; break; } }
+  if (!e) return;
+  var r = e.result;
+  var v = VD[r && r.verdict] || VD['FAIR'];
+  document.getElementById('mb').innerHTML = '<div style="font-family:\'Bebas Neue\',sans-serif;font-size:20px;letter-spacing:1px;color:#fff;margin-bottom:14px">' + e.title + '</div>' + renderHistoryImages(e) + '<div style="display:flex;align-items:center;gap:12px;background:' + v.bg + ';border:1px solid ' + v.bo + ';border-radius:14px;padding:16px;margin-bottom:14px"><span style="font-size:38px">' + v.e + '</span><div><div style="font-family:\'Bebas Neue\',sans-serif;font-size:34px;color:' + v.c + ';line-height:1">' + (r && r.verdict) + '</div><div style="font-size:12px;color:var(--mu);font-style:italic;margin-top:4px">' + (r && r.oneLiner || '') + '</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px"><div style="background:var(--s2);border-radius:12px;padding:12px 14px"><div style="font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--mu);margin-bottom:4px">Open With</div><div style="font-family:\'Bebas Neue\',sans-serif;font-size:24px;color:var(--g)">$' + (r && r.recommendedOffer || 0) + '</div></div><div style="background:var(--s2);border-radius:12px;padding:12px 14px"><div style="font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--mu);margin-bottom:4px">Walk Away</div><div style="font-family:\'Bebas Neue\',sans-serif;font-size:24px;color:var(--gold)">$' + (r && r.walkAwayPrice || 0) + '</div></div><div style="background:var(--s2);border-radius:12px;padding:12px 14px"><div style="font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--mu);margin-bottom:4px">Flip For</div><div style="font-family:\'Bebas Neue\',sans-serif;font-size:20px;color:var(--tx)">$' + (r && r.estimatedResellLow || 0) + '–$' + (r && r.estimatedResellHigh || 0) + '</div></div><div style="background:var(--s2);border-radius:12px;padding:12px 14px"><div style="font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--mu);margin-bottom:4px">Est. Profit</div><div style="font-family:\'Bebas Neue\',sans-serif;font-size:24px;color:var(--g)">+$' + (r && r.estimatedProfit || 0) + '</div></div></div><div style="background:rgba(0,255,136,.05);border-left:3px solid var(--g);border-radius:0 10px 10px 0;padding:12px 14px;font-size:13px;color:#a0ffcc;line-height:1.6;cursor:pointer" onclick="navigator.clipboard.writeText(\'' + ((r && r.negotiationScript || '').replace(/'/g,"\\'")) + '\');toast(\'✅ Copied!\')">"' + (r && r.negotiationScript || '') + '"</div><div style="font-size:11px;color:var(--mu);text-align:center;margin-top:10px">Scanned ' + e.date + ' · Tap script to copy</div>';
+  document.getElementById('mo').classList.add('on');
+}
+
+function clrAll() {
+  if (!confirm('Clear all history?')) return;
+  hist = []; sv(); renderHist(); updatePill(); toast('🗑️ Cleared');
+}
+
+updatePill();
+
+function saveApiKey() {} // legacy — keys now on server
+function saveGeminiKey() {} // legacy — keys now on server
+function refreshApiKeySettings() {} // legacy
+function loadSettingsInfo() {
+  // Update plan badge and user info when settings tab opens
+  var user = getAuthUser();
+  if (!user) return;
+  var sname = document.getElementById('settingsUserName');
+  var semail = document.getElementById('settingsUserEmail');
+  if (sname) sname.textContent = user.name || '—';
+  if (semail) semail.textContent = user.email || '—';
+}
+
+
+// ── Watchlist ────────────────────────────────────────────
+
+// ── Auth ─────────────────────────────────────────────────
+var _authTab = 'login';
+var _authToken = null;
+var _authUser  = null;
+
+function getAuthToken() {
+  if (_authToken) return _authToken;
+  try { _authToken = localStorage.getItem('fr_token'); } catch(e) {}
+  return _authToken;
+}
+function getAuthUser() {
+  if (_authUser) return _authUser;
+  try { var u = localStorage.getItem('fr_user'); _authUser = u ? JSON.parse(u) : null; } catch(e) {}
+  return _authUser;
+}
+function setAuth(token, user) {
+  _authToken = token; _authUser = user;
+  try { localStorage.setItem('fr_token', token); localStorage.setItem('fr_user', JSON.stringify(user)); } catch(e) {}
+}
+function clearAuth() {
+  _authToken = null; _authUser = null;
+  try { localStorage.removeItem('fr_token'); localStorage.removeItem('fr_user'); } catch(e) {}
+}
+
+function authHeaders() {
+  var token = getAuthToken();
+  return token ? { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token } : { 'Content-Type': 'application/json' };
+}
+
+function switchAuthTab(tab) {
+  _authTab = tab;
+  var isLogin = tab === 'login';
+  document.getElementById('authTabLogin').style.background  = isLogin ? '#00ff88' : 'transparent';
+  document.getElementById('authTabLogin').style.color       = isLogin ? '#000' : 'var(--mu)';
+  document.getElementById('authTabSignup').style.background = isLogin ? 'transparent' : '#00ff88';
+  document.getElementById('authTabSignup').style.color      = isLogin ? 'var(--mu)' : '#000';
+  document.getElementById('authNameWrap').style.display     = isLogin ? 'none' : 'block';
+  document.getElementById('authSubmitBtn').textContent      = isLogin ? 'Log In' : 'Create Account';
+  document.getElementById('authError').style.display = 'none';
+}
+
+function showAuthError(msg) {
+  var el = document.getElementById('authError');
+  el.textContent = msg; el.style.display = 'block';
+}
+
+function submitAuth() {
+  var url = getBackendUrl();
+  var email    = (document.getElementById('authEmail').value || '').trim();
+  var password = (document.getElementById('authPassword').value || '').trim();
+  var name     = (document.getElementById('authName') ? document.getElementById('authName').value.trim() : '');
+  if (!email || !password) { showAuthError('Please enter your email and password.'); return; }
+  var loadingEl = document.getElementById('authLoading');
+  var btnEl     = document.getElementById('authSubmitBtn');
+  loadingEl.textContent = 'Connecting… (may take ~15s if server is waking up)';
+  loadingEl.style.display = 'block';
+  btnEl.style.opacity = '0.5';
+  btnEl.disabled = true;
+  document.getElementById('authError').style.display = 'none';
+  var endpoint = _authTab === 'login' ? '/auth/login' : '/auth/signup';
+  var body = { email: email, password: password };
+  if (_authTab === 'signup' && name) body.name = name;
+
+  // First wake the server, then auth — handles Render cold-start
+  function doAuth() {
+    return fetch(url + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function(r) {
+        return r.text().then(function(txt) {
+          var d;
+          try { d = JSON.parse(txt); } catch(e) { throw new Error('Server returned unexpected response. Make sure the latest server.js is deployed.'); }
+          return { ok: r.ok, data: d };
+        });
+      });
+  }
+
+  doAuth()
+    .then(function(res) {
+      loadingEl.style.display = 'none';
+      btnEl.style.opacity = '1';
+      btnEl.disabled = false;
+      if (!res.ok) { showAuthError(res.data.error || 'Something went wrong.'); return; }
+      setAuth(res.data.token, res.data.user);
+      onAuthReady();
+      // Show verify screen for new signups
+      if (_authTab === 'signup' && res.data.user && !res.data.user.emailVerified) {
+        setTimeout(function() { showVerifyScreen(); }, 300);
+      } else {
+        document.getElementById('authModal').style.display = 'none';
+      }
+    })
+    .catch(function(e) {
+      loadingEl.style.display = 'none';
+      btnEl.style.opacity = '1';
+      btnEl.disabled = false;
+      var msg = e && e.message ? e.message : 'Unknown error';
+      showAuthError(msg.indexOf('unexpected response') !== -1
+        ? msg
+        : 'Could not reach server. Make sure the updated server.js is deployed on Render. (' + msg + ')');
+    });
+}
+
+function logOut() {
+  clearAuth();
+  updateUserUI(null);
+  document.getElementById('authEmail').value = '';
+  document.getElementById('authPassword').value = '';
+  document.getElementById('authModal').style.display = 'flex';
+}
+
+function updateUserUI(user) {
+  var initial = user ? (user.name || user.email || '?')[0].toUpperCase() : '?';
+  var av = document.getElementById('userAvatar');
+  var sav = document.getElementById('settingsAvatar');
+  var sname = document.getElementById('settingsUserName');
+  var semail = document.getElementById('settingsUserEmail');
+  if (av) av.textContent = initial;
+  if (sav) sav.textContent = initial;
+  if (sname) sname.textContent = user ? (user.name || 'Account') : '—';
+  if (semail) semail.textContent = user ? user.email : '—';
+  // Update plan badge in settings
+  var plan = user ? (user.plan || 'free') : 'free';
+  var planLabels = { free: 'Free', basic: 'Basic', premium: 'Premium ⭐' };
+  var planEl = document.getElementById('settingsPlanName');
+  if (planEl) planEl.textContent = planLabels[plan] || 'Free';
+  // Show manage subscription button only for paying users
+  var manageBtn = document.getElementById('manageSubBtn');
+  if (manageBtn) manageBtn.style.display = (plan !== 'free') ? 'block' : 'none';
+  // Change upgrade button text if already on a plan
+  var upgradeBtn = document.querySelector('#settingsPlanBadge button');
+  if (upgradeBtn) upgradeBtn.textContent = plan === 'free' ? 'Upgrade ↑' : 'Change Plan';
+}
+
+function pingServer() {
+  var url = getBackendUrl();
+  var token = getAuthToken();
+  if (!url || !token) return;
+  fetch(url + '/auth/ping', { method: 'POST', headers: authHeaders() })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.resumed && d.resumed > 0) {
+        toast('▶️ ' + d.resumed + ' watch(es) resumed');
+        loadWatchlist();
+      }
+    })
+    .catch(function() {});
+}
+
+
+// ── Email verification ────────────────────────────────────
+function showVerifyScreen() {
+  document.getElementById('authModal').style.display = 'flex';
+  document.getElementById('authVerifyScreen').style.display = 'block';
+  // Hide the login/signup form div (first child of modal)
+  var formDiv = document.querySelector('#authModal > div:not(#authVerifyScreen)');
+  if (formDiv) formDiv.style.display = 'none';
+  document.getElementById('verifyCodeInput').focus();
+}
+
+function hideVerifyScreen() {
+  document.getElementById('authVerifyScreen').style.display = 'none';
+  document.getElementById('authModal').style.display = 'none';
+  var formDiv = document.querySelector('#authModal > div:not(#authVerifyScreen)');
+  if (formDiv) formDiv.style.display = 'block';
+}
+
+function skipVerify() {
+  hideVerifyScreen();
+  toast('You can verify your email anytime in Settings');
+}
+
+function submitVerify() {
+  var code = (document.getElementById('verifyCodeInput').value || '').trim();
+  if (!code || code.length < 6) {
+    document.getElementById('verifyError').textContent = 'Enter the 6-digit code from your email.';
+    document.getElementById('verifyError').style.display = 'block';
+    return;
+  }
+  var url = getBackendUrl();
+  var btn = document.getElementById('verifyBtn');
+  btn.textContent = 'Verifying...'; btn.style.opacity = '0.6'; btn.disabled = true;
+  document.getElementById('verifyError').style.display = 'none';
+  fetch(url + '/auth/verify-email', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ code: code })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    btn.textContent = 'Verify Email'; btn.style.opacity = '1'; btn.disabled = false;
+    if (d.error) {
+      document.getElementById('verifyError').textContent = d.error;
+      document.getElementById('verifyError').style.display = 'block';
+      return;
+    }
+    // Update local user cache
+    var user = getAuthUser();
+    if (user) { user.emailVerified = true; setAuth(getAuthToken(), user); }
+    hideVerifyScreen();
+    updateVerifyBanner(true);
+    toast('✅ Email verified!');
+  })
+  .catch(function() {
+    btn.textContent = 'Verify Email'; btn.style.opacity = '1'; btn.disabled = false;
+    document.getElementById('verifyError').textContent = 'Connection error. Try again.';
+    document.getElementById('verifyError').style.display = 'block';
+  });
+}
+
+function resendVerifyCode() {
+  var url = getBackendUrl();
+  toast('Sending new code...');
+  fetch(url + '/auth/resend-verify', { method: 'POST', headers: authHeaders() })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.ok) toast('✅ New code sent — check your email');
+      else toast('Could not resend. Try again.');
+    })
+    .catch(function() { toast('Connection error. Try again.'); });
+}
+
+function updateVerifyBanner(verified) {
+  var banner = document.getElementById('settingsVerifyBanner');
+  if (banner) banner.style.display = verified ? 'none' : 'block';
+}
+
+function onAuthReady() {
+  var user = getAuthUser();
+  updateUserUI(user);
+  updateVerifyBanner(user && user.emailVerified);
+  pingServer();
+  loadWatchlist();
+  refreshListings();
+}
+
+// On page load — check for existing token
+(function initAuth() {
+  var token = getAuthToken();
+  var user  = getAuthUser();
+  if (token && user) {
+    // Validate token with server before proceeding — clears bad/expired tokens
+    fetch('https://api.flip-radar.app/auth/me', { headers: { 'Authorization': 'Bearer ' + token } })
+      .then(function(r) {
+        if (r.ok) {
+          return r.json().then(function(freshUser) {
+            setAuth(token, freshUser);
+            document.getElementById('authModal').style.display = 'none';
+            onAuthReady();
+            if (!freshUser.emailVerified) {
+              setTimeout(function() { updateVerifyBanner(false); }, 500);
+            }
+          });
+        } else {
+          // Token invalid — clear and show login
+          clearAuth();
+          document.getElementById('authModal').style.display = 'flex';
+        }
+      })
+      .catch(function() {
+        // Offline — trust local token and proceed
+        document.getElementById('authModal').style.display = 'none';
+        onAuthReady();
+      });
+  } else {
+    document.getElementById('authModal').style.display = 'flex';
+  }
+})();
+
+function getBackendUrl() {
+  return 'https://api.flip-radar.app';
+}
+function showWErr(m) {
+  var e = document.getElementById('wer');
+  if (e) { e.textContent = m; e.style.display = 'block'; } else { toast(m); }
+}
+function hideWErr() {
+  var e = document.getElementById('wer');
+  if (e) e.style.display = 'none';
+}
+function testBackend() {
+  var url = getBackendUrl();
+  if (!url) { showWErr('Enter your Railway URL first.'); return; }
+  toast('Connecting...');
+  fetch(url + '/').then(function(r){return r.json();}).then(function(d){
+    toast('Connected! ' + d.watchlist + ' keywords active');
+    hideWErr(); loadWatchlist();
+  }).catch(function(){ showWErr('Could not connect. Check URL and make sure backend is running.'); });
+}
+
+var LOCAL_WATCH_KEY = 'fr_watchlist_cache';
+function getLocalWatches() {
+  try { return JSON.parse(localStorage.getItem(LOCAL_WATCH_KEY) || '[]'); } catch(e) { return []; }
+}
+function saveLocalWatches(items) {
+  try { localStorage.setItem(LOCAL_WATCH_KEY, JSON.stringify((items || []).slice(0, 20))); } catch(e) {}
+}
+function normaliseWatchlistResponse(data) {
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.watchlist)) return data.watchlist;
+  if (data && Array.isArray(data.items)) return data.items;
+  if (data && data.error) throw new Error(data.error);
+  return [];
+}
+function upsertLocalWatch(item, replaceId) {
+  var items = getLocalWatches();
+  var id = replaceId || item.id;
+  var replaced = false;
+  items = items.map(function(w) {
+    if (w.id === id || w.keyword === item.keyword) { replaced = true; return item; }
+    return w;
+  });
+  if (!replaced) items.unshift(item);
+  saveLocalWatches(items);
+}
+function removeLocalWatch(id) {
+  saveLocalWatches(getLocalWatches().filter(function(w) { return w.id !== id; }));
+}
+function loadWatchlist() {
+  var url = getBackendUrl();
+  var cached = getLocalWatches();
+  if (cached.length) renderWatchlist(cached);
+  if (!url) { if (!cached.length) renderWatchlist([]); return; }
+  fetch(url + '/watchlist', { headers: authHeaders() })
+    .then(function(r){
+      return r.json().then(function(d) {
+        if (!r.ok) throw new Error(d && d.error ? d.error : 'Could not load watchlists');
+        return d;
+      });
+    })
+    .then(function(data) {
+      var items = normaliseWatchlistResponse(data);
+      saveLocalWatches(items);
+      renderWatchlist(items);
+      hideWErr();
+    })
+    .catch(function(e) {
+      if (!cached.length) renderWatchlist([]);
+      showWErr('Watchlists saved on this device. Cloud load failed: ' + (e.message || 'connection error'));
+    });
+}
+function renderWatchlist(items) {
+  var el = document.getElementById('wList');
+  if (!el) return;
+  items = Array.isArray(items) ? items : [];
+  updatePlanUI(items ? items.length : 0);
+  if (!items || !items.length) {
+    el.innerHTML = '<div class="he" style="padding:30px 0"><span style="font-size:36px;display:block;margin-bottom:8px">👁️</span>No watchlists yet. Tap + New Watchlist.</div>';
+    return;
+  }
+  el.innerHTML = items.map(function(w) {
+    return '<div class="hi" style="justify-content:space-between;align-items:center">' +
+      '<div style="display:flex;align-items:center;gap:12px">' +
+        '<div style="width:40px;height:40px;background:rgba(0,255,136,.1);border:1px solid rgba(0,255,136,.2);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">🔍</div>' +
+        '<div>' +
+          '<div class="hit" style="font-size:15px;font-weight:700">' + w.keyword + '</div>' +
+          '<div class="him">' + (w.maxPrice ? 'Max $' + w.maxPrice.toLocaleString() : 'Any price') + ' · ' + (w.plan === 'premium' ? 'every 60s' : w.plan === 'basic' ? 'every 15 min' : 'no auto scan') + (w.lastScanned ? ' · last scan ' + formatAgo(w.lastScanned) : '') + '</div>' +
+        '</div>' +
+      '</div>' +
+      '<button onclick="removeWatch(\'' + w.id + '\')" style="background:rgba(255,79,79,.1);border:1px solid rgba(255,79,79,.25);border-radius:8px;color:var(--red);font-size:12px;padding:6px 12px;cursor:pointer;white-space:nowrap">Remove</button>' +
+    '</div>';
+  }).join('');
+}
+// ── Watch tab UI ──────────────────────────────────────────
+var _selectedSpeed = 'basic';
+
+function showNewWatch(bypassLimit) {
+  // Check plan limit before showing form (skip if dev bypass)
+  var url = getBackendUrl();
+  var openForm = function() {
+    document.getElementById('watchMain').style.display = 'none';
+    document.getElementById('watchForm').style.display = 'block';
+    document.getElementById('main').scrollTop = 0;
+  };
+  if (bypassLimit) { openForm(); return; }
+  var localCount = getLocalWatches().length;
+  var limit = Math.max(getPlanLimit(), 1);
+  if (url) {
+    fetch(url + '/watchlist', { headers: authHeaders() }).then(function(r){return r.json();}).then(function(data){
+      var watches = normaliseWatchlistResponse(data);
+      var count = watches.length || localCount;
+      if (count >= limit) { openPlanModal(); return; }
+      openForm();
+    }).catch(function(){
+      if (localCount >= limit) { openPlanModal(); return; }
+      openForm();
+    });
+  } else {
+    if (localCount >= limit) { openPlanModal(); return; }
+    openForm();
+  }
+}
+
+function hideNewWatch() {
+  document.getElementById('watchForm').style.display = 'none';
+  // Reset vehicle filters
+  ['wMinYear','wMaxYear','wMinKms','wMaxKms'].forEach(function(id) {
+    var el = document.getElementById(id); if (el) el.value = '';
+  });
+  _selectedTransmission = 'any';
+  selectTransmission('any');
+  var body = document.getElementById('vehicleFiltersBody');
+  var btn  = document.getElementById('vehicleFiltersToggle');
+  if (body) body.style.display = 'none';
+  if (btn)  btn.textContent = 'Show ▼';
+  document.getElementById('watchMain').style.display = 'block';
+  document.getElementById('main').scrollTop = 0;
+  // Reset exclude token input
+  _excludeTokens = [];
+  _currentSuggestions = [];
+  _lastSuggestedKeyword = '';
+  var sugWrap = document.getElementById('wExcludeSuggestions');
+  if (sugWrap) sugWrap.style.display = 'none';
+  renderExcludeTokens();
+  document.getElementById('wExcludeInput').value = '';
+}
+
+// ── Exclude keywords — token input ────────────────────────
+var _excludeTokens = [];
+
+function handleExcludeKey(e) {
+  if (e.key === 'Enter' || e.key === ',' ) {
+    e.preventDefault();
+    commitExcludeToken();
+  }
+}
+
+function handleExcludeInput(e) {
+  // Commit on space (but keep cursor in field so user can keep typing)
+  var val = e.target.value;
+  if (val.endsWith(' ') || val.endsWith(',')) {
+    commitExcludeToken();
+  }
+}
+
+function commitExcludeToken() {
+  var inp = document.getElementById('wExcludeInput');
+  var word = inp.value.replace(/[,\s]+$/, '').trim().toLowerCase();
+  if (word.length < 2) { inp.value = ''; return; }
+  if (_excludeTokens.indexOf(word) === -1) {
+    _excludeTokens.push(word);
+    renderExcludeTokens();
+  }
+  inp.value = '';
+}
+
+function renderExcludeTokens() {
+  var el = document.getElementById('wExcludeTokens');
+  if (!el) return;
+  if (!_excludeTokens.length) { el.innerHTML = ''; el.style.marginBottom = '0'; return; }
+  el.style.marginBottom = '8px';
+  el.innerHTML = _excludeTokens.map(function(w, i) {
+    return '<span style="display:inline-flex;align-items:center;gap:5px;background:rgba(255,79,79,.15);border:1px solid rgba(255,79,79,.4);border-radius:20px;padding:4px 10px 4px 12px;font-size:12px;font-weight:600;color:#ff6b6b">' +
+      w +
+      '<button onclick="removeExcludeToken(' + i + ')" style="background:none;border:none;color:#ff6b6b;cursor:pointer;font-size:14px;padding:0;line-height:1;opacity:.7">×</button>' +
+    '</span>';
+  }).join('');
+}
+
+function removeExcludeToken(i) {
+  _excludeTokens.splice(i, 1);
+  renderExcludeTokens();
+  renderExcludeSuggestions(); // refresh suggestions to re-show removed ones
+}
+
+// ── AI exclude suggestions ────────────────────────────────
+var _suggestTimer = null;
+var _lastSuggestedKeyword = '';
+var _currentSuggestions = [];
+
+// ── Vehicle keyword detection ─────────────────────────────
+// Mirrors server-side VEHICLE_KEYWORDS exactly for 100% consistency
+var VEHICLE_KEYWORDS_FE = [
+  'car','ute','van','truck','motorcycle','suv','4wd','wagon',
   'sedan','hatch','coupe','convertible','tractor','forklift','boat','caravan',
-  'camper','excavator','loader','hilux','landcruiser','patrol','hiace','tarago','kluger',
+  'camper','excavator','loader','hilux','landcruiser','patrol',
   'ranger','triton','navara','colorado','dmax','bt50','pajero','prado','defender','discovery',
   'transit','sprinter','vito','ducato','daily','commodore','falcon','camry','corolla',
   'civic','accord','mazda','subaru','toyota','ford','holden','honda','nissan','mitsubishi',
   'hyundai','kia','bmw','mercedes','audi','volkswagen','vw','jeep','ram','dodge',
-  'amarok','everest','fortuner','outlander','asx','eclipse','cx5','cx-5','rav4',
-  'forester','impreza','wrx','outback','liberty','insignia','astra','captiva'];
-// NOTE: scooter, moped, bike removed — electric versions dont need odometer data (includeDetails:true is wasted cost)
-
-// Only checks the KEYWORD — prevents "callaway golf clubs" triggering vehicle mode
-// just because someone mentions a Ram truck in their listing description
-function isVehicleKeyword(keyword) {
-  const kw = keyword.toLowerCase();
-  return VEHICLE_KEYWORDS.some(v => kw.includes(v));
-}
-
-// Checks keyword + title + description — used for tagging individual listings
-function isVehicleListing(keyword, title, description) {
-  const text = (keyword + ' ' + title + ' ' + (description || '')).toLowerCase();
-  return VEHICLE_KEYWORDS.some(kw => text.includes(kw));
-}
-
-// Extract mileage from structured vehicle_info block (more accurate than regex)
-function extractMileageFromVehicleInfo(item) {
-  // Priority 1: subtitle chips — FB returns ["2005", "175,000 km", "Automatic"] here
-  const subs = item.custom_sub_titles || item.listing_subtitle || item.subtitle || [];
-  const subArr = Array.isArray(subs) ? subs : String(subs || '').split(/[·|]/);
-  for (const chip of subArr) {
-    const c = String(chip || '').trim();
-    const m = c.match(/^(\d{1,3}(?:[,\s]\d{3})+)\s*k(?:m|ms|ilometres?)?$/i)
-           || c.match(/^(\d{4,6})\s*k(?:m|ms|ilometres?)?$/i);
-    if (m) {
-      const val = parseInt(m[1].replace(/[,\s]/g, ''));
-      if (val > 1000 && val < 2000000) return val;
-    }
-  }
-  // Priority 2: vehicle_odometer_data — string like "250,000 km"
-  const odoData = item.vehicle_odometer_data;
-  if (odoData) {
-    const parsed = parseInt(String(odoData).replace(/[^0-9]/g, ''));
-    if (parsed > 0 && parsed < 2000000) return parsed;
-  }
-  // Priority 3: structured vehicle_info fields
-  const vi = item.vehicle_info || item.listing_vehicle_data || item.vehicleInfo || {};
-  const raw = vi.odometer || vi.mileage || vi.kilometers || vi.driven_km || vi.driven
-    || item.odometer || item.mileage || item.kilometers || null;
-  if (!raw) return null;
-  if (typeof raw === 'number') return raw > 0 && raw < 2000000 ? raw : null;
-  const parsed = parseInt(String(raw).replace(/[^0-9]/g, ''));
-  return parsed > 0 && parsed < 2000000 ? parsed : null;
-}
-
-function extractMileage(title, description) {
-  const text = (title + ' ' + (description || '')).toLowerCase();
-
-  // Explicit odometer/odo labels — highest confidence
-  const odoPatterns = [
-    /odo(?:meter)?[\s:]*(\d{1,3}(?:,\d{3})+)/,         // odo: 210,000
-    /odo(?:meter)?[\s:]*(\d{4,6})/,                      // odo: 210000
-    /odometer[\s:]*(\d{1,3}(?:,\d{3})+)/,
-    /odometer[\s:]*(\d{4,6})/,
-  ];
-  for (const p of odoPatterns) {
-    const m = text.match(p);
-    if (m) {
-      const val = parseInt(m[1].replace(/,/g, ''));
-      if (val > 1000 && val < 1000000) return val;
-    }
-  }
-
-  // "210 thousand km" / "210k kilometres"
-  const thousandMatch = text.match(/(\d{1,3})\s*(?:thousand|thou)\s*k(?:m|ms|ilometres?|ilometers?)?/);
-  if (thousandMatch) {
-    const val = parseInt(thousandMatch[1]) * 1000;
-    if (val > 1000 && val < 1000000) return val;
-  }
-
-  // Standard patterns with comma-separated numbers — e.g. 210,000km
-  const commaMatch = text.match(/(\d{1,3}(?:,\d{3})+)\s*k(?:m|ms|ilometres?|ilometers?|s\b)/);
-  if (commaMatch) {
-    const val = parseInt(commaMatch[1].replace(/,/g, ''));
-    if (val > 1000 && val < 1000000) return val;
-  }
-
-  // Space-separated thousands — e.g. "181 000 km" (common AU format)
-  const spaceMatch = text.match(/(\d{1,3}(?:\s\d{3})+)\s*k(?:m|ms|ilometres?|ilometers?|s\b)/);
-  if (spaceMatch) {
-    const val = parseInt(spaceMatch[1].replace(/\s/g, ''));
-    if (val > 1000 && val < 1000000) return val;
-  }
-
-  // Plain number followed by km variant — e.g. 210000km or 210000 kms
-  const plainMatch = text.match(/(\d{4,6})\s*k(?:m|ms|ilometres?|ilometers?|s\b)/);
-  if (plainMatch) {
-    const val = parseInt(plainMatch[1]);
-    if (val > 1000 && val < 1000000) return val;
-  }
-
-  // Shorthand — e.g. "210k" or "210 k" at word boundary
-  const shortMatch = text.match(/\b(\d{2,4})\s*k(?:\s|$|[^a-z])/);
-  if (shortMatch) {
-    const val = parseInt(shortMatch[1]) * 1000;
-    if (val > 10000 && val < 1000000) return val;
-  }
-
-  // "low ks" / "high ks" — can't extract exact number, return null
-  return null;
-}
-
-function extractYear(title, description) {
-  const text = title + ' ' + (description || '');
-  const m = text.match(/(19[7-9]\d|20[0-2]\d)/);
-  if (m) {
-    const yr = parseInt(m[1]);
-    if (yr >= 1970 && yr <= new Date().getFullYear() + 1) return yr;
-  }
-  return null;
-}
-
-function extractMake(keyword, title) {
-  const MAKES = ['toyota','ford','holden','honda','nissan','mitsubishi','mazda','subaru',
-    'hyundai','kia','bmw','mercedes','audi','volkswagen','vw','jeep','ram','dodge',
-    'isuzu','ldv','great wall','gwm','chery','mg','skoda','volvo','peugeot','renault',
-    'citroen','fiat','alfa','land rover','range rover','lexus','infiniti','acura',
-    'cadillac','chevrolet','buick','pontiac','chrysler','suzuki','daihatsu','ssangyong'];
-  const text = (keyword + ' ' + title).toLowerCase();
-  for (const make of MAKES) {
-    if (text.includes(make)) return make.charAt(0).toUpperCase() + make.slice(1);
-  }
-  return null;
-}
-
-function extractTransmission(title, description) {
-  const text = (title + ' ' + (description || '')).toLowerCase();
-  if (/\bdsg\b|\bdct\b|\bdual.?clutch\b/.test(text)) return 'DSG';
-  if (/\bcvt\b/.test(text)) return 'CVT';
-  if (/\bamt\b/.test(text)) return 'Auto';
-  // "auto" as standalone word — avoid matching "automatic car" twice
-  if (/\bautomatic\b/.test(text)) return 'Automatic';
-  if (/(?:^|[\s,•·\-])auto(?:[\s,•·\-]|$)/.test(text)) return 'Auto';
-  if (/\bmanual\b|\b[456]\s*speed\b|\b[456]\s*sp\b/.test(text)) return 'Manual';
-  return null;
-}
-
-// Prepend year and/or make to title when they're known but absent from the raw title.
-// Produces: "2012 Toyota Hilux SR5" from "Hilux SR5" + year=2012, make=Toyota.
-// Never duplicates if make/year already in title.
-function normalizeVehicleTitle(rawTitle, year, make) {
-  if (!rawTitle) return rawTitle;
-  const title = rawTitle.trim();
-  const lo = title.toLowerCase();
-  let prefix = '';
-  if (year && !title.includes(String(year))) prefix += year + ' ';
-  if (make && !lo.includes(make.toLowerCase())) prefix += make + ' ';
-  return prefix ? (prefix + title) : title;
-}
-
-// ── AU vehicle depreciation rates ────────────────────────
-const VPX_REF_KM = 100000;  // mileage reference for normalisation (100k km baseline)
-// annualRate: fraction lost per year, perKm: $/km additional depreciation vs VPX_REF_KM
-const DEP_TABLE = {
-  toyota:      { annualRate: 0.12, perKm: 0.06 },
-  mazda:       { annualRate: 0.12, perKm: 0.06 },
-  honda:       { annualRate: 0.12, perKm: 0.06 },
-  subaru:      { annualRate: 0.14, perKm: 0.07 },
-  mitsubishi:  { annualRate: 0.14, perKm: 0.07 },
-  hyundai:     { annualRate: 0.16, perKm: 0.08 },
-  kia:         { annualRate: 0.16, perKm: 0.08 },
-  nissan:      { annualRate: 0.16, perKm: 0.08 },
-  volkswagen:  { annualRate: 0.16, perKm: 0.08 },
-  bmw:         { annualRate: 0.20, perKm: 0.12 },
-  mercedes:    { annualRate: 0.20, perKm: 0.12 },
-  'mercedes-benz': { annualRate: 0.20, perKm: 0.12 },
-  audi:        { annualRate: 0.20, perKm: 0.12 },
-  ford:        { annualRate: 0.18, perKm: 0.09 },
-  holden:      { annualRate: 0.18, perKm: 0.09 },
-  jeep:        { annualRate: 0.20, perKm: 0.10 },
-  landrover:   { annualRate: 0.22, perKm: 0.15 },
-  'land rover':{ annualRate: 0.22, perKm: 0.15 },
-  lexus:       { annualRate: 0.14, perKm: 0.07 },
-  volvo:       { annualRate: 0.18, perKm: 0.09 },
-  _default:    { annualRate: 0.16, perKm: 0.08 },
-};
-// Diesel 4WDs hold value significantly better than their make average
-const DIESEL_4WD_MODELS = ['hilux','triton','ranger','bt-50','bt50','colorado','patrol',
-  'landcruiser','land cruiser','pajero','prado','fortuner','d-max','dmax','mux','mu-x'];
-function getDepRates(make, model) {
-  const m = (model || '').toLowerCase();
-  if (DIESEL_4WD_MODELS.some(d => m.includes(d))) return { annualRate: 0.10, perKm: 0.05 };
-  return DEP_TABLE[(make || '').toLowerCase()] || DEP_TABLE._default;
-}
-
-// Confidence score: how much to trust this pricing source (0–1).
-// Drives: AI skip threshold, border glow intensity, "confidence" display bar.
-function calcConfidence(source, count = 0) {
-  switch (source) {
-    case 'vpx':         return Math.min(0.92, 0.52 + count * 0.025); // grows with AU samples
-    case 'autograb':    return 0.87;  // RedBook industry data
-    case 'csales':      return Math.min(0.82, 0.55 + count * 0.018); // grows with listing count
-    case 'own_history': return Math.min(0.55, 0.28 + count * 0.015);
-    default:            return 0.20;
-  }
-}
-
-function extractState(location) {
-  if (!location) return null;
-  const loc = location.toUpperCase();
-  if (/\bVIC\b|VICTORIA|MELBOURNE/.test(loc))  return 'VIC';
-  if (/\bNSW\b|NEW SOUTH WALES|SYDNEY/.test(loc)) return 'NSW';
-  if (/\bQLD\b|QUEENSLAND|BRISBANE|GOLD COAST/.test(loc)) return 'QLD';
-  if (/\bWA\b|WESTERN AUSTRALIA|PERTH/.test(loc))  return 'WA';
-  if (/\bSA\b|SOUTH AUSTRALIA|ADELAIDE/.test(loc)) return 'SA';
-  if (/\bTAS\b|TASMANIA|HOBART/.test(loc))  return 'TAS';
-  if (/\bACT\b|CANBERRA/.test(loc))         return 'ACT';
-  if (/\bNT\b|NORTHERN TERRITORY|DARWIN/.test(loc)) return 'NT';
-  return null;
-}
-
-// Fallback model extraction when structured fields are missing
-function extractModel(make, title) {
-  const MODELS = {
-    toyota:     ['camry','corolla','hilux','rav4','landcruiser','land cruiser','prado','kluger',
-                 'yaris','prius','c-hr','chr','86','gr86','supra','aurion','fortuner','hiace','tarago'],
-    ford:       ['ranger','escape','puma','focus','fiesta','mustang','f-150','transit','everest','mondeo','endura'],
-    holden:     ['commodore','colorado','trax','trailblazer','astra','barina','cruze','captiva','spark'],
-    honda:      ['civic','accord','cr-v','crv','hr-v','hrv','jazz','odyssey','integra','type r'],
-    nissan:     ['navara','patrol','x-trail','xtrail','pathfinder','qashqai','leaf','370z','350z','gt-r','gtr','micra','pulsar'],
-    mitsubishi: ['triton','pajero','outlander','asx','eclipse cross','lancer','galant','colt','mirage'],
-    mazda:      ['cx-5','cx5','cx-3','cx3','cx-30','cx30','cx-9','cx9','mazda3','mazda6','bt-50','bt50','mx-5','mx5','mazda2'],
-    subaru:     ['outback','forester','impreza','wrx','sti','xv','crosstrek','brz','ascent','legacy','liberty'],
-    hyundai:    ['tucson','santa fe','kona','i30','i20','i10','i40','sonata','elantra','veloster','staria','ioniq5','ioniq6','ioniq'],
-    kia:        ['sportage','sorento','cerato','stinger','carnival','niro','seltos','ev6','picanto','rio'],
-    volkswagen: ['golf','polo','passat','tiguan','touareg','amarok','caddy','transporter','t-roc','id4','arteon'],
-    bmw:        ['3 series','5 series','7 series','x3','x5','x1','x7','m3','m5','m4','4 series','1 series','2 series','x6','i4'],
-    mercedes:   ['c-class','e-class','s-class','a-class','b-class','glc','gle','gla','glb','gls','cla','cls'],
-    audi:       ['a3','a4','a5','a6','a7','a8','q3','q5','q7','rs3','rs4','rs6','s3','s4','s5','tt'],
-    isuzu:      ['d-max','dmax','mu-x','mux'],
-    ldv:        ['t60','d90','g10'],
-    gwm:        ['ute','haval h6','haval','jolion'],
-    mg:         ['hs','zs'],
-    lexus:      ['is','es','rx','nx','ux','lx','gx','lc'],
-    jeep:       ['wrangler','cherokee','grand cherokee','compass','renegade','gladiator'],
-    'land rover': ['defender','discovery','range rover','sport','freelander','evoque','velar'],
-    subaru:     ['outback','forester','impreza','wrx','sti','xv','brz'],
-  };
-  const t = (title || '').toLowerCase();
-  const models = MODELS[(make || '').toLowerCase()] || [];
-  for (const model of models) {
-    if (t.includes(model)) return model;
-  }
-  return null;
-}
-
-// Normalize listed price to VPX_REF_KM equivalent for apples-to-apples comparison.
-// Higher-km car listed at $10k → would have been $13k at 100k km → normPrice = $13k.
-function normalizePriceToRefKm(price, mileage, make, model) {
-  if (!price || price <= 0 || !mileage || mileage <= 0) return price;
-  const { perKm } = getDepRates(make, model);
-  return Math.round(price + (mileage - VPX_REF_KM) * perKm);
-}
-
-// Reverse: given median at VPX_REF_KM, what is market value at targetMileage?
-function adjustMarketPriceToMileage(refMedian, targetMileage, make, model) {
-  if (!refMedian || !targetMileage || targetMileage <= 0) return refMedian;
-  const { perKm } = getDepRates(make, model);
-  return Math.round(refMedian - (targetMileage - VPX_REF_KM) * perKm);
-}
-
-function parsePrice(raw) {
-  if (!raw) return 0;
-  if (typeof raw === 'number') return Math.round(raw);
-  return Math.round(parseFloat(String(raw).replace(/[^0-9.]/g, '')) || 0);
-}
-
-// Prices sellers use as placeholders meaning "make an offer" / "contact me"
-// $1 and $1234 are the most common on FB Marketplace AU
-const OFFER_PRICES = new Set([1, 1234, 1111, 2345, 9999, 9998, 9997, 11111, 99999, 100000, 123456]);
-function isOfferPrice(price) {
-  if (!price || price <= 0) return false;
-  // Exact known placeholder prices
-  if (OFFER_PRICES.has(price)) return true;
-  // Repeating digit pattern e.g. 2222, 3333, 5555
-  const s = String(price);
-  if (s.length >= 3 && s.split('').every(c => c === s[0])) return true;
-  return false;
-}
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ── Shared scan cache TTL ────────────────────────────────
-const SHARED_SCAN_TTL_MS = 110 * 60 * 1000; // 110 mins — slightly under the 2hr scan interval
-
-// ── Distribute raw listings to a single user ─────────────
-async function distributeListingsToUser(watcher, raw, opts = {}) {
-  if (!Array.isArray(raw)) raw = []; // safety net
-  const keyword      = watcher.keyword.toLowerCase();
-  const userId       = watcher.userId;
-  const seen         = await getUserSeen(userId);
-  const userListings = await getUserListings(userId);
-  let newCount       = 0;
-
-  const excludeWords = Array.isArray(watcher.excludeWords) ? watcher.excludeWords : [];
-
-  // ── Keyword synonym map ──────────────────────────────────
-  // Known brands, models and aliases that count as a match even without exact keyword words
-  const SYNONYMS = {
-
-    // ── Electric scooters ─────────────────────────────────
-    'electric scooter': ['ninebot', 'segway', 'xiaomi', 'mi scooter', 'gotrax', 'inokim', 'kaabo', 'dualtron', 'apollo', 'zero 8', 'zero 10', 'evo scooter', 'mearth', 'mercane', 'vsett', 'kugoo', 'fluidfreeride', 'turboant', 'hiboy', 'unagi', 'pure air', 'blade gt', 'mantis', 'wolf king', 'speedway', 'emove', 'joyor', 'navee', 'yadea', 'okai'],
-    'e scooter':        ['ninebot', 'segway', 'xiaomi', 'gotrax', 'inokim', 'kaabo', 'dualtron', 'apollo', 'mearth', 'mercane', 'vsett', 'kugoo', 'emove', 'navee', 'yadea'],
-    'scooter':          ['ninebot', 'segway', 'xiaomi', 'vespa', 'honda pcx', 'honda lead', 'yamaha nmax', 'yamaha vino', 'suzuki address', 'kymco', 'sym', 'peugeot scooter', 'piaggio', 'aprilia sr', 'genuine scooter', 'wolf scooter'],
-
-    // ── Electric bikes ────────────────────────────────────
-    'electric bike':    ['ebike', 'e-bike', 'e bike', 'bafang', 'bosch ebike', 'shimano steps', 'levo', 'turbo levo', 'specialized turbo', 'rad power', 'radpower', 'aventon', 'lectric', 'ride1up', 'juiced', 'super73', 'cake bike', 'riese muller', 'gazelle', 'trek powerfly', 'giant trance e', 'giant reign e', 'cannondale neo', 'bulls ebike', 'haibike', 'cube stereo hybrid', 'focus jam', 'orbea rise', 'yt decoy'],
-    'ebike':            ['ebike', 'e-bike', 'e bike', 'bafang', 'bosch', 'shimano steps', 'levo', 'rad power', 'aventon', 'super73', 'haibike', 'cube hybrid'],
-    'electric bicycle': ['ebike', 'e-bike', 'e bike', 'bafang', 'bosch', 'rad power', 'aventon', 'lectric'],
-
-    // ── Mopeds ───────────────────────────────────────────
-    'moped':            ['ninebot', 'segway', 'honda cub', 'ct110', 'postie bike', 'monkey bike', 'honda ct', 'yamaha cy', 'puch', 'tomos', 'garelli', 'derbi', 'piaggio ciao', 'vespa ciao'],
-
-    // ── Motorcycles ──────────────────────────────────────
-    'motorcycle':       ['honda cbr', 'honda cb', 'yamaha r1', 'yamaha r6', 'yamaha mt', 'kawasaki ninja', 'kawasaki z', 'suzuki gsxr', 'suzuki sv', 'ducati', 'bmw gs', 'bmw s1000', 'triumph', 'ktm duke', 'ktm exc', 'husqvarna', 'royal enfield', 'harley', 'indian scout', 'aprilia rsv', 'mv agusta', 'benelli', 'cfmoto', 'loncin'],
-    'dirt bike':        ['ktm', 'husqvarna', 'yamaha yz', 'yamaha wr', 'honda crf', 'kawasaki kx', 'suzuki rmz', 'beta rr', 'sherco', 'gasgas', 'tm racing', 'pitbike', 'pit bike', 'stomp', 'thumpstar'],
-
-    // ── Apple devices ─────────────────────────────────────
-    'iphone':           ['apple iphone', 'iphone 15', 'iphone 14', 'iphone 13', 'iphone 12', 'iphone 11', 'iphone x', 'iphone se', 'iphone pro', 'iphone plus', 'iphone max'],
-    'macbook':          ['apple macbook', 'macbook pro', 'macbook air', 'macbook m1', 'macbook m2', 'macbook m3', 'apple laptop', 'mac laptop'],
-    'ipad':             ['apple ipad', 'ipad pro', 'ipad air', 'ipad mini', 'ipad 10th', 'ipad 9th', 'apple tablet'],
-    'apple watch':      ['iwatch', 'series 9', 'series 8', 'series 7', 'apple watch ultra', 'watch ultra', 'watch se'],
-    'airpods':          ['airpod pro', 'airpods pro', 'airpods max', 'apple earbuds', 'apple earphones', 'apple headphones'],
-
-    // ── Gaming consoles ───────────────────────────────────
-    'ps5':              ['playstation 5', 'playstation5', 'sony ps5', 'ps5 console', 'ps5 digital', 'ps5 disc', 'dualsense'],
-    'ps4':              ['playstation 4', 'playstation4', 'sony ps4', 'ps4 console', 'ps4 pro', 'ps4 slim'],
-    'xbox':             ['xbox series x', 'xbox series s', 'xbox one', 'microsoft xbox', 'series x', 'series s'],
-    'nintendo switch':  ['switch oled', 'switch lite', 'nintendo oled', 'switch console', 'switch bundle'],
-    'gaming pc':        ['gaming computer', 'gaming desktop', 'rtx gaming', 'rgb gaming', 'gaming rig', 'gaming setup', 'custom pc', 'prebuilt gaming'],
-
-    // ── Golf ─────────────────────────────────────────────
-    'golf clubs':       ['callaway', 'titleist', 'taylormade', 'ping', 'cleveland', 'mizuno', 'cobra golf', 'srixon', 'wilson golf', 'tour edge', 'honma', 'full set', 'iron set', 'golf set', 'driver set', 'wedge set'],
-    'golf club':        ['callaway', 'titleist', 'taylormade', 'ping', 'cleveland', 'mizuno', 'cobra golf', 'srixon', 'driver', 'putter', 'wedge', 'iron', '3 wood', '5 wood'],
-    'golf bag':         ['cart bag', 'stand bag', 'staff bag', 'pencil bag', 'titleist bag', 'callaway bag', 'taylormade bag', 'ping bag'],
-
-    // ── Cameras ──────────────────────────────────────────
-    'camera':           ['sony a7', 'sony a6', 'canon eos', 'canon r5', 'canon r6', 'nikon z', 'nikon d', 'fujifilm xt', 'fujifilm x100', 'panasonic gh', 'olympus om', 'leica', 'hasselblad', 'mirrorless', 'dslr'],
-    'gopro':            ['hero 12', 'hero 11', 'hero 10', 'hero 9', 'gopro hero', 'action cam', 'action camera', 'dji action', 'insta360'],
-    'drone':            ['dji mini', 'dji mavic', 'dji air', 'dji phantom', 'dji fpv', 'autel evo', 'skydio', 'fpv drone', 'quadcopter'],
-
-    // ── Audio ─────────────────────────────────────────────
-    'headphones':       ['sony wh', 'sony xm4', 'sony xm5', 'bose qc', 'bose 700', 'bose quietcomfort', 'sennheiser', 'audio technica', 'beats studio', 'beats pro', 'jabra evolve', 'beyerdynamic', 'akg', 'anker soundcore', 'jbl live'],
-    'speakers':         ['jbl charge', 'jbl flip', 'jbl xtreme', 'bose soundlink', 'sonos', 'marshall speaker', 'ultimate ears', 'ue boom', 'harman kardon', 'klipsch', 'polk audio', 'audioengine', 'yamaha speaker'],
-    'turntable':        ['record player', 'vinyl player', 'technics', 'audio technica lp', 'pro-ject', 'rega', 'pioneer plx', 'reloop', 'denon dp'],
-
-    // ── Computers ────────────────────────────────────────
-    'laptop':           ['macbook', 'thinkpad', 'dell xps', 'hp spectre', 'hp envy', 'lenovo yoga', 'asus rog', 'asus zenbook', 'surface pro', 'surface laptop', 'acer swift', 'razer blade', 'lg gram'],
-    'graphics card':    ['rtx 4090', 'rtx 4080', 'rtx 4070', 'rtx 3090', 'rtx 3080', 'rtx 3070', 'rtx 3060', 'rx 7900', 'rx 6900', 'rx 6800', 'gpu', 'nvidia', 'radeon'],
-    'monitor':          ['ultrawide', '4k monitor', '144hz', '240hz', 'oled monitor', 'curved monitor', 'dell ultrasharp', 'lg ultragear', 'samsung odyssey', 'asus rog monitor', 'benq'],
-
-    // ── Tools & Equipment ─────────────────────────────────
-    'power tools':      ['dewalt', 'milwaukee', 'makita', 'bosch tools', 'festool', 'hikoki', 'metabo', 'ryobi', 'ridgid', 'snap-on', 'impact driver', 'drill set', 'circular saw', 'angle grinder'],
-    'generator':        ['honda generator', 'yamaha generator', 'kipor', 'hyundai generator', 'briggs stratton', 'powertech', 'genset', 'inverter generator'],
-    'pressure washer':  ['karcher', 'gerni', 'ryobi pressure', 'dewalt pressure', 'simpson pressure', 'generac', 'pressure cleaner'],
-
-    // ── Fitness ───────────────────────────────────────────
-    'treadmill':        ['nordictrack', 'bowflex', 'sole treadmill', 'life fitness', 'concept2', 'peloton tread', 'reebok treadmill', 'running machine'],
-    'weights':          ['dumbbells', 'barbell', 'kettlebell', 'weight plates', 'olympic weights', 'gym weights', 'bumper plates', 'cast iron weights'],
-    'exercise bike':    ['spin bike', 'peloton', 'wattbike', 'schwinn', 'assault bike', 'concept2 bike', 'nordictrack bike', 'indoor cycle', 'stationary bike'],
-
-    // ── Furniture ─────────────────────────────────────────
-    'couch':            ['sofa', 'lounge', 'sectional', 'chesterfield', 'loveseat', '3 seater', '4 seater', '2 seater', 'corner sofa'],
-    'sofa':             ['couch', 'lounge', 'sectional', 'chesterfield', '3 seater', '4 seater', 'corner lounge'],
-    'dining table':     ['dining set', 'kitchen table', 'dinner table', 'table and chairs', 'dining suite'],
-
-    // ── Cars (common searches) ────────────────────────────
-    'ute':              ['hilux', 'ranger', 'navara', 'triton', 'colorado', 'd-max', 'bt-50', 'amarok', 'ram 1500', 'f-150', 'silverado', 'tundra'],
-    'van':              ['transit', 'sprinter', 'vito', 'ducato', 'daily', 'hiace', 'nv200', 'master', 'vivaro', 'trafic', 'transporter'],
-    '4wd':              ['landcruiser', 'prado', 'patrol', 'pajero', 'defender', 'discovery', 'wrangler', 'everest', 'fortuner', 'outlander', 'rav4', 'crv'],
-
-    // ── Watches ───────────────────────────────────────────
-    'watch':            ['rolex', 'omega', 'seiko', 'casio', 'citizen', 'tag heuer', 'tissot', 'breitling', 'iwc', 'panerai', 'tudor', 'oris', 'longines', 'hamilton', 'garmin watch', 'suunto'],
-    'smartwatch':       ['apple watch', 'samsung galaxy watch', 'garmin fenix', 'garmin forerunner', 'fitbit', 'polar', 'suunto', 'huawei watch', 'pixel watch'],
-
-    // ── Clothing & Fashion ────────────────────────────────
-    'sneakers':         ['nike air', 'jordan', 'adidas yeezy', 'yeezy', 'new balance', 'asics gel', 'vans old skool', 'converse', 'reebok classic', 'puma', 'salehe', 'dunk', 'air force', 'air max', 'ultraboost'],
-    'designer bag':     ['louis vuitton', 'lv bag', 'gucci bag', 'prada bag', 'chanel bag', 'hermes', 'balenciaga', 'burberry', 'coach bag', 'kate spade', 'michael kors', 'tory burch'],
-
-    // ── Musical instruments ───────────────────────────────
-    'guitar':           ['fender', 'gibson', 'martin guitar', 'taylor guitar', 'epiphone', 'ibanez', 'prs guitar', 'schecter', 'telecaster', 'stratocaster', 'les paul', 'sg guitar', 'acoustic guitar', 'electric guitar'],
-    'keyboard':         ['yamaha keyboard', 'roland keyboard', 'korg', 'casio keyboard', 'nord piano', 'kawai', 'digital piano', 'midi keyboard', 'synthesizer'],
-
-    // ── Baby & Kids ───────────────────────────────────────
-    'pram':             ['stroller', 'bugaboo', 'uppababy', 'babyzen yoyo', 'silver cross', 'mountain buggy', 'baby jogger', 'icandy', 'nuna', 'cybex'],
-    'baby car seat':    ['car seat', 'britax', 'maxi cosi', 'cybex seat', 'nuna rava', 'uppababy mesa', 'clek', 'jolly jumper'],
-  };
-
-  // Find synonyms for this keyword
-  const kwSynonyms = SYNONYMS[keyword] || [];
-
-  // Split keyword into words — all must appear in title OR a synonym matches
-  const kwWords = keyword.replace(/['"]/g, '').toLowerCase().split(/\s+/).filter(w => w.length > 0);
-
-  const relevant = raw.filter(l => {
-    const title = (l.title || '').toLowerCase();
-    const desc  = (l.description || '').toLowerCase();
-    const full  = title + ' ' + desc;
-
-    // Only block user-defined excluded words — AI handles all relevance filtering
-    if (excludeWords.length && excludeWords.some(w => w && full.includes(w))) return false;
-
-    return true;
-  });
-
-  const dropped = raw.length - relevant.length;
-  if (dropped > 0) {
-    console.log(`[Filter] "${keyword}" — dropped ${dropped} listing(s) (matched excluded words)`);
-    // Save blocked listings so user can review them
-    const blockedListings = raw.filter(l => !relevant.includes(l)).map(l => ({
-      id: l.id, title: l.title, price: l.price, url: l.url,
-      image: l.image, keyword, blockedAt: new Date().toISOString()
-    }));
-    redisGet(K.blocked(watcher.userId)).then(existing => {
-      const all = Array.isArray(existing) ? existing : [];
-      const merged = [...blockedListings, ...all.filter(e => !blockedListings.find(b => b.id === e.id))];
-      redisSet(K.blocked(watcher.userId), merged.slice(0, 100)); // keep last 100
-    }).catch(() => {});
-  }
-
-  let seenSkipped = 0;
-  let seenModified = false;
-  // Debug counters — logged at end to show exactly where listings went
-  let dropMaxPrice = 0, dropMinPrice = 0;
-  // On regular scans (after initial scan completed), drop any listing that was
-  // posted before the initial scan finished — those should have been caught then.
-  // This stops old listings trickling in on every 30-min scan.
-  const initialScanCutoff = watcher.initialScanCompletedAt
-    ? new Date(watcher.initialScanCompletedAt).getTime()
-    : null;
-
-  for (let listing of relevant) {
-    // ── Check for price drop + write to Neon DB ───────────
-    // Price drop check runs first — enriches the listing object with
-    // priceDropped/previousPrice flags before anything else sees it.
-    listing = await checkPriceDrop(listing);
-    storeScanPrice(keyword, listing).catch(() => {});
-
-    const key    = `${keyword}:${listing.id}`;
-    const seenTs = seen[key];
-
-    // Price-dropped listings always get through to the feed even if seen before
-    // — the user needs to know the price changed
-    const isPriceDrop = listing.priceDropped && listing.price < (listing.previousPrice || Infinity);
-    if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS && !isPriceDrop) {
-      if (!opts.initialScan) { seenSkipped++; continue; }
-    }
-    // Price range filter — only applies when the user has set a min/max
-    if (watcher.maxPrice && listing.price && listing.price > watcher.maxPrice) { dropMaxPrice++; continue; }
-    if (watcher.minPrice && listing.price && listing.price < watcher.minPrice) { dropMinPrice++; continue; }
-    // Vehicle filters
-    if (watcher.minYear && listing.year && listing.year < watcher.minYear) continue;
-    if (watcher.maxYear && listing.year && listing.year > watcher.maxYear) continue;
-    if (watcher.minKms  && listing.mileage && listing.mileage < watcher.minKms) continue;
-    if (watcher.maxKms  && listing.mileage && listing.mileage > watcher.maxKms) continue;
-    if (watcher.transmission && listing.transmission &&
-        listing.transmission.toLowerCase() !== watcher.transmission.toLowerCase()) continue;
-
-    seen[key] = Date.now();
-
-    if (!userListings.find(l => l.id === listing.id)) {
-      userListings.push(listing);
-      userListings.sort((a, b) =>
-        new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt)
-      );
-      if (userListings.length > 500) userListings.length = 500;
-    }
-    newCount++;
-    const pToken   = watcher.pushoverToken || process.env.PUSHOVER_TOKEN;
-    const pUser    = watcher.pushoverUser  || process.env.PUSHOVER_USER;
-    const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
-    const dropStr  = listing.priceDropped
-      ? ` 🔻 Price dropped from $${listing.previousPrice} (-$${listing.dropAmount})`
-      : '';
-    const pushTitle = listing.priceDropped
-      ? `💸 Price Drop: ${keyword}`
-      : `FlipRadar: ${keyword}`;
-    // Pushover notification (if configured)
-    await sendPushover(pToken, pUser, pushTitle, `${listing.title}\n${priceStr}${dropStr}`, listing.url);
-    // Web push notification — works even when app is closed, no extra app needed
-    sendWebPush(watcher.userId, {
-      title: pushTitle,
-      body:  `${priceStr}${dropStr} · ${listing.location || keyword}`,
-      url:   listing.url,
-      tag:   `listing-${listing.id}`,
-    }).catch(() => {});
-    await sleep(300);
-  }
-
-  // Log the breakdown so we can see exactly where listings went
-  const totalIn = relevant.length;
-  const totalOut = newCount;
-  if (totalIn > 0) {
-    console.log(`[Distribute] "${keyword}" → ${totalIn} in, ${totalOut} new, ${seenSkipped} already seen, ${dropMaxPrice + dropMinPrice} outside price range`);
-  }
-
-  if (newCount > 0) {
-    await saveUserListings(userId, userListings);
-    await saveUserSeen(userId, seen);
-  } else if (seenModified) {
-    // Seen map changed (cutoff blocks or initial-scan refreshes) but no new listings.
-    // Must persist so those entries survive across the next scan cycle.
-    await saveUserSeen(userId, seen);
-  }
-
-  return { newCount, userListings };
-}
-
-// ── Per-watch scan — shared cache across all users ────────
-// If two users watch "mercedes benz", only ONE BrightData call is made per 25 mins
-// Both users get results from the shared cache — huge cost saving
-async function scanWatchItem(watcher, opts = {}) {
-  const keyword = watcher.keyword.toLowerCase();
-
-  // ── Check shared scan cache first ────────────────────────
-  let raw;
-  const cached = await redisGet(K.sharedScan(keyword));
-  if (!opts.initialScan && cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
-    // Serve from cache — no limit, serve everything cached
-    raw = cached.listings || [];
-    console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no SociaVault call)`);
-  } else {
-    raw = await scrapeKeyword(keyword, {
-      city: watcher.location, lat: watcher.lat, lng: watcher.lng,
-      radius: watcher.radius, initialScan: opts.initialScan || false,
-      minPrice: watcher.minPrice || null,
-      maxPrice: watcher.maxPrice || null,
-    });
-    await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
-    console.log(`[SharedCache] "${keyword}" → cached ${raw.length} listings`);
-
-    // ── Also distribute to ALL other users watching this keyword ──
-    const otherWatchers = watchlist.filter(w =>
-      w.keyword.toLowerCase() === keyword &&
-      w.userId !== watcher.userId &&
-      !w.paused
-    );
-    for (const other of otherWatchers) {
-      await distributeListingsToUser(other, raw).catch(e =>
-        console.error(`[SharedCache] Error distributing to user ${other.userId}:`, e.message)
-      );
-    }
-  }
-
-  // NOTE: We do NOT clear seen cache on initial scan anymore
-  // This preserves existing listings in the feed when adding a new keyword
-
-  // ── Distribute to this user ───────────────────────────────
-  // Safety net — ensure raw is always an array
-  if (!Array.isArray(raw)) raw = [];
-
-  // On initial scan: sort by recency so the feed shows newest first.
-  // No cap — let all scraped listings through (up to 50).
-  if (opts.initialScan && raw.length > 1) {
-    raw = [...raw].sort((a, b) => {
-      if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
-      if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
-      return new Date(b.listedAt || b.foundAt || 0) - new Date(a.listedAt || a.foundAt || 0);
-    });
-    console.log(`[InitialScan] "${keyword}" → passing all ${raw.length} listings through`);
-  }
-
-  const { newCount, userListings } = await distributeListingsToUser(watcher, raw, opts);
-
-  // Mark initial scan complete — regular scans will filter by listedAt after this timestamp
-  if (opts.initialScan) {
-    watcher.initialScanCompletedAt = new Date().toISOString();
-  }
-
-  watcher.lastScanned = new Date().toISOString();
-  await saveWatch(watcher);
-  console.log(`[Scan] "${keyword}" (${watcher.plan||'basic'}) → ${newCount} new`);
-  return newCount;
-}
-
-// ── Per-watch timers ──────────────────────────────────────
-const watchTimers = {};
-
-function startWatchTimer(watcher) {
-  if (watchTimers[watcher.id]) clearInterval(watchTimers[watcher.id]);
-  const interval = PLAN_INTERVALS[getEffectivePlan(watcher)] || PLAN_INTERVALS.basic;
-  console.log(`[Timer] "${watcher.keyword}" every ${interval/60000}m (${watcher.plan||'basic'})`);
-  watchTimers[watcher.id] = setInterval(() => {
-    scanWatchItem(watcher).catch(e => console.error(`[Timer] Error for "${watcher.keyword}":`, e.message));
-  }, interval);
-}
-
-function stopWatchTimer(watchId) {
-  if (watchTimers[watchId]) { clearInterval(watchTimers[watchId]); delete watchTimers[watchId]; }
-}
-
-// ── Auto-pause inactive users ─────────────────────────────
-async function pauseInactiveUsers() {
-  const CUTOFF = Date.now() - INACTIVE_DAYS * 24 * 60 * 60 * 1000;
-  let paused = 0;
-  for (const w of watchlist) {
-    if (w.paused) continue;
-    const user = await getUser(w.userId);
-    if (!user || !user.lastSeen) continue;
-    if (new Date(user.lastSeen).getTime() < CUTOFF) {
-      w.paused = true;
-      stopWatchTimer(w.id);
-      await saveWatch(w);
-      paused++;
-      console.log(`[AutoPause] "${w.keyword}" (user ${w.userId}) paused — inactive 7+ days`);
-    }
-  }
-  console.log(`[AutoPause] Done — ${paused} watch(es) paused`);
-}
-
-// ── Seed scanner — runs every 2 days, stops each keyword once it has enough data ──
-// Builds the price-stats database without needing user watches.
-// Each keyword is automatically retired once it hits SEED_THRESHOLD clean listings.
-
-const SEED_THRESHOLD = 25; // min listings in price pool before a keyword is considered seeded
-
-const SEED_KEYWORDS = [
-  // Vehicles — generation resolver sorts them into correct cohorts by year
-  'holden commodore', 'ford falcon', 'toyota hilux', 'ford ranger',
-  'toyota landcruiser', 'toyota prado', 'nissan patrol', 'nissan navara',
-  'mitsubishi triton', 'subaru wrx', 'toyota kluger', 'holden ute',
-  'bmw 3 series', 'ford territory', 'toyota camry', 'toyota corolla',
-  // Power tools — brand specific for tight cohorts
-  'milwaukee m18', 'milwaukee m12', 'makita 18v', 'dewalt 18v',
-  'festool', 'hilti', 'ryobi one+',
-  // Phones & tablets
-  'iphone 14 pro', 'iphone 13', 'iphone 15', 'ipad pro',
-  'samsung galaxy s23', 'samsung galaxy s24',
-  // Gaming
-  'ps5 console', 'xbox series x', 'nintendo switch oled', 'steam deck',
-  // Computers
-  'macbook pro', 'macbook air',
-  // Home & appliances
-  'dyson v15', 'dyson v11', 'dyson airwrap', 'thermomix', 'kitchenaid',
-  // Outdoor & camping
-  'engel fridge', 'waeco fridge', 'weber bbq',
+  // model codes and common search terms people type
+  'e30','e36','e46','e90','e92','e60','e39','e38',
+  'wrx','sti','brz','86','rav4','crv','cx5','cx-5','cx9','cx-9',
+  'triton','navara','colorado','dmax','bt-50','bt50',
+  'hilux','landcruiser','prado','fortuner','kluger',
+  'patrol','pathfinder','xtrail','x-trail','qashqai',
+  'lancer','outlander','asx','eclipse',
+  'tucson','santa fe','i30','i20','accent',
+  'cerato','sportage','sorento','stinger',
+  'golf','polo','tiguan','passat','amarok',
+  'wrangler','cherokee','compass',
+  'mustang','f150','f-150','explorer','escape',
+  'camaro','silverado','tahoe',
+  'swift','vitara','jimny','baleno',
+  'forester','outback','impreza','legacy',
+  'yaris','echo','tarago','alphard','estima',
+  'pajero','triton','outlander',
+  'transit','tourneo','connect',
+  'ducato','daily','boxer','relay',
+  'sprinter','vito','viano','citan',
+  'defender','discovery','freelander','evoque','sport',
+  'commodore','colorado','cruze','barina','astra',
+  'falcon','territory','ranger','transit',
+  '4x4','4wd','awd','diesel','petrol','turbo','tdi','tdci','ute','utes',
+  'wagon','hatchback','sedan','coupe','convertible','suv','crossover','people mover'
 ];
 
-async function getSeedStatus() {
-  // Returns { keyword: sampleCount } for all seed keywords
-  try {
-    const placeholders = SEED_KEYWORDS.map((_, i) => `$${i + 1}`).join(',');
-    // Check actual pool-eligible listings in DB (works even before stats are rebuilt)
-    const { rows } = await pool.query(`
-      SELECT keyword, COUNT(*)::INT AS n
-      FROM listings
-      WHERE keyword = ANY($1) AND in_price_pool = TRUE AND is_active = TRUE
-      GROUP BY keyword
-    `, [SEED_KEYWORDS]);
-    const status = {};
-    SEED_KEYWORDS.forEach(kw => { status[kw] = 0; });
-    rows.forEach(r => { status[r.keyword] = r.n; });
-    return status;
-  } catch(e) {
-    console.error('[Seed] status check error:', e.message);
-    return {};
+function isVehicleKw(kw) {
+  var lower = kw.toLowerCase().trim();
+  if (!lower) return false;
+  // Direct word/phrase match anywhere in the keyword
+  return VEHICLE_KEYWORDS_FE.some(function(v) { return lower.indexOf(v) !== -1; });
+}
+
+function detectVehicleKeyword(val) {
+  var section = document.getElementById('vehicleFiltersSection');
+  if (!section) return;
+  var isVehicle = isVehicleKw(val);
+  if (isVehicle) {
+    section.style.display = 'block';
+    // Auto-expand if it was hidden
+    var body = document.getElementById('vehicleFiltersBody');
+    var btn  = document.getElementById('vehicleFiltersToggle');
+    if (body && body.style.display === 'none') {
+      body.style.display = 'block';
+      if (btn) btn.textContent = 'Hide ▲';
+    }
+  } else {
+    section.style.display = 'none';
+    // Collapse and clear vehicle filter values when hidden
+    var body = document.getElementById('vehicleFiltersBody');
+    var btn  = document.getElementById('vehicleFiltersToggle');
+    if (body) body.style.display = 'none';
+    if (btn)  btn.textContent = 'Show ▼';
+    ['wMinYear','wMaxYear','wMinKms','wMaxKms'].forEach(function(id) {
+      var el = document.getElementById(id); if (el) el.value = '';
+    });
+    _selectedTransmission = 'any';
+    if (typeof selectTransmission === 'function') selectTransmission('any');
   }
 }
 
-async function runSeedJob() {
-  console.log('[Seed] Starting seed scan run...');
-  const status = await getSeedStatus();
-  const pending = SEED_KEYWORDS.filter(kw => (status[kw] || 0) < SEED_THRESHOLD);
-  const complete = SEED_KEYWORDS.length - pending.length;
+function scheduleExcludeSuggestions() {
+  clearTimeout(_suggestTimer);
+  var kw = (document.getElementById('wKeyword').value || '').trim();
+  if (kw.length < 2) {
+    document.getElementById('wExcludeSuggestions').style.display = 'none';
+    return;
+  }
+  if (kw === _lastSuggestedKeyword) return;
+  _suggestTimer = setTimeout(function() { fetchExcludeSuggestions(kw); }, 800);
+}
 
-  console.log(`[Seed] ${complete}/${SEED_KEYWORDS.length} keywords seeded. ${pending.length} remaining.`);
+function fetchExcludeSuggestions(keyword) {
+  var url = getBackendUrl();
+  if (!url) return;
+  _lastSuggestedKeyword = keyword;
+  var chipsEl = document.getElementById('wExcludeSuggestionChips');
+  var wrapEl  = document.getElementById('wExcludeSuggestions');
+  chipsEl.innerHTML = '<span style="font-size:11px;color:var(--mu)">Thinking…</span>';
+  wrapEl.style.display = 'block';
 
-  if (pending.length === 0) {
-    console.log('[Seed] All keywords seeded — seed job complete. No credits used.');
+  var prompt = 'You are helping a Facebook Marketplace buyer filter out irrelevant listings for the search keyword: "' + keyword + '".\n' +
+    'Return a JSON array of 6-10 short lowercase words or phrases that should be EXCLUDED from results because they indicate:\n' +
+    '- Parts listings (not complete items)\n' +
+    '- Wrecked/damaged/non-running items\n' +
+    '- Wanted/looking-to-buy posts\n' +
+    '- Accessories only\n' +
+    '- Other clearly irrelevant listings for someone wanting to buy this item to flip\n\n' +
+    'Be specific to the keyword. For a car keyword include things like "wrecking", "parts", "engine only", "not running".\n' +
+    'For electronics include things like "broken screen", "for parts", "cracked".\n' +
+    'Return ONLY a JSON array of strings, nothing else. Example: ["wrecking","parts","damaged","wanted","project"]';
+
+  fetch(url + '/ai/text', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+    body: JSON.stringify({ prompt: prompt, max_tokens: 200 })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    var text = (d.text || '').trim();
+    try {
+      // Strip any markdown fences just in case
+      text = text.replace(/```json|```/g, '').trim();
+      var suggestions = JSON.parse(text);
+      if (!Array.isArray(suggestions)) throw new Error('not array');
+      _currentSuggestions = suggestions.map(function(s) { return String(s).toLowerCase().trim(); }).filter(Boolean);
+      renderExcludeSuggestions();
+    } catch(e) {
+      chipsEl.innerHTML = '';
+      wrapEl.style.display = 'none';
+    }
+  })
+  .catch(function() {
+    chipsEl.innerHTML = '';
+    wrapEl.style.display = 'none';
+  });
+}
+
+function renderExcludeSuggestions() {
+  var chipsEl = document.getElementById('wExcludeSuggestionChips');
+  var wrapEl  = document.getElementById('wExcludeSuggestions');
+  if (!chipsEl || !_currentSuggestions.length) return;
+  // Only show suggestions not already added
+  var available = _currentSuggestions.filter(function(s) {
+    return _excludeTokens.indexOf(s) === -1;
+  });
+  if (!available.length) { wrapEl.style.display = 'none'; return; }
+  wrapEl.style.display = 'block';
+  chipsEl.innerHTML = available.map(function(s) {
+    return '<button onclick="addExcludeSuggestion(\'' + s.replace(/'/g, "\\'") + '\')" ' +
+      'style="padding:5px 12px;background:rgba(255,200,80,.1);border:1px solid rgba(255,200,80,.3);border-radius:20px;' +
+      'color:#ffc850;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">+ ' + s + '</button>';
+  }).join('');
+}
+
+function addExcludeSuggestion(word) {
+  if (_excludeTokens.indexOf(word) === -1) {
+    _excludeTokens.push(word);
+    renderExcludeTokens();
+  }
+  renderExcludeSuggestions(); // removes clicked chip from suggestions
+}
+
+// ── Exclude keywords — localStorage ──────────────────────
+function saveExcludeWords(watchId, words) {
+  try {
+    var all = JSON.parse(localStorage.getItem('fr_exclude') || '{}');
+    all[watchId] = words;
+    localStorage.setItem('fr_exclude', JSON.stringify(all));
+  } catch(e) {}
+}
+
+function getExcludeWords(watchId) {
+  try {
+    var all = JSON.parse(localStorage.getItem('fr_exclude') || '{}');
+    return all[watchId] || [];
+  } catch(e) { return []; }
+}
+
+function getAllExcludeWords() {
+  try { return JSON.parse(localStorage.getItem('fr_exclude') || '{}'); }
+  catch(e) { return {}; }
+}
+
+function listingMatchesExclude(listing, excludeWords) {
+  if (!excludeWords || !excludeWords.length) return false;
+  var haystack = ((listing.title || '') + ' ' + (listing.description || '') + ' ' + (listing.keyword || '')).toLowerCase();
+  return excludeWords.some(function(w) { return w && haystack.indexOf(w.toLowerCase()) !== -1; });
+}
+
+// Get all exclude words across all watches as a flat merged list (for safety net filtering)
+function getAllExcludeWordsList() {
+  try {
+    var all = JSON.parse(localStorage.getItem('fr_exclude') || '{}');
+    var merged = [];
+    Object.values(all).forEach(function(words) {
+      if (Array.isArray(words)) words.forEach(function(w) { if (merged.indexOf(w) === -1) merged.push(w); });
+    });
+    return merged;
+  } catch(e) { return []; }
+}
+
+
+
+function selectSpeed(speed) {
+  _selectedSpeed = speed;
+  var boxes = { basic: document.getElementById('wSpeedBasic'), pro: document.getElementById('wSpeedPro'), premium: document.getElementById('wSpeedPremium') };
+  var checks = { basic: document.getElementById('wSpeedBasicCheck'), pro: document.getElementById('wSpeedProCheck'), premium: document.getElementById('wSpeedPremiumCheck') };
+  Object.keys(boxes).forEach(function(k) {
+    if (!boxes[k]) return;
+    var active = k === speed;
+    boxes[k].style.border = active ? '2px solid #00ff88' : '1px solid var(--bd)';
+    boxes[k].style.background = active ? 'rgba(0,255,136,.08)' : 'transparent';
+    checks[k].textContent = active ? '✓' : '○';
+    checks[k].style.color = active ? '#00ff88' : 'var(--mu)';
+  });
+}
+
+var _selectedTransmission = 'any';
+function selectTransmission(val) {
+  _selectedTransmission = val;
+  ['any','auto','manual'].forEach(function(k) {
+    var btn = document.getElementById('wTrans' + k.charAt(0).toUpperCase() + k.slice(1));
+    if (!btn) return;
+    var active = k === val;
+    btn.style.border = active ? '2px solid #00ff88' : '1px solid var(--bd)';
+    btn.style.background = active ? 'rgba(0,255,136,.08)' : 'var(--s2)';
+    btn.style.color = active ? '#fff' : 'var(--mu)';
+  });
+}
+
+function toggleVehicleFilters() {
+  var body = document.getElementById('vehicleFiltersBody');
+  var btn  = document.getElementById('vehicleFiltersToggle');
+  var open = body.style.display !== 'none';
+  body.style.display = open ? 'none' : 'block';
+  btn.textContent = open ? 'Show ▼' : 'Hide ▲';
+}
+
+// ── Location presets ──────────────────────────────────────
+var _locMode = 'auto50'; // auto50 | auto25 | custom
+var _userLat = null;
+var _userLng = null;
+
+function setLocationPreset(mode) {
+  _locMode = mode;
+  var btns = {
+    auto50: document.getElementById('locPresetAuto'),
+    auto25: document.getElementById('locPreset25'),
+    custom: document.getElementById('locPresetCustom')
+  };
+  var activeStyle = 'padding:7px 12px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;border:none;background:#00ff88;color:#000';
+  var inactiveStyle = 'padding:7px 12px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid var(--bd);background:var(--s2);color:var(--mu)';
+  Object.keys(btns).forEach(function(k) { if (btns[k]) btns[k].style.cssText = (k === mode ? activeStyle : inactiveStyle); });
+
+  var customFields = document.getElementById('customLocationFields');
+  var statusEl = document.getElementById('locationStatus');
+
+  if (mode === 'custom') {
+    if (customFields) customFields.style.display = 'block';
+    if (statusEl) statusEl.textContent = 'Enter your location and radius below';
+  } else {
+    if (customFields) customFields.style.display = 'none';
+    var radius = mode === 'auto25' ? 25 : 50;
+    if (statusEl) statusEl.textContent = 'Locating you...';
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(function(pos) {
+        _userLat = pos.coords.latitude;
+        _userLng = pos.coords.longitude;
+        if (statusEl) statusEl.textContent = 'Will search within ' + radius + 'km of your location ✓';
+      }, function() {
+        if (statusEl) statusEl.textContent = 'Could not get location — will use Melbourne as default';
+      });
+    }
+  }
+}
+
+function getWatchLocation() {
+  if (_locMode === 'custom') {
+    return {
+      city: document.getElementById('wLocation') ? document.getElementById('wLocation').value.trim() || 'melbourne' : 'melbourne',
+      radius: document.getElementById('wRadius') ? parseInt(document.getElementById('wRadius').value) : 50,
+      lat: null, lng: null
+    };
+  }
+  var radius = _locMode === 'auto25' ? 25 : 50;
+  return { city: null, lat: _userLat, lng: _userLng, radius };
+}
+
+
+function useMyLocation() {
+  if (!navigator.geolocation) { toast('Location not supported'); return; }
+  toast('Getting location...');
+  navigator.geolocation.getCurrentPosition(function(pos) {
+    var lat = pos.coords.latitude.toFixed(4);
+    var lng = pos.coords.longitude.toFixed(4);
+    document.getElementById('wLocation').value = lat + ',' + lng;
+    toast('Location set!');
+  }, function() { toast('Could not get location'); });
+}
+
+ function fillWithAI() {
+  var desc = document.getElementById('wAiDesc').value.trim();
+  if (!desc) { toast('Describe what you want first'); return; }
+  toast('Filling with AI...');
+  var prompt = 'Extract watchlist details from this description and return ONLY valid JSON, no markdown: {"name":string,"keyword":string,"minPrice":number or null,"maxPrice":number or null,"aiFilter":string or null}. Description: ' + desc;
+  var aiCall = getBackendUrl()
+    ? callBackendAI('/ai/text', { prompt: prompt, max_tokens: 300 }).then(function(d) { return d._raw || JSON.stringify(d); })
+    : fetchWithRetry('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json','x-api-key':API_KEY,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true' },
+        body: JSON.stringify({ model:'claude-haiku-4-5-20251001', max_tokens:300, messages:[{role:'user',content:prompt}] })
+      }).then(function(r){return r.json();}).then(function(d){ return d.content && d.content[0] ? d.content[0].text : ''; });
+  aiCall.then(function(text) {
+    try {
+      var match = text.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error('No JSON');
+      var result = JSON.parse(match[0]);
+      if (result.name)     document.getElementById('wName').value = result.name;
+      if (result.keyword)  document.getElementById('wKeyword').value = result.keyword;
+      if (result.minPrice) document.getElementById('wMinPrice').value = result.minPrice;
+      if (result.maxPrice) document.getElementById('wMaxPrice').value = result.maxPrice;
+      if (result.aiFilter) document.getElementById('wAiFilter').value = result.aiFilter;
+      toast('✅ Filled with AI!');
+    } catch(e) { toast('Could not parse AI response'); }
+  }).catch(function(){ toast('AI fill failed'); });
+}
+
+
+function devBypassLimit() {
+  showNewWatch(true);
+}
+
+function addWatch() {
+  var url = getBackendUrl();
+  var keyword = document.getElementById('wKeyword').value.trim();
+  var maxPrice = document.getElementById('wMaxPrice').value.trim();
+  if (!keyword) { showWErr('Enter a keyword first.'); return; }
+  hideWErr();
+  var loc = getWatchLocation();
+  var minPrice = document.getElementById('wMinPrice').value.trim();
+  var excludeWords = _excludeTokens.slice();
+  var localItem = {
+    id: 'local_' + Date.now(),
+    keyword: keyword,
+    maxPrice: maxPrice ? parseInt(maxPrice) : null,
+    minPrice: minPrice ? parseInt(minPrice) : null,
+    plan: _selectedSpeed,
+    location: loc.city || null,
+    lat: loc.lat || null,
+    lng: loc.lng || null,
+    radius: loc.radius || 50,
+    localOnly: true,
+    createdAt: new Date().toISOString()
+  };
+  upsertLocalWatch(localItem);
+  if (excludeWords.length) saveExcludeWords(localItem.id, excludeWords);
+  document.getElementById('wKeyword').value = '';
+  document.getElementById('wMinPrice').value = '';
+  document.getElementById('wMaxPrice').value = '';
+  hideNewWatch();
+  renderWatchlist(getLocalWatches());
+  toast('✅ Watching: ' + keyword);
+  if (!url) {
+    showWErr('Saved on this device. Backend URL is unavailable, so cloud scanning is not active.');
+    return;
+  }
+  var minYear = document.getElementById('wMinYear') ? document.getElementById('wMinYear').value.trim() : '';
+  var maxYear = document.getElementById('wMaxYear') ? document.getElementById('wMaxYear').value.trim() : '';
+  var minKms  = document.getElementById('wMinKms')  ? document.getElementById('wMinKms').value.trim()  : '';
+  var maxKms  = document.getElementById('wMaxKms')  ? document.getElementById('wMaxKms').value.trim()  : '';
+  fetch(url + '/watchlist', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({
+      keyword:      keyword,
+      maxPrice:     maxPrice ? parseInt(maxPrice) : null,
+      minPrice:     minPrice ? parseInt(minPrice) : null,
+      plan:         _selectedSpeed,
+      location:     loc.city || null,
+      lat:          loc.lat  || null,
+      lng:          loc.lng  || null,
+      radius:       loc.radius || 50,
+      excludeWords: excludeWords,
+      minYear:      minYear ? parseInt(minYear) : null,
+      maxYear:      maxYear ? parseInt(maxYear) : null,
+      minKms:       minKms  ? parseInt(minKms)  : null,
+      maxKms:       maxKms  ? parseInt(maxKms)  : null,
+      transmission: (_selectedTransmission && _selectedTransmission !== 'any') ? _selectedTransmission : null,
+    })
+  })
+  .then(function(r) {
+    return r.json().then(function(d) {
+      if (!r.ok) throw new Error(d && d.error ? d.error : 'Could not save to cloud');
+      return d;
+    });
+  })
+  .then(function(newItem) {
+    if (newItem && newItem.id) {
+      newItem.localOnly = false;
+      upsertLocalWatch(newItem, localItem.id);
+      if (excludeWords.length) saveExcludeWords(newItem.id, excludeWords);
+    }
+    loadWatchlist();
+    // Poll for listings after adding a watch — initial scan can take 30-60s
+    var pollCount = 0;
+    var pollInterval = setInterval(function() {
+      pollCount++;
+      refreshListings();
+      if (pollCount >= 6) clearInterval(pollInterval); // stop after 3 mins
+    }, 30000); // check every 30s
+    // Also do a quick check at 10s in case it was fast
+    setTimeout(function() { refreshListings(); }, 10000);
+  })
+  .catch(function(e) {
+    console.error('addWatch sync error:', e);
+    if (e.message && e.message.toLowerCase().includes('limit')) {
+      showWErr('Plan limit hit on server. Use 🛠 Dev button to bypass.');
+      var msg = document.getElementById('planLimitMsg');
+      if (msg) msg.style.display = 'block';
+    } else {
+      showWErr('Saved on this device. Cloud sync failed: ' + (e.message || 'connection error'));
+    }
+  });
+}
+
+
+// ── Plan limits ───────────────────────────────────────────
+// ── Plan modal ────────────────────────────────────────────
+var _pendingPlan = null;
+
+
+// ── Stripe / Plan ─────────────────────────────────────────
+var _billing = 'weekly';
+var _selectedPlanName = 'premium';
+var STRIPE_PK = 'pk_test_51Ta7AzPDjYUYNInH9L5vNseVrlXkIMnpn9n52nVPxvZzkApJ7JWjku4bT4vZXSa3YwZmXn07ZHqSoUYtYLPpucpi00fiVZWY5Q';
+
+var PRICES = {
+  basic:   { weekly: { id: 'price_1Ta7LcPDjYUYNInHPy2AMqba', label: '$5.49', per: '/week' },
+             monthly: { id: 'price_1Ta7MLPDjYUYNInHYru4vO5M', label: '$13.99', per: '/month' },
+             yearly:  { id: 'price_1Ta7MdPDjYUYNInHu5k5kiOU', label: '$89.00', per: '/year' } },
+  premium: { weekly: { id: 'price_1Ta7PsPDjYUYNInHMvbMiWvV', label: '$8.99', per: '/week' },
+             monthly: { id: 'price_1Ta7QDPDjYUYNInHDQTp70Mt', label: '$27.99', per: '/month' },
+             yearly:  { id: 'price_1Ta7QSPDjYUYNInHLG2F4aT3', label: '$199.00', per: '/year' } },
+};
+
+function setBilling(period) {
+  _billing = period;
+  ['Weekly','Monthly','Yearly'].forEach(function(p) {
+    var btn = document.getElementById('bill' + p);
+    if (!btn) return;
+    var active = p.toLowerCase() === period;
+    btn.style.background = active ? '#00ff88' : 'transparent';
+    btn.style.color = active ? '#000' : 'var(--mu)';
+  });
+  updatePlanPrices();
+}
+
+function updatePlanPrices() {
+  var bp = PRICES.basic[_billing];
+  var pp = PRICES.premium[_billing];
+  var bpEl   = document.getElementById('basicPrice');
+  var bperEl = document.getElementById('basicPer');
+  var ppEl   = document.getElementById('premiumPrice');
+  var pperEl = document.getElementById('premiumPer');
+  var bSave  = document.getElementById('basicSaving');
+  var pSave  = document.getElementById('premiumSaving');
+  if (bpEl)   bpEl.textContent   = bp.label;
+  if (bperEl) bperEl.textContent = bp.per;
+  if (ppEl)   ppEl.textContent   = pp.label;
+  if (pperEl) pperEl.textContent = pp.per;
+  var savings = {
+    basic:   { weekly: null, monthly: 7.97,  yearly: 78.88 },
+    premium: { weekly: null, monthly: 7.97,  yearly: 136.88 },
+  };
+  var bSavingVal = savings.basic[_billing];
+  var pSavingVal = savings.premium[_billing];
+  if (bSave) {
+    if (bSavingVal) { bSave.textContent = 'Save $' + bSavingVal.toFixed(2) + ' vs weekly'; bSave.style.display = 'block'; }
+    else { bSave.style.display = 'none'; }
+  }
+  if (pSave) {
+    if (pSavingVal) { pSave.textContent = 'Save $' + pSavingVal.toFixed(2) + ' vs weekly'; pSave.style.display = 'block'; }
+    else { pSave.style.display = 'none'; }
+  }
+  updateCheckoutBtn();
+}
+
+function selectStripePlan(plan) {
+  _selectedPlanName = plan;
+  var basicCard   = document.getElementById('basicPlanCard');
+  var premiumCard = document.getElementById('premiumPlanCard');
+  if (basicCard) {
+    basicCard.style.borderColor   = plan === 'basic' ? '#00ff88' : 'var(--bd)';
+    basicCard.style.background    = plan === 'basic' ? 'rgba(0,255,136,.04)' : 'transparent';
+  }
+  if (premiumCard) {
+    premiumCard.style.borderColor = plan === 'premium' ? '#00ff88' : 'var(--bd)';
+    premiumCard.style.background  = plan === 'premium' ? 'rgba(0,255,136,.04)' : 'transparent';
+  }
+  updateCheckoutBtn();
+}
+
+function updateCheckoutBtn() {
+  var btn = document.getElementById('planCheckoutBtn');
+  if (!btn) return;
+  var p = PRICES[_selectedPlanName][_billing];
+  btn.textContent = 'Subscribe — ' + p.label + ' ' + p.per + ' →';
+}
+
+var _stripeInstance = null;
+var _stripeCardElement = null;
+var _stripeClientSecret = null;
+
+function showPlanScreen() {
+  document.getElementById('cardScreen').style.display = 'none';
+  document.getElementById('planScreen') && (document.getElementById('planScreen').style.display = 'block');
+  // Show the first child div (plan selection)
+  var modal = document.querySelector('#planModal > div > div:first-child');
+  if (modal) modal.style.display = 'block';
+  var card = document.getElementById('cardScreen');
+  if (card) card.style.display = 'none';
+}
+
+function goToCheckout() {
+  var url = getBackendUrl();
+  var priceId = PRICES[_selectedPlanName][_billing].id;
+  var p = PRICES[_selectedPlanName][_billing];
+  var btn = document.getElementById('planCheckoutBtn');
+  if (btn) { btn.textContent = 'Loading...'; btn.disabled = true; }
+
+  // Create payment intent on server
+  fetch(url + '/stripe/create-intent', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ priceId: priceId })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (btn) { btn.textContent = 'Subscribe — ' + p.label + ' ' + p.per + ' →'; btn.disabled = false; }
+    if (!d.clientSecret) { toast('Could not start checkout. Try again.'); return; }
+    _stripeClientSecret = d.clientSecret;
+
+    // Show card screen
+    var planDiv = document.querySelector('#planModal .plan-screen');
+    var cardDiv = document.getElementById('cardScreen');
+    // Hide first child, show card screen
+    var firstChild = document.querySelector('#planModal > div > div:not(#cardScreen)');
+    if (firstChild) firstChild.style.display = 'none';
+    if (cardDiv) cardDiv.style.display = 'block';
+
+    // Update summary
+    var summaryPlan = document.getElementById('cardSummaryPlan');
+    var summaryPrice = document.getElementById('cardSummaryPrice');
+    if (summaryPlan) summaryPlan.textContent = _selectedPlanName === 'premium' ? 'Premium ⭐' : 'Basic';
+    if (summaryPrice) summaryPrice.textContent = p.label + p.per;
+
+    // Mount Stripe Elements
+    if (!_stripeInstance) {
+      _stripeInstance = Stripe('pk_test_51Ta7AzPDjYUYNInH9L5vNseVrlXkIMnpn9n52nVPxvZzkApJ7JWjku4bT4vZXSa3YwZmXn07ZHqSoUYtYLPpucpi00fiVZWY5Q');
+    }
+    var elements = _stripeInstance.elements({ clientSecret: _stripeClientSecret, appearance: {
+      theme: 'night',
+      variables: { colorPrimary: '#00ff88', colorBackground: '#0d0d18', colorText: '#e4e4f4', colorDanger: '#ff6b6b', fontFamily: 'DM Sans, sans-serif', borderRadius: '10px' }
+    }});
+    _stripeCardElement = elements.create('payment');
+    _stripeCardElement.mount('#card-element');
+    _stripeCardElement.on('change', function(e) {
+      var errEl = document.getElementById('card-errors');
+      if (e.error) { errEl.textContent = e.error.message; errEl.style.display = 'block'; }
+      else { errEl.style.display = 'none'; }
+    });
+
+    // Apple Pay / Google Pay is disabled in this static build.
+    var paymentRequestBtn = document.getElementById('payment-request-btn');
+    var paymentRequestDivider = document.getElementById('payment-request-divider');
+    if (paymentRequestBtn) paymentRequestBtn.style.display = 'none';
+    if (paymentRequestDivider) paymentRequestDivider.style.display = 'none';
+  })
+  .catch(function(e) {
+    if (btn) { btn.disabled = false; updateCheckoutBtn(); }
+    toast('Connection error. Try again.');
+  });
+}
+
+function handlePaymentSuccess() {
+  closePlanModal();
+  toast('🎉 Payment successful! Upgrading your account...');
+  setTimeout(function() {
+    fetch(getBackendUrl() + '/auth/me', { headers: authHeaders() })
+      .then(function(r) { return r.json(); })
+      .then(function(u) { if (u && u.plan) { setAuth(getAuthToken(), u); updateUserUI(u); toast('✅ Welcome to ' + u.plan + '!'); } })
+      .catch(function() {});
+  }, 3000);
+}
+
+function submitPayment() {
+  if (!_stripeInstance || !_stripeClientSecret || !_stripeCardElement) { toast('Payment not ready. Try again.'); return; }
+  var btn = document.getElementById('payBtn');
+  if (btn) { btn.textContent = 'Processing...'; btn.disabled = true; }
+  document.getElementById('card-errors').style.display = 'none';
+
+  _stripeInstance.confirmPayment({
+    elements: _stripeCardElement._elements || (function() {
+      // fallback for payment element
+      return undefined;
+    })(),
+    clientSecret: _stripeClientSecret,
+    confirmParams: { return_url: window.location.href },
+    redirect: 'if_required'
+  }).then(function(result) {
+    if (btn) { btn.textContent = 'Pay Now'; btn.disabled = false; }
+    if (result.error) {
+      var errEl = document.getElementById('card-errors');
+      errEl.textContent = result.error.message;
+      errEl.style.display = 'block';
+    } else if (result.paymentIntent && result.paymentIntent.status === 'succeeded') {
+      closePlanModal();
+      toast('🎉 Payment successful! Upgrading your account...');
+      // Poll for plan upgrade
+      setTimeout(function() {
+        fetch(getBackendUrl() + '/auth/me', { headers: authHeaders() })
+          .then(function(r) { return r.json(); })
+          .then(function(u) { if (u && u.plan) { setAuth(getAuthToken(), u); updateUserUI(u); toast('✅ Welcome to ' + u.plan + '!'); } })
+          .catch(function() {});
+      }, 3000);
+    }
+  }).catch(function(e) {
+    if (btn) { btn.textContent = 'Pay Now'; btn.disabled = false; }
+    toast('Payment error. Try again.');
+  });
+}
+
+function openManageSubscription() {
+  var url = getBackendUrl();
+  fetch(url + '/stripe/portal', { method: 'POST', headers: authHeaders() })
+    .then(function(r) { return r.json(); })
+    .then(function(d) { if (d.url) window.location.href = d.url; })
+    .catch(function() { toast('Could not open billing portal.'); });
+}
+
+// Check if user upgraded after returning from Stripe
+(function checkUpgradeReturn() {
+  if (window.location.search.includes('upgraded=1')) {
+    toast('🎉 Welcome to ' + (_authUser && _authUser.plan ? _authUser.plan : 'Premium') + '!');
+    history.replaceState(null, '', window.location.pathname);
+    // Refresh user plan from server
+    var url = getBackendUrl();
+    fetch(url + '/auth/me', { headers: authHeaders() })
+      .then(function(r) { return r.json(); })
+      .then(function(u) {
+        if (u && u.plan) {
+          var token = getAuthToken();
+          setAuth(token, u);
+          updateUserUI(u);
+        }
+      }).catch(function(){});
+  }
+})();
+
+// Appraisal rate limiting — check with server before firing
+function checkAppraisalLimit() {
+  var url = getBackendUrl();
+  return fetch(url + '/auth/appraisal', { method: 'POST', headers: authHeaders() })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) {
+        var user = getAuthUser();
+        var plan = user ? user.plan : 'free';
+        if (plan === 'free') {
+          toast('⚠️ 5 appraisals/day limit reached. Upgrade for more!');
+          openPlanModal();
+        } else if (plan === 'basic') {
+          toast('⚠️ 25 appraisals/day limit reached. Upgrade to Premium for unlimited!');
+          openPlanModal();
+        }
+        return false;
+      }
+      return true;
+    })
+    .catch(function() { return true; }); // fail open so appraisal still works offline
+}
+
+function closePlanModal() { document.getElementById('planModal').style.display = 'none'; }
+function openPlanModal() {
+  document.getElementById('planModal').style.display = 'block';
+  setBilling('weekly');
+  selectStripePlan('premium');
+}
+
+var PLAN_LIMITS = { free: 0, basic: 1, premium: 2 };
+function getPlanLimit() {
+  var user = getAuthUser();
+  var plan = user ? (user.plan || 'free') : 'free';
+  return PLAN_LIMITS[plan] !== undefined ? PLAN_LIMITS[plan] : 0;
+}
+
+function updatePlanUI(watchCount) {
+  var user = getAuthUser();
+  var plan = user ? (user.plan || 'free') : 'free';
+  var limit = Math.max(getPlanLimit(), 1);
+  var el;
+  el = document.getElementById('planName');   if (el) el.textContent = plan === 'premium' ? 'Premium' : plan === 'basic' ? 'Basic' : 'Free';
+  el = document.getElementById('planSlots');  if (el) el.textContent = watchCount + ' / ' + limit + ' watchlist' + (limit > 1 ? 's' : '');
+  el = document.getElementById('planIcon');   if (el) el.textContent = plan === 'premium' ? '⭐' : '🔍';
+  var atLimit = watchCount >= limit;
+  el = document.getElementById('addWatchBtnWrap'); if (el) el.style.display = atLimit ? 'none' : 'block';
+  el = document.getElementById('planLimitMsg');    if (el) el.style.display = atLimit ? 'block' : 'none';
+}
+
+function removeWatch(id) {
+  var url = getBackendUrl();
+  removeLocalWatch(id);
+  renderWatchlist(getLocalWatches());
+  try {
+    var all = JSON.parse(localStorage.getItem('fr_exclude') || '{}');
+    delete all[id];
+    localStorage.setItem('fr_exclude', JSON.stringify(all));
+  } catch(e) {}
+  toast('Removed');
+  if (!url || String(id).indexOf('local_') === 0) return;
+  fetch(url + '/watchlist/' + id, { method: 'DELETE', headers: authHeaders() })
+    .then(function(r) {
+      if (!r.ok) { showWErr('Removed on this device. Cloud remove failed.'); return; }
+      loadWatchlist();
+    })
+    .catch(function() { showWErr('Removed on this device. Cloud remove failed.'); });
+}
+function manualScan() {
+  var url = getBackendUrl();
+  if (!url) { showWErr('Backend error. Please try again.'); return; }
+  fetch(url + '/scan/now', {method:'POST'}).then(function(){
+    toast('Scan triggered! Check Pushover.', 3500);
+  }).catch(function(){ showWErr('Could not trigger scan.'); });
+}
+(function(){
+  var saved = localStorage.getItem('fr_backend');
+  if (saved) { var inp = document.getElementById('wBackendUrl'); if(inp) inp.value = saved; }
+})();
+
+
+// ── Listings feed ─────────────────────────────────────────
+// ── Watchlist feed tabs ───────────────────────────────────
+var _activeWatchFilter = 'all';
+var _watchlistData = [];
+
+function applyWatchFilter() {
+  var cached = getCachedListings();
+  var allExclude = getAllExcludeWords();
+  // Flat list of ALL exclude words across all watches — safety net so nothing slips through
+  var allExcludeFlat = getAllExcludeWordsList();
+  var filtered;
+  if (_activeWatchFilter === 'all') {
+    filtered = cached.filter(function(l) {
+      var watch = _watchlistData.find(function(w) { return w.keyword === l.keyword; });
+      if (watch && watch.maxPrice && l.price > watch.maxPrice) return false;
+      if (watch && watch.minPrice && l.price < watch.minPrice) return false;
+      // Use watch-specific exclude words if available, otherwise fall back to all exclude words
+      var excludeWords = watch ? (allExclude[watch.id] || []) : allExcludeFlat;
+      if (listingMatchesExclude(l, excludeWords)) return false;
+      return true;
+    });
+  } else {
+    var watch = _watchlistData.find(function(w) { return w.keyword === _activeWatchFilter; });
+    var excludeWords = watch ? (allExclude[watch.id] || []) : allExcludeFlat;
+    filtered = cached.filter(function(l) {
+      if (l.keyword !== _activeWatchFilter) return false;
+      if (watch && watch.maxPrice && l.price > watch.maxPrice) return false;
+      if (watch && watch.minPrice && l.price < watch.minPrice) return false;
+      if (listingMatchesExclude(l, excludeWords)) return false;
+      return true;
+    });
+  }
+  var ratings = getCachedRatings() || {};
+  renderListingsFeed(filtered, ratings);
+  // Only re-rate items that don't have a rating yet
+  var unrated = filtered.filter(function(l) { return !ratings[l.id]; });
+  if (unrated.length > 0) autoAppraise(unrated);
+}
+
+function renderWatchlistTabs() {
+  var el = document.getElementById('watchlistTabs');
+  if (!el) return;
+  var url = getBackendUrl();
+  if (!url) { el.innerHTML = ''; return; }
+  fetch(url + '/watchlist', { headers: authHeaders() })
+    .then(function(r) { return r.json(); })
+    .then(function(watches) {
+      if (!watches || !watches.length) { el.innerHTML = ''; return; }
+      var tabStyle = function(active) {
+        return 'padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;border:none;' +
+          (active ? 'background:#00ff88;color:#000;' : 'background:var(--s2);color:var(--mu);border:1px solid var(--bd);');
+      };
+      var html = '<button class="wtab" data-kw="all" style="' + tabStyle(_activeWatchFilter === 'all') + '">All</button>';
+      var seen = {};
+      watches.forEach(function(w) {
+        var kw = w.keyword;
+        if (seen[kw]) return;
+        seen[kw] = true;
+        var label = w.name || kw;
+        html += '<button class="wtab" data-kw="' + kw + '" style="' + tabStyle(_activeWatchFilter === kw) + '">' + label + '</button>';
+      });
+      el.innerHTML = html;
+      // Store watches for price filtering
+      _watchlistData = watches;
+      el.onclick = function(ev) {
+        var btn = ev.target.closest('.wtab');
+        if (!btn) return;
+        _activeWatchFilter = btn.getAttribute('data-kw');
+        renderWatchlistTabs();
+        applyWatchFilter();
+      };
+    })
+    .catch(function() { el.innerHTML = ''; });
+}
+
+
+function triggerRefresh() {
+  var icon = document.getElementById('refreshIcon');
+  var btn = document.getElementById('refreshBtn');
+  if (icon) icon.className = 'spinning';
+  if (btn) btn.style.opacity = '0.6';
+  refreshListings();
+}
+
+// ── Active feed keyword filter ────────────────────────────
+var _feedFilter = 'all'; // 'all' | keyword string
+
+function renderFilterTabs(items) {
+  var el = document.getElementById('feedFilterTabs');
+  if (!el) return;
+  // Collect unique keywords
+  var kws = [];
+  items.forEach(function(l) { if (l.keyword && kws.indexOf(l.keyword) === -1) kws.push(l.keyword); });
+  if (kws.length <= 1) { el.innerHTML = ''; return; } // Only show tabs if >1 keyword
+  var tabStyle = function(active) {
+    return 'padding:6px 14px;border-radius:100px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;border:1px solid ' +
+      (active ? '#00ff88;background:rgba(0,255,136,.15);color:#00ff88' : 'var(--bd);background:var(--s1);color:var(--mu)');
+  };
+  var html = '<button onclick="setFeedFilter(\'all\')" style="' + tabStyle(_feedFilter === 'all') + '">All</button>';
+  kws.forEach(function(kw) {
+    html += '<button data-kw="' + kw + '" class="feed-filter-btn" style="' + tabStyle(_feedFilter === kw) + '">' + kw + '</button>';
+  });
+  el.innerHTML = html;
+}
+
+function setFeedFilter(kw) {
+  _feedFilter = kw;
+  var cached = getCachedListings();
+  var ratings = getCachedRatings();
+  renderFilterTabs(cached);
+  renderListingsFeed(cached, ratings);
+}
+
+function refreshListings() {
+  var url = getBackendUrl();
+  if (!url) {
+    document.getElementById('listingsFeed').innerHTML = '<div style="text-align:center;padding:60px 20px;color:var(--mu)"><div style="font-size:48px;margin-bottom:12px">🔌</div><div>No listings yet. Add a keyword in the Watch tab.</div></div>';
     return;
   }
 
-  let scanned = 0;
-  for (const keyword of pending) {
-    try {
-      // Scan using minimal opts — upsertListingToDB fires automatically inside the scan
-      await sociaVaultKeywordScan(keyword, {
-        keyword,
-        minPrice: null, maxPrice: null,
-        minYear: null, maxYear: null,
-        minKms: null, maxKms: null,
-        transmission: null,
-        excludeWords: [],
-        initialScan: true,
+  var cached = getCachedListings();
+  var cachedRatings = getCachedRatings();
+  if (cached.length) { renderListingsFeed(cached, cachedRatings || {}); }
+  else document.getElementById('listingsFeed').innerHTML = '<div style="text-align:center;padding:60px 20px;color:var(--mu)"><div style="font-size:36px;margin-bottom:12px">⏳</div><div>Loading...</div></div>';
+
+  // Always fetch all listings — don't use ?since= as it can miss listings
+  // if the lastFetch time is wrong. Merge on client side instead.
+  var fetchUrl = url + '/listings';
+
+  fetch(fetchUrl, { headers: authHeaders() })
+    .then(function(r) { return r.json(); })
+    .then(function(newItems) {
+      var icon = document.getElementById('refreshIcon');
+      var btn = document.getElementById('refreshBtn');
+      if (icon) icon.className = '';
+      if (btn) btn.style.opacity = '1';
+      saveLastFetchTime(new Date().toISOString());
+      _lastFeedFetch = Date.now();
+      updateFeedLastUpdated();
+
+      // Merge: new items at top, existing cached below, deduplicate by id
+      var existingCached = getCachedListings();
+      var existingIds = {};
+      existingCached.forEach(function(l) { existingIds[l.id] = true; });
+      var trulyNew = (newItems || []).filter(function(l) { return !existingIds[l.id]; });
+      var merged = trulyNew.concat(existingCached);
+      if (merged.length > 200) merged = merged.slice(0, 200);
+
+      if (!merged.length) {
+        document.getElementById('feedFilterTabs').innerHTML = '';
+        document.getElementById('listingsFeed').innerHTML = '<div style="text-align:center;padding:60px 20px;color:var(--mu)"><div style="font-size:48px;margin-bottom:12px">📭</div><div>No listings yet</div><div style="font-size:13px;margin-top:8px">Add a keyword in the Watch tab — it scans every 30 minutes</div></div>';
+        return;
+      }
+
+      // Mark truly new items so the feed can highlight them
+      trulyNew.forEach(function(l) { l._isNew = true; });
+
+      // Prune ratings for IDs no longer in feed
+      var mergedIdSet = {};
+      merged.forEach(function(l) { mergedIdSet[l.id] = true; });
+      var existingRatings = getCachedRatings() || {};
+      var prunedRatings = {};
+      Object.keys(existingRatings).forEach(function(id) {
+        if (mergedIdSet[id]) prunedRatings[id] = existingRatings[id];
       });
-      scanned++;
-      console.log(`[Seed] "${keyword}" scanned (${status[keyword] || 0} → checking...)`);
-      await new Promise(res => setTimeout(res, 400)); // small pause between calls
-    } catch(e) {
-      console.error(`[Seed] "${keyword}" error:`, e.message);
-    }
-  }
-  console.log(`[Seed] Run complete — ${scanned} keywords scanned.`);
+      saveCachedRatings(prunedRatings);
+      saveCachedListings(merged);
+      renderWatchlistTabs();
+
+      var ratings2 = getCachedRatings() || {};
+      renderListingsFeed(merged, ratings2);
+
+      // Only appraise items we have not rated yet
+      var unrated = trulyNew.filter(function(l) { return !ratings2[l.id]; });
+      if (unrated.length > 0) autoAppraise(unrated);
+
+      if (trulyNew.length > 0) toast('✨ ' + trulyNew.length + ' new listing' + (trulyNew.length > 1 ? 's' : '') + ' found');
+    })
+    .catch(function(err) {
+      var icon = document.getElementById('refreshIcon');
+      var btn = document.getElementById('refreshBtn');
+      if (icon) icon.className = '';
+      if (btn) btn.style.opacity = '1';
+      if (!cached.length) document.getElementById('listingsFeed').innerHTML = '<div style="text-align:center;padding:60px 20px;color:var(--mu)"><div style="font-size:48px;margin-bottom:12px">❌</div><div>Could not load listings</div></div>';
+    });
 }
 
-// Run seed job every 2 days at 7am
-cron.schedule('0 7 */2 * *', () => {
-  runSeedJob().catch(e => console.error('[Seed] cron error:', e.message));
-});
+function saveLastFetchTime(iso) { try { localStorage.setItem('fr_last_fetch', iso); } catch(e) {} }
+function getLastFetchTime() { try { return localStorage.getItem('fr_last_fetch') || ''; } catch(e) { return ''; } }
 
-cron.schedule('0 3 * * *', () => pauseInactiveUsers().catch(e => console.error('[AutoPause]', e.message)));
-
-// ── Nightly DB stats rebuild + IQR outlier pass (2am AEST) ──
-// 1. Back-scores any unscored/changed listings with quality flags
-// 2. Runs per-keyword IQR pass to tag statistical outliers
-// 3. Rebuilds pre-computed stats tables so appraisals are instant
-cron.schedule('0 2 * * *', async () => {
-  console.log('[Cron] Starting nightly quality pass + stats rebuild...');
-  try {
-
-    // ── Step 1: Re-score listings flagged unscored or with stale quality ──
-    // Catches any listings written before quality scoring was added
-    await pool.query(`
-      UPDATE listings SET
-        quality_flags = (
-          CASE WHEN title ~* '\\m(broken|cracked|faulty|damaged|spares?|repairs?|parts? only|not working|dead|seized|blown|written off|wrecked|flood|hail|project car|needs work|as.?is)\\M' THEN 2 ELSE 0 END |
-          CASE WHEN title ~* '\\m(swap|swaps|trade|trades|pto|part trade|part swap)\\M'  THEN 4 ELSE 0 END |
-          CASE WHEN title ~* '\\m(follow|instagram|whatsapp|telegram|bit\\.ly|t\\.me)\\M' THEN 64 ELSE 0 END
-        ),
-        price_quality = CASE
-          WHEN title ~* '\\m(broken|cracked|faulty|damaged|spares?|repairs?|parts? only|not working|dead|seized|blown|written off|wrecked|flood|hail|project car|needs work|as.?is)\\M' THEN 'not_for_sale'
-          WHEN title ~* '\\m(swap|swaps|trade|trades|pto|part trade|part swap)\\M'  THEN 'not_for_sale'
-          WHEN title ~* '\\m(follow|instagram|whatsapp|telegram|bit\\.ly|t\\.me)\\M' THEN 'spam'
-          ELSE 'ok'
-        END,
-        in_price_pool = CASE
-          WHEN title ~* '\\m(broken|cracked|faulty|damaged|spares?|repairs?|parts? only|not working|dead|seized|blown|written off|wrecked|flood|hail|project car|needs work|as.?is)\\M' THEN FALSE
-          WHEN title ~* '\\m(swap|swaps|trade|trades|pto|part trade|part swap)\\M'  THEN FALSE
-          WHEN title ~* '\\m(follow|instagram|whatsapp|telegram|bit\\.ly|t\\.me)\\M' THEN FALSE
-          ELSE TRUE
-        END
-      WHERE price_quality = 'unscored' OR price_quality IS NULL
-    `);
-
-    // ── Step 2: IQR outlier pass — per keyword ─────────────
-    // Marks listings whose price falls outside p25-1.5*IQR .. p75+1.5*IQR as outliers
-    // This catches listings like "$50 iPhone 14 Pro" or "$200,000 Toyota Corolla"
-    await pool.query(`
-      WITH cohort_fences AS (
-        SELECT
-          keyword,
-          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price) AS p25,
-          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price) AS p75
-        FROM listings
-        WHERE keyword IS NOT NULL
-          AND price > 0 AND is_offer_price = FALSE
-          AND price_quality = 'ok'
-          AND is_active = TRUE
-          AND scraped_at > NOW() - INTERVAL '90 days'
-        GROUP BY keyword
-        HAVING COUNT(*) >= 8
-      )
-      UPDATE listings l SET
-        price_quality = 'outlier',
-        quality_flags = quality_flags | 8,
-        in_price_pool = FALSE
-      FROM cohort_fences f
-      WHERE l.keyword = f.keyword
-        AND l.price_quality = 'ok'
-        AND l.is_active = TRUE
-        AND (
-          l.price < GREATEST(0, f.p25 - 1.5 * (f.p75 - f.p25))
-          OR
-          l.price > f.p75 + 1.5 * (f.p75 - f.p25)
-        )
-    `);
-
-    // ── Step 3: IQR outlier pass — per vehicle cohort ──────
-    await pool.query(`
-      WITH vehicle_fences AS (
-        SELECT
-          make, model, year,
-          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price) AS p25,
-          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price) AS p75
-        FROM listings
-        WHERE make IS NOT NULL AND year IS NOT NULL
-          AND price > 0 AND is_offer_price = FALSE
-          AND price_quality = 'ok'
-          AND is_active = TRUE
-        GROUP BY make, model, year
-        HAVING COUNT(*) >= 8
-      )
-      UPDATE listings l SET
-        price_quality = 'outlier',
-        quality_flags = quality_flags | 8,
-        in_price_pool = FALSE
-      FROM vehicle_fences f
-      WHERE l.make = f.make
-        AND (l.model = f.model OR (l.model IS NULL AND f.model IS NULL))
-        AND l.year = f.year
-        AND l.price_quality = 'ok'
-        AND l.is_active = TRUE
-        AND (
-          l.price < GREATEST(0, f.p25 - 1.5 * (f.p75 - f.p25))
-          OR
-          l.price > f.p75 + 1.5 * (f.p75 - f.p25)
-        )
-    `);
-
-    // ── Step 4: Rebuild keyword_price_stats with IQR data ──
-    // GENERAL GOODS ONLY — vehicles have their own vehicle_price_stats table.
-    // Also normalise known keyword typos before grouping.
-    await pool.query(`
-      UPDATE listings SET keyword = 'holden commodore'
-      WHERE keyword = 'holden comodore'
-    `);
-    await pool.query(`
-      INSERT INTO keyword_price_stats
-        (keyword, sample_count, raw_count, median_price, p25_price, p75_price,
-         iqr, floor_price, ceiling_price, low_price, high_price, updated_at)
-      WITH base AS (
-        SELECT keyword,
-          COUNT(*)::INT AS raw_count,
-          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
-          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
-        FROM listings
-        WHERE keyword IS NOT NULL AND price > 0
-          AND category = 'general'
-          AND is_offer_price = FALSE AND in_price_pool = TRUE AND is_active = TRUE
-          AND scraped_at > NOW() - INTERVAL '90 days'
-        GROUP BY keyword HAVING COUNT(*) >= 5
-      ),
-      fenced AS (
-        SELECT l.keyword,
-          b.raw_count,
-          b.p25, b.p75,
-          (b.p75 - b.p25)                               AS iqr,
-          GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))::INT  AS fence_lo,
-          (b.p75 + 1.5*(b.p75-b.p25))::INT             AS fence_hi,
-          COUNT(*)::INT                                 AS clean_count,
-          PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT AS median,
-          MIN(l.price)::INT                             AS low,
-          MAX(l.price)::INT                             AS high
-        FROM listings l JOIN base b ON l.keyword = b.keyword
-        WHERE l.price BETWEEN GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))
-                          AND (b.p75 + 1.5*(b.p75-b.p25))
-          AND l.category = 'general'
-          AND l.is_offer_price = FALSE AND l.in_price_pool = TRUE
-          AND l.is_active = TRUE
-          AND l.scraped_at > NOW() - INTERVAL '90 days'
-        GROUP BY l.keyword, b.raw_count, b.p25, b.p75
-        HAVING COUNT(*) >= 5
-      )
-      SELECT keyword, clean_count, raw_count, median, p25, p75,
-             iqr::INT, fence_lo, fence_hi, low, high, NOW()
-      FROM fenced
-      ON CONFLICT (keyword) DO UPDATE SET
-        sample_count  = EXCLUDED.sample_count,
-        raw_count     = EXCLUDED.raw_count,
-        median_price  = EXCLUDED.median_price,
-        p25_price     = EXCLUDED.p25_price,
-        p75_price     = EXCLUDED.p75_price,
-        iqr           = EXCLUDED.iqr,
-        floor_price   = EXCLUDED.floor_price,
-        ceiling_price = EXCLUDED.ceiling_price,
-        low_price     = EXCLUDED.low_price,
-        high_price    = EXCLUDED.high_price,
-        updated_at    = NOW()
-    `);
-
-    // ── Step 5: Rebuild vehicle_price_stats — keyed by precise cohort ──
-    // Groups by every identity dimension, building one row per unique cohort.
-    // cohort_key = make|model|series|variant|year_band|mileage_band|transmission
-    await pool.query(`
-      INSERT INTO vehicle_price_stats
-        (cohort_key, make, model, series, variant, body_style,
-         year_band, mileage_band, transmission,
-         sample_count, raw_count,
-         median_price, p25_price, p75_price,
-         iqr, floor_price, ceiling_price, updated_at)
-      WITH raw_cohorts AS (
-        SELECT
-          LOWER(make)
-            || '|' || LOWER(COALESCE(model,''))
-            || '|' || LOWER(COALESCE(series,''))
-            || '|' || LOWER(COALESCE(variant,''))
-            || '|' || COALESCE(year_band,'unknown')
-            || '|' || COALESCE(mileage_band,'unknown')
-            || '|' || LOWER(COALESCE(transmission,''))   AS cohort_key,
-          make, COALESCE(model,'') AS model,
-          series, variant, body_style,
-          year_band, mileage_band, transmission,
-          COUNT(*)::INT AS raw_count,
-          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
-          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
-        FROM listings
-        WHERE make IS NOT NULL AND year_band IS NOT NULL
-          AND kms IS NOT NULL AND kms > 0
-          AND mileage_band IS NOT NULL AND mileage_band != 'unknown'
-          AND price > 0 AND is_offer_price = FALSE
-          AND in_price_pool = TRUE
-          AND listing_status IN ('active','sold')
-        GROUP BY cohort_key, make, COALESCE(model,''), series, variant,
-                 body_style, year_band, mileage_band, transmission
-        HAVING COUNT(*) >= 5
-      ),
-      fenced AS (
-        SELECT
-          rc.cohort_key, rc.make, rc.model, rc.series, rc.variant,
-          rc.body_style, rc.year_band, rc.mileage_band, rc.transmission,
-          rc.raw_count,
-          (rc.p75 - rc.p25)                                AS iqr,
-          GREATEST(0, rc.p25 - 1.5*(rc.p75-rc.p25))::INT  AS fence_lo,
-          (rc.p75 + 1.5*(rc.p75-rc.p25))::INT             AS fence_hi,
-          COUNT(l.id)::INT                                 AS clean_count,
-          PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT AS median,
-          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT AS p25_clean,
-          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT AS p75_clean
-        FROM listings l
-        JOIN raw_cohorts rc ON (
-          LOWER(l.make) = LOWER(rc.make)
-          AND COALESCE(l.model,'') = rc.model
-          AND COALESCE(l.series,'')       = COALESCE(rc.series,'')
-          AND COALESCE(l.variant,'')      = COALESCE(rc.variant,'')
-          AND COALESCE(l.year_band,'unknown')    = COALESCE(rc.year_band,'unknown')
-          AND COALESCE(l.mileage_band,'unknown') = COALESCE(rc.mileage_band,'unknown')
-          AND COALESCE(l.transmission,'')        = COALESCE(rc.transmission,'')
-        )
-        WHERE l.price BETWEEN GREATEST(0, rc.p25 - 1.5*(rc.p75-rc.p25))
-                          AND (rc.p75 + 1.5*(rc.p75-rc.p25))
-          AND l.is_offer_price = FALSE
-          AND l.in_price_pool = TRUE
-          AND l.listing_status IN ('active','sold')
-        GROUP BY rc.cohort_key, rc.make, rc.model, rc.series, rc.variant,
-                 rc.body_style, rc.year_band, rc.mileage_band, rc.transmission,
-                 rc.raw_count, rc.p25, rc.p75
-        HAVING COUNT(l.id) >= 5
-      )
-      SELECT cohort_key, make, model, series, variant, body_style,
-             year_band, mileage_band, transmission,
-             clean_count, raw_count,
-             median, p25_clean, p75_clean,
-             iqr::INT, fence_lo, fence_hi, NOW()
-      FROM fenced
-      ON CONFLICT (cohort_key) DO UPDATE SET
-        sample_count  = EXCLUDED.sample_count,
-        raw_count     = EXCLUDED.raw_count,
-        median_price  = EXCLUDED.median_price,
-        p25_price     = EXCLUDED.p25_price,
-        p75_price     = EXCLUDED.p75_price,
-        iqr           = EXCLUDED.iqr,
-        floor_price   = EXCLUDED.floor_price,
-        ceiling_price = EXCLUDED.ceiling_price,
-        updated_at    = NOW()
-    `);
-
-    // ── Step 6: Mark gone listings as sold (not inactive) ──
-    // Listings not seen in 30 days assumed sold — price stays in pool
-    const sold = await pool.query(`
-      UPDATE listings
-      SET listing_status = 'sold',
-          is_active      = FALSE
-      WHERE last_seen_at < NOW() - INTERVAL '30 days'
-        AND listing_status = 'active'
-        AND is_active = TRUE
-      RETURNING id
-    `);
-
-    // ── Step 7: Report ─────────────────────────────────────
-    const [summary, outlierCount, poolCount] = await Promise.all([
-      getDBSummary(),
-      pool.query(`SELECT COUNT(*)::INT AS cnt FROM listings WHERE price_quality = 'outlier'`),
-      pool.query(`SELECT COUNT(*)::INT AS cnt FROM listings WHERE in_price_pool = TRUE AND is_active = TRUE`),
-    ]);
-    const soldCount = await pool.query(`SELECT COUNT(*)::INT AS cnt FROM listings WHERE listing_status='sold'`);
-    console.log(
-      `[Cron] Done. Total: ${summary?.total_listings} listings · ` +
-      `In price pool: ${poolCount.rows[0].cnt} · ` +
-      `Outliers tagged: ${outlierCount.rows[0].cnt} · ` +
-      `Marked sold: ${sold.rowCount} · ` +
-      `Total sold in DB: ${soldCount.rows[0].cnt}`
-    );
-  } catch (e) {
-    console.error('[Cron] Stats rebuild error:', e.message);
-  }
-});
-
-// ── Boot: load all watches from Redis ─────────────────────
-async function loadAllWatches() {
-  // Resolve owner userId so watcher-level plan checks work
-  const ownerUid = await redisGet(K.emailIdx(OWNER_EMAIL));
-  if (ownerUid) { ownerUserId = ownerUid; console.log(`[Boot] Owner account resolved: ${ownerUid}`); }
-
-  const allIds = await redisGet('fr:all-watch-ids') || [];
-  const watches = await Promise.all(allIds.map(getWatch));
-  watchlist = watches.filter(Boolean);
-  console.log(`[Boot] Loaded ${watchlist.length} watch(es)`);
-  watchlist.forEach(w => { if (!w.paused) startWatchTimer(w); });
-}
-
-async function addToGlobalWatchIndex(watchId) {
-  const ids = await redisGet('fr:all-watch-ids') || [];
-  if (!ids.includes(watchId)) ids.push(watchId);
-  await redisSet('fr:all-watch-ids', ids);
-}
-async function removeFromGlobalWatchIndex(watchId) {
-  const ids = await redisGet('fr:all-watch-ids') || [];
-  await redisSet('fr:all-watch-ids', ids.filter(id => id !== watchId));
-}
-
-// Keep Render awake
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
-if (SELF_URL) {
-  setInterval(() => axios.get(SELF_URL + '/').catch(() => {}), 14 * 60 * 1000);
-}
-
-// ── Routes ────────────────────────────────────────────────
-app.get('/', async (req, res) => {
-  const dbSummary = await getDBSummary().catch(() => null);
-  res.json({
-    status:   'ok',
-    redis:    REDIS_URL ? 'connected' : 'not set',
-    database: DATABASE_URL ? 'connected' : 'not set',
-    db: dbSummary ? {
-      totalListings:    dbSummary.total_listings,
-      activeListings:   dbSummary.active_listings,
-      uniqueKeywords:   dbSummary.unique_keywords,
-      uniqueMakes:      dbSummary.unique_makes,
-      lastScraped:      dbSummary.last_scraped,
-    } : null,
-    watches:  watchlist.length,
-    timers:   Object.keys(watchTimers).length,
-    lastScan: lastScanTime,
-    lastScanNewListings: lastScanCount,
+// Cache listings in localStorage
+function saveCachedListings(items) {
+  // Deduplicate by ID before saving
+  var seen = {};
+  var deduped = items.filter(function(l) {
+    if (seen[l.id]) return false;
+    seen[l.id] = true;
+    return true;
   });
-});
-
-// GET /db/stats — detailed database statistics (owner-gated)
-app.get('/db/stats', authMiddleware, async (req, res) => {
-  try {
-    const user = await getUser(req.userId);
-    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
-
-    const [summary, topKeywords, topMakes, recentActivity] = await Promise.all([
-      getDBSummary(),
-      pool.query(`
-        SELECT keyword, sample_count, median_price, p25_price, p75_price, updated_at
-        FROM keyword_price_stats
-        ORDER BY sample_count DESC LIMIT 20
-      `),
-      pool.query(`
-        SELECT make, COUNT(*)::INT AS count, AVG(price)::INT AS avg_price,
-               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
-        FROM listings
-        WHERE make IS NOT NULL AND price > 0 AND is_offer_price = FALSE
-        GROUP BY make ORDER BY count DESC LIMIT 15
-      `),
-      pool.query(`
-        SELECT DATE(scraped_at) AS day, COUNT(*)::INT AS listings_scraped
-        FROM listings
-        WHERE scraped_at > NOW() - INTERVAL '14 days'
-        GROUP BY day ORDER BY day DESC
-      `),
-    ]);
-
-    res.json({
-      summary,
-      topKeywords:    topKeywords.rows,
-      topVehicleMakes: topMakes.rows,
-      dailyActivity:  recentActivity.rows,
-    });
-  } catch (e) {
-    console.error('[DB/stats]', e.message);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// GET /db/comparables?keyword=ps5&limit=20 — raw comparables for a keyword
-app.get('/db/comparables', authMiddleware, async (req, res) => {
-  try {
-    const { keyword, limit } = req.query;
-    if (!keyword) return res.status(400).json({ error: 'keyword required' });
-    const rows = await getDBComparables(keyword, parseInt(limit) || 20);
-    res.json({ keyword, count: rows.length, comparables: rows });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// GET /db/prices?keyword=hilux — price stats for a keyword
-app.get('/db/prices', authMiddleware, async (req, res) => {
-  try {
-    const { keyword, make, model, year, mileage } = req.query;
-    if (make && year) {
-      const stats = await getDBVehicleStats(make, model, parseInt(year), mileage ? parseInt(mileage) : null);
-      return res.json({ found: !!stats, type: 'vehicle', ...stats });
-    }
-    if (!keyword) return res.status(400).json({ error: 'keyword or make+year required' });
-    const stats = await getDBPriceStats(keyword);
-    res.json({ found: !!stats, type: 'keyword', ...stats });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// ── Auth routes ───────────────────────────────────────────
-app.post('/auth/signup', async (req, res) => {
-  try {
-    const { email, password, name } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    const existing = await getUserByEmail(email);
-    if (existing) return res.status(409).json({ error: 'An account already exists for this email' });
-    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const verifyCode   = String(Math.floor(100000 + Math.random() * 900000));
-    const user = {
-      id: uuidv4(),
-      email: email.toLowerCase().trim(),
-      name:  (name || email.split('@')[0]).trim(),
-      passwordHash,
-      createdAt:     new Date().toISOString(),
-      lastSeen:      new Date().toISOString(),
-      plan:          'basic',
-      emailVerified: false,
-      verifyCode,
-      verifyExpiry:  new Date(Date.now() + 15 * 60 * 1000).toISOString(),
-    };
-    await saveUser(user);
-    await redisSet(K.emailIdx(user.email), user.id);
-    const token = makeToken(user.id);
-    console.log(`[Auth] Signup: ${user.email}`);
-    verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Verify failed:', e.message));
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user), emailVerified: false } });
-  } catch (e) { console.error('[Signup]', e.message); res.status(500).json({ error: 'Server error' }); }
-});
-
-app.post('/auth/verify-email', authMiddleware, async (req, res) => {
-  try {
-    const { code } = req.body;
-    if (!code) return res.status(400).json({ error: 'Verification code required' });
-    const user = await getUser(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
-    if (!user.verifyCode || user.verifyCode !== String(code).trim())
-      return res.status(400).json({ error: 'Incorrect code. Please check your email and try again.' });
-    if (new Date(user.verifyExpiry) < new Date())
-      return res.status(400).json({ error: 'Code expired. Request a new one.' });
-    user.emailVerified = true;
-    delete user.verifyCode;
-    delete user.verifyExpiry;
-    await saveUser(user);
-    console.log(`[Auth] Email verified: ${user.email}`);
-    welcomeEmail(user.name, user.email).catch(e => console.error('[Email] Welcome failed:', e.message));
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-app.post('/auth/resend-verify', authMiddleware, async (req, res) => {
-  try {
-    const user = await getUser(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
-    const verifyCode  = String(Math.floor(100000 + Math.random() * 900000));
-    user.verifyCode   = verifyCode;
-    user.verifyExpiry = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-    await saveUser(user);
-    verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Resend verify failed:', e.message));
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-app.post('/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    const user = await getUserByEmail(email);
-    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
-    const match = await bcrypt.compare(password, user.passwordHash);
-    if (!match) return res.status(401).json({ error: 'Invalid email or password' });
-    user.lastSeen = new Date().toISOString();
-    await saveUser(user);
-    const token = makeToken(user.id);
-    console.log(`[Auth] Login: ${user.email}`);
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user) } });
-  } catch (e) { console.error('[Login]', e.message); res.status(500).json({ error: 'Server error' }); }
-});
-
-app.post('/auth/ping', authMiddleware, async (req, res) => {
-  try {
-    const user = await getUser(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    user.lastSeen = new Date().toISOString();
-    await saveUser(user);
-    let resumed = 0;
-    const userWatches = watchlist.filter(w => w.userId === req.userId && w.paused);
-    for (const w of userWatches) {
-      w.paused = false;
-      await saveWatch(w);
-      startWatchTimer(w);
-      resumed++;
-    }
-    if (resumed > 0) console.log(`[Ping] Resumed ${resumed} watch(es) for ${user.email}`);
-    res.json({ ok: true, lastSeen: user.lastSeen, resumed });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-app.get('/auth/me', authMiddleware, async (req, res) => {
-  try {
-    const user = await getUser(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user), lastSeen: user.lastSeen });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// ── Watchlist routes ──────────────────────────────────────
-app.get('/watchlist', authMiddleware, async (req, res) => {
-  try {
-    const watches = await getUserWatches(req.userId);
-    res.json(watches);
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-app.post('/watchlist', authMiddleware, async (req, res) => {
-  try {
-    const { keyword, maxPrice, minPrice, pushoverToken, pushoverUser, plan, name, speed } = req.body;
-    if (!keyword || keyword.trim().length < 2)
-      return res.status(400).json({ error: 'Keyword required' });
-    const user = await getUser(req.userId);
-    const planLimit = PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)];
-    const existingWatches = await getUserWatches(req.userId);
-    if (!isOwner(user) && existingWatches.length >= planLimit)
-      return res.status(403).json({ error: 'Watchlist limit reached for your plan', plan: getEffectivePlan(user), limit: planLimit });
-    const watchPlan = plan || (speed === 'premium' ? 'premium' : 'basic');
-    const rawExclude = req.body.excludeWords || [];
-    const excludeWords = Array.isArray(rawExclude)
-      ? rawExclude.map(w => w.toLowerCase().trim()).filter(Boolean)
-      : [];
-
-    const item = {
-      id: uuidv4(),
-      userId:   req.userId,
-      keyword:  keyword.trim().toLowerCase(),
-      name:     name || keyword.trim(),
-      maxPrice: maxPrice ? parseInt(maxPrice) : null,
-      minPrice: minPrice ? parseInt(minPrice) : null,
-      location: req.body.location || null,
-      lat:      req.body.lat    ? parseFloat(req.body.lat)  : null,
-      lng:      req.body.lng    ? parseFloat(req.body.lng)  : null,
-      radius:   req.body.radius ? parseInt(req.body.radius) : 50,
-      plan:     watchPlan,
-      pushoverToken: pushoverToken || null,
-      pushoverUser:  pushoverUser  || null,
-      excludeWords,
-      // Vehicle-specific filters
-      minYear:       req.body.minYear       ? parseInt(req.body.minYear)       : null,
-      maxYear:       req.body.maxYear       ? parseInt(req.body.maxYear)       : null,
-      minKms:        req.body.minKms        ? parseInt(req.body.minKms)        : null,
-      maxKms:        req.body.maxKms        ? parseInt(req.body.maxKms)        : null,
-      transmission:  req.body.transmission  ? req.body.transmission.trim()     : null, // 'auto', 'manual', or null
-      paused:    false,
-      addedAt:   new Date().toISOString(),
-      lastScanned: null,
-    };
-    await saveWatch(item);
-    await addWatchId(req.userId, item.id);
-    await addToGlobalWatchIndex(item.id);
-    watchlist.push(item);
-    startWatchTimer(item);
-    console.log(`[Watch] Added "${item.keyword}" for user ${req.userId}`);
-    res.json(item);
-    // Initial backfill — runs once when watch is added
-    scanWatchItem(item, { initialScan: true })
-      .then(n => console.log(`[InitialScan] "${item.keyword}" → ${n} listing(s)`))
-      .catch(e => console.error(`[InitialScan] Error:`, e.message));
-  } catch (e) { console.error('[AddWatch]', e.message); res.status(500).json({ error: 'Server error' }); }
-});
-
-// PATCH /watchlist/:id — update watch filters
-app.patch('/watchlist/:id', authMiddleware, async (req, res) => {
-  try {
-    const watch = await getWatch(req.params.id);
-    if (!watch || watch.userId !== req.userId)
-      return res.status(404).json({ error: 'Not found' });
-
-    const { excludeWords, minYear, maxYear, minKms, maxKms, transmission, minPrice, maxPrice } = req.body;
-
-    if (Array.isArray(excludeWords))
-      watch.excludeWords = excludeWords.map(w => w.toLowerCase().trim()).filter(Boolean);
-    if (minPrice  !== undefined) watch.minPrice  = minPrice  ? parseInt(minPrice)  : null;
-    if (maxPrice  !== undefined) watch.maxPrice  = maxPrice  ? parseInt(maxPrice)  : null;
-    if (minYear   !== undefined) watch.minYear   = minYear   ? parseInt(minYear)   : null;
-    if (maxYear   !== undefined) watch.maxYear   = maxYear   ? parseInt(maxYear)   : null;
-    if (minKms    !== undefined) watch.minKms    = minKms    ? parseInt(minKms)    : null;
-    if (maxKms    !== undefined) watch.maxKms    = maxKms    ? parseInt(maxKms)    : null;
-    if (transmission !== undefined) watch.transmission = transmission ? transmission.trim() : null;
-
-    await saveWatch(watch);
-    const idx = watchlist.findIndex(w => w.id === req.params.id);
-    if (idx !== -1) watchlist[idx] = { ...watchlist[idx], ...watch };
-
-    res.json({ ok: true, watch });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-app.delete('/watchlist/:id', authMiddleware, async (req, res) => {
-  try {
-    const watch = await getWatch(req.params.id);
-    if (!watch || watch.userId !== req.userId)
-      return res.status(404).json({ error: 'Not found' });
-    const keyword = watch.keyword;
-    stopWatchTimer(req.params.id);
-    await deleteWatch(req.params.id);
-    await removeWatchId(req.userId, req.params.id);
-    await removeFromGlobalWatchIndex(req.params.id);
-    watchlist = watchlist.filter(w => w.id !== req.params.id);
-
-    // Clear blocked listings for this keyword so they show fresh if re-added
-    const blocked = await redisGet(K.blocked(req.userId)) || [];
-    const remaining = blocked.filter(l => l.keyword !== keyword);
-    await redisSet(K.blocked(req.userId), remaining);
-
-    // Clear seen cache entries for this keyword so re-adding starts truly fresh
-    const seen = await getUserSeen(req.userId);
-    const prefix = `${keyword}:`;
-    const prunedSeen = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
-    await saveUserSeen(req.userId, prunedSeen, { merge: false }); // replace — we're removing entries
-    const clearedSeen = Object.keys(seen).length - Object.keys(prunedSeen).length;
-    console.log(`[Watch] Deleted "${keyword}" — cleared ${blocked.length - remaining.length} blocked, ${clearedSeen} seen entries`);
-
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// ── Listings routes ───────────────────────────────────────
-app.get('/listings', authMiddleware, async (req, res) => {
-  try {
-    const { keyword, since } = req.query;
-    let result = await getUserListings(req.userId);
-    if (keyword) result = result.filter(l => l.keyword === keyword);
-    if (since) {
-      const sinceMs = new Date(since).getTime();
-      if (!isNaN(sinceMs)) result = result.filter(l => new Date(l.foundAt).getTime() > sinceMs);
-    }
-    result = [...result].sort((a, b) => {
-        // Push listings with unknown dates to the bottom
-        return new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt);
-      });
-    res.json(result);
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-app.delete('/listings', authMiddleware, async (req, res) => {
-  try {
-    await saveUserListings(req.userId, []);
-    await saveUserSeen(req.userId, {}, { merge: false }); // full reset — replace, don't merge
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// GET /listings/blocked — get listings that were filtered out
-app.get('/listings/blocked', authMiddleware, async (req, res) => {
-  try {
-    const blocked = await redisGet(K.blocked(req.userId)) || [];
-    res.json(blocked);
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// POST /listings/unblock — move a blocked listing back into the feed
-app.post('/listings/unblock', authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.body;
-    if (!id) return res.status(400).json({ error: 'id required' });
-    const blocked = await redisGet(K.blocked(req.userId)) || [];
-    const listing = blocked.find(l => l.id === id);
-    if (!listing) return res.status(404).json({ error: 'Not found' });
-    // Remove from blocked
-    await redisSet(K.blocked(req.userId), blocked.filter(l => l.id !== id));
-    // Add to user listings
-    const listings = await getUserListings(req.userId);
-    if (!listings.find(l => l.id === id)) {
-      listings.unshift({ ...listing, foundAt: new Date().toISOString() });
-      listings.sort((a, b) => {
-        // Push listings with unknown dates to the bottom
-        return new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt);
-      });
-      await saveUserListings(req.userId, listings);
-    }
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// POST /listings/remove — remove specific listings by ID (irrelevant ones flagged by AI)
-app.post('/listings/remove', authMiddleware, async (req, res) => {
-  try {
-    const { ids } = req.body;
-    if (!ids || !Array.isArray(ids)) return res.status(400).json({ error: 'ids array required' });
-    const listings = await getUserListings(req.userId);
-    const filtered = listings.filter(l => !ids.includes(l.id));
-    await saveUserListings(req.userId, filtered);
-    // Don't mark as permanently seen — if user re-adds the keyword they should see fresh listings
-    console.log(`[Filter] Removed ${ids.length} irrelevant listing(s) for user ${req.userId}`);
-    res.json({ ok: true, removed: ids.length });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// ── Price cache route — lets frontend check own scan history before triggering AI ──
-app.get('/prices', authMiddleware, async (req, res) => {
-  try {
-    const { keyword } = req.query;
-    if (!keyword) return res.status(400).json({ error: 'keyword required' });
-    const priceData = await getPriceCacheForKeyword(keyword);
-    console.log('[Prices] Result for', keyword, ':', priceData ? 'found (' + priceData.count + ' prices, median $' + priceData.median + ')' : 'not found');
-    if (!priceData) return res.json({ found: false, keyword });
-    res.json({ found: true, keyword, ...priceData });
-  } catch (e) { console.error('[Prices] Error:', e.message); res.status(500).json({ error: 'Server error' }); }
-});
-
-// GET /prices/vehicle?make=Toyota&model=Camry&year=2019&mileage=72000
-// Returns VPX market stats for a specific vehicle cohort
-app.get('/prices/vehicle', authMiddleware, async (req, res) => {
-  try {
-    const { make, model, year, mileage } = req.query;
-    if (!make || !year) return res.status(400).json({ error: 'make and year required' });
-    const resolvedModel = model || null;
-    const stats = await getDBVehicleStats(make, resolvedModel, parseInt(year), mileage ? parseInt(mileage) : null);
-    if (!stats) return res.json({ found: false, make, model, year });
-    res.json({ found: true, ...stats });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// ── Appraisal route — limit check only, always defers to AI ──
-// POST /appraise  { keyword, price }
-app.post('/appraise', authMiddleware, async (req, res) => {
-  try {
-    const { keyword, price } = req.body;
-    if (!keyword || !price) return res.status(400).json({ error: 'keyword and price required' });
-    const user = await _getUserCached(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    const today = new Date().toISOString().slice(0, 10);
-    if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
-    const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
-    if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
-      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
-    res.json({ found: false, usedCache: false });
-  } catch (e) { console.error('[Appraise]', e.message); res.status(500).json({ error: 'Server error' }); }
-});
-
-// ── Misc routes ───────────────────────────────────────────
-app.get('/proxy-image', async (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).json({ error: 'url required' });
-  try {
-    const response = await axios.get(url, {
-      responseType: 'arraybuffer', timeout: 10000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
-        'Referer': 'https://www.facebook.com/'
-      }
-    });
-    res.json({
-      base64: Buffer.from(response.data).toString('base64'),
-      mediaType: response.headers['content-type'] || 'image/jpeg'
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/scan/now', authMiddleware, async (req, res) => {
-  res.json({ ok: true, message: 'Scan started' });
-  const watches = watchlist.filter(w => w.userId === req.userId && !w.paused);
-  for (const w of watches) {
-    await scanWatchItem(w).catch(e => console.error(`[Scan/now]`, e.message));
-    await sleep(500);
-  }
-});
-
-app.post('/scan/test', async (req, res) => {
-  const { keyword } = req.body;
-  if (!keyword) return res.status(400).json({ error: 'keyword required' });
-  try {
-    const found = await scrapeKeyword(keyword, {});
-    res.json({ keyword, count: found.length, listings: found });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Stripe routes ─────────────────────────────────────────
-app.post('/stripe/create-checkout', authMiddleware, async (req, res) => {
-  try {
-    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
-    const { priceId } = req.body;
-    if (!priceId || !Object.values(PRICE_IDS).includes(priceId))
-      return res.status(400).json({ error: 'Invalid price' });
-    const user = await getUser(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      payment_method_types: ['card'],
-      line_items: [{ price: priceId, quantity: 1 }],
-      success_url: 'https://flip-radar.app?upgraded=1',
-      cancel_url:  'https://flip-radar.app?cancelled=1',
-      customer_email: user.email,
-      metadata: { userId: user.id, priceId },
-      subscription_data: { metadata: { userId: user.id, priceId } },
-    });
-    res.json({ url: session.url });
-  } catch (e) { console.error('[Stripe] Checkout error:', e.message); res.status(500).json({ error: e.message }); }
-});
-
-app.post('/stripe/create-intent', authMiddleware, async (req, res) => {
-  try {
-    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
-    const { priceId } = req.body;
-    if (!priceId || !Object.values(PRICE_IDS).includes(priceId))
-      return res.status(400).json({ error: 'Invalid price' });
-    const user = await getUser(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    let customerId = user.stripeCustomerId;
-    if (!customerId) {
-      const customer = await stripe.customers.create({ email: user.email, name: user.name, metadata: { userId: user.id } });
-      customerId = customer.id;
-      user.stripeCustomerId = customerId;
-      await saveUser(user);
-    }
-    const subscription = await stripe.subscriptions.create({
-      customer: customerId,
-      items: [{ price: priceId }],
-      payment_behavior: 'default_incomplete',
-      payment_settings: { save_default_payment_method: 'on_subscription' },
-      expand: ['latest_invoice.payment_intent'],
-      metadata: { userId: user.id, priceId },
-    });
-    const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
-    res.json({ clientSecret, subscriptionId: subscription.id });
-  } catch (e) { console.error('[Stripe] Intent error:', e.message); res.status(500).json({ error: e.message }); }
-});
-
-app.post('/stripe/portal', authMiddleware, async (req, res) => {
-  try {
-    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
-    const user = await getUser(req.userId);
-    if (!user || !user.stripeCustomerId) return res.status(400).json({ error: 'No subscription found' });
-    const session = await stripe.billingPortal.sessions.create({
-      customer: user.stripeCustomerId,
-      return_url: 'https://flip-radar.app',
-    });
-    res.json({ url: session.url });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.json({ ok: true });
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
-  } catch (e) { console.error('[Stripe] Webhook sig failed:', e.message); return res.status(400).send('Webhook Error'); }
-  try {
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
-      const userId  = session.metadata?.userId;
-      const priceId = session.metadata?.priceId;
-      if (userId && priceId) {
-        const user = await getUser(userId);
-        if (user) {
-          user.plan = PRICE_TO_PLAN[priceId] || 'basic';
-          user.stripeCustomerId     = session.customer;
-          user.stripeSubscriptionId = session.subscription;
-          await saveUser(user);
-          console.log(`[Stripe] Upgraded ${user.email} to ${user.plan}`);
-        }
-      }
-    }
-    if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.paused') {
-      const sub    = event.data.object;
-      const userId = sub.metadata?.userId;
-      if (userId) {
-        const user = await getUser(userId);
-        if (user) {
-          user.plan = 'free';
-          user.stripeSubscriptionId = null;
-          await saveUser(user);
-          console.log(`[Stripe] Downgraded ${user.email} to free`);
-        }
-      }
-    }
-  } catch (e) { console.error('[Stripe] Webhook handler error:', e.message); }
-  res.json({ received: true });
-});
-
-app.get('/auth/plan', authMiddleware, async (req, res) => {
-  try {
-    const user = await getUser(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    const today    = new Date().toISOString().slice(0, 10);
-    const appraised = user.appraisalDate === today ? (user.appraisalsToday || 0) : 0;
-    const limit     = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
-    res.json({
-      plan: getEffectivePlan(user),
-      appraisalsUsedToday: appraised,
-      appraisalsLimit:     limit === Infinity ? -1 : limit,
-      watchlistLimit:      PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
-    });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// GET /onboarding — tells the frontend what state the user is in
-// Used to show/hide onboarding screen and tips
-app.get('/onboarding', authMiddleware, async (req, res) => {
-  try {
-    const user    = await getUser(req.userId);
-    const watches = await getUserWatches(req.userId);
-    const listings = await getUserListings(req.userId);
-    res.json({
-      hasWatches:    watches.length > 0,
-      watchCount:    watches.length,
-      hasListings:   listings.length > 0,
-      listingCount:  listings.length,
-      plan:          getEffectivePlan(user),
-      watchLimit:    PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
-      // Steps completed
-      steps: {
-        addedWatch:    watches.length > 0,
-        gotListings:   listings.length > 0,
-        usedAppraisal: (user.appraisalsToday || 0) > 0 || user.appraisalDate != null,
-      },
-    });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// GET /listings/price-drops — listings that have dropped in price recently
-app.get('/listings/price-drops', authMiddleware, async (req, res) => {
-  try {
-    const listings = await getUserListings(req.userId);
-    const drops = listings.filter(l => l.priceDropped && l.previousPrice);
-    res.json(drops);
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-app.post('/auth/appraisal', authMiddleware, async (req, res) => {
-  try {
-    const cr = await consumeAppraisal(req.userId);
-    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
-    res.json({ ok: true, used: cr.used, limit: cr.limit });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// ── Web Push notification sender ─────────────────────────
-async function sendWebPush(userId, payload) {
-  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
-  try {
-    const subs = await redisGet(K_push(userId));
-    if (!subs || !subs.length) return;
-    webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
-    const msg = JSON.stringify(payload);
-    const results = await Promise.allSettled(
-      subs.map(sub => webpush.sendNotification(sub, msg))
-    );
-    // Remove expired/invalid subscriptions
-    const valid = subs.filter((_, i) => results[i].status === 'fulfilled');
-    if (valid.length !== subs.length) await redisSet(K_push(userId), valid);
-  } catch (e) {
-    console.error('[WebPush] Error:', e.message);
-  }
+  try { localStorage.setItem('fr_feed', JSON.stringify(deduped)); } catch(e) {}
+}
+function getCachedListings() {
+  try { return JSON.parse(localStorage.getItem('fr_feed') || '[]'); } catch(e) { return []; }
 }
 
-// POST /push/subscribe — save user's push subscription
-app.post('/push/subscribe', authMiddleware, async (req, res) => {
-  try {
-    const { subscription } = req.body;
-    if (!subscription || !subscription.endpoint) return res.status(400).json({ error: 'subscription required' });
-    const subs = await redisGet(K_push(req.userId)) || [];
-    // Avoid duplicates
-    const exists = subs.find(s => s.endpoint === subscription.endpoint);
-    if (!exists) {
-      subs.push(subscription);
-      await redisSet(K_push(req.userId), subs);
-    }
-    console.log(`[WebPush] Subscribed user ${req.userId}`);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
+// Cache AI ratings in localStorage
+function saveCachedRatings(ratingMap) {
+  try { localStorage.setItem('fr_ratings', JSON.stringify(ratingMap)); } catch(e) {}
+}
+function getCachedRatings() {
+  try { return JSON.parse(localStorage.getItem('fr_ratings') || 'null'); } catch(e) { return null; }
+}
 
-// DELETE /push/subscribe — remove subscription
-app.delete('/push/subscribe', authMiddleware, async (req, res) => {
-  try {
-    const { endpoint } = req.body;
-    const subs = await redisGet(K_push(req.userId)) || [];
-    await redisSet(K_push(req.userId), subs.filter(s => s.endpoint !== endpoint));
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
+// Auto refresh every 30 mins
+var _feedRefreshTimer = null;
+var _lastFeedFetch = 0;
+var FEED_REFRESH_INTERVAL = 60 * 1000; // check every 60 seconds for new listings
 
-// GET /push/vapid-key — gives frontend the public key to subscribe with
-app.get('/push/vapid-key', (req, res) => {
-  if (!VAPID_PUBLIC_KEY) return res.status(500).json({ error: 'Push not configured' });
-  res.json({ publicKey: VAPID_PUBLIC_KEY });
-});
+function refreshListingsIfStale() {
+  // Always show cached immediately
+  var cached = getCachedListings();
+  var ratings = getCachedRatings();
+  if (cached.length) { renderFilterTabs(cached); renderListingsFeed(cached, ratings); }
+  // Always fetch fresh from backend
+  refreshListings();
+}
 
-// ── AI proxy routes — keys live on server, never in browser ──
-const GEMINI_API_KEY    = process.env.GEMINI_API_KEY    || null;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
+function startFeedAutoRefresh() {
+  if (_feedRefreshTimer) clearInterval(_feedRefreshTimer);
+  _feedRefreshTimer = setInterval(function() {
+    refreshListings();
+  }, FEED_REFRESH_INTERVAL);
+}
 
-// ── Web Push (VAPID) ──────────────────────────────────────
-const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
-const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
+function updateFeedLastUpdated() {
+  var el = document.getElementById('feedLastUpdated');
+  if (!el || !_lastFeedFetch) return;
+  var mins = Math.floor((Date.now() - _lastFeedFetch) / 60000);
+  el.textContent = mins === 0 ? 'Updated just now' : 'Updated ' + mins + 'm ago';
+}
+// Tick the "last updated" label every minute
+setInterval(updateFeedLastUpdated, 60000);
+startFeedAutoRefresh();
 
+// ── Service Worker + Web Push ─────────────────────────────
+// Registers SW and subscribes user to push notifications automatically
+// No setup needed by the user — just tap Allow when prompted
+function initWebPush() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+  var backendUrl = getBackendUrl();
+  if (!backendUrl) return;
 
-// Redis key for push subscriptions
-const K_push = userId => `fr:push:${userId}`;
+  // Register service worker
+  navigator.serviceWorker.register('/sw.js').then(function(reg) {
+    console.log('[SW] Registered');
 
-// POST /ai/vehicle — vehicle appraisal grounded in DB data when available
-// DB data is fetched FIRST so AI can reason from real market numbers.
-app.post('/ai/vehicle', authMiddleware, async (req, res) => {
-  try {
-    if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
+    // Get VAPID public key from backend
+    fetch(backendUrl + '/push/vapid-key').then(function(r) { return r.json(); }).then(function(d) {
+      if (!d.publicKey) return;
+      var publicKey = d.publicKey;
 
-    const { make, model, year, mileage, transmission, listingPrice, title, description,
-            imageUrl, imageBase64, imageMime, listingId, listingUrl } = req.body;
-    if (!listingPrice) return res.status(400).json({ error: 'listingPrice required' });
+      // Check current permission
+      if (Notification.permission === 'denied') return;
 
-    // ── Appraisal cache check — free hit, no point consumed ──
-    const keyword = req.body.keyword || [make, model, year].filter(Boolean).join(' ');
-    const cached  = await getAppraisalCache(listingId, title, listingPrice, keyword);
-    if (cached) {
-      console.log(`[AI/vehicle] Cache hit — skipping AI + appraisal deduction`);
-      return res.json({ ...cached, usedCache: true });
-    }
-
-    const cr = await consumeAppraisal(req.userId);
-    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
-
-    // ── Step 1: Fetch DB market data BEFORE building prompt ──
-    // Key change: DB data feeds INTO the prompt so AI reasons from
-    // real AU market numbers rather than training data alone.
-    const dbResult = (make && model && year)
-      ? await fetchBestVehiclePrice(make, model, year, mileage, {
-          series: req.body.series, variant: req.body.variant, transmission
-        }).catch(() => null)
-      : null;
-
-    const dbPreferred = dbResult && !dbResult.belowThreshold;
-    const dbAvailable = !!dbResult;
-
-    // ── Step 2: Fetch full listing details from SociaVault ──
-    let fullDescription = description || '';
-    let condition = null;
-    if (listingId || listingUrl) {
-      const details = await fetchListingDetails(listingId, listingUrl);
-      if (details) {
-        if (details.description && details.description.length > (fullDescription?.length || 0)) {
-          fullDescription = details.description;
-        }
-        condition = details.condition || null;
-        console.log(`[AI/vehicle] Fetched full details — desc: ${fullDescription.length} chars, condition: ${condition}`);
-      }
-    }
-
-    // ── Step 3: Build DB market context block ────────────────
-    // Injected into the prompt — AI uses these real numbers as its anchor.
-    let dbMarketContext = '';
-    if (dbAvailable && dbResult.marketMedian) {
-      const mb        = dbResult.mileageBand || 'unknown mileage range';
-      const yb        = dbResult.yearBand    || String(year);
-      const cohortStr = [make, model, dbResult.series, dbResult.variant].filter(Boolean).join(' ');
-      const listingMileageBand = mileage ? bandMileage(mileage) : null;
-      const mileageMismatch = listingMileageBand && dbResult.mileageBand && listingMileageBand !== dbResult.mileageBand;
-
-      if (dbPreferred) {
-        const consistency = dbResult.iqr && dbResult.marketMedian
-          ? (dbResult.iqr / dbResult.marketMedian < 0.2 ? 'tight, consistent market' : 'moderate spread')
-          : '';
-        const mileageNote = mileageMismatch
-          ? `NOTE: Listing mileage (${Number(mileage).toLocaleString()} km) is outside the ${mb} cohort. ` +
-            `Use the cohort data as a baseline and adjust using the depreciation guide below.`
-          : `Listing mileage matches this cohort — use the market data directly, adjusted for condition signals.`;
-
-        dbMarketContext = [
-          '',
-          'REAL MARKET DATA FROM AU LISTINGS (use as your pricing anchor — actual observed data, not estimates):',
-          `- Vehicle cohort: ${cohortStr} · ${yb} · ${mb}`,
-          `- Market median price for this cohort: $${dbResult.marketMedian.toLocaleString()}`,
-          `- Price range (P25–P75): $${dbResult.marketLow.toLocaleString()} – $${dbResult.marketHigh.toLocaleString()}`,
-          `- Sample size: ${dbResult.samples} comparable AU listings`,
-          dbResult.iqr ? `- Market consistency (IQR): $${dbResult.iqr.toLocaleString()} — ${consistency}` : '',
-          '',
-          mileageNote,
-          'Your estimatedMarketValue MUST be grounded in these numbers.',
-          'Adjust up or down based on condition/extras/description but do not deviate >25% without stating why in whyItsWorth.',
-        ].filter(l => l !== null).join('\n');
-
-      } else {
-        dbMarketContext = [
-          '',
-          'PARTIAL MARKET DATA FROM AU LISTINGS (small sample — directional reference only):',
-          `- Vehicle cohort: ${cohortStr} · ${yb} · ${mb}`,
-          `- Observed median: $${dbResult.marketMedian.toLocaleString()}`,
-          `- Observed range: $${dbResult.marketLow.toLocaleString()} – $${dbResult.marketHigh.toLocaleString()}`,
-          `- Sample size: ${dbResult.samples} listings`,
-          mileageMismatch
-            ? `Listing mileage (${Number(mileage).toLocaleString()} km) differs from ${mb} cohort — interpolate using the depreciation guide.`
-            : '',
-          'Use alongside your own knowledge. If figures conflict with your knowledge, use judgment.',
-        ].filter(l => l !== null).join('\n');
-      }
-    } else {
-      dbMarketContext = '\nNO DATABASE DATA AVAILABLE for this vehicle cohort yet.\nUse your knowledge of the AU used-car market. Be conservative.';
-    }
-
-    // ── Step 4: Build the full prompt ─────────────────────
-    const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
-    const vehicleDetails = [
-      `Make/Model/Year: ${carLabel}`,
-      req.body.series  ? `Series: ${req.body.series}`   : null,
-      req.body.variant ? `Variant: ${req.body.variant}` : null,
-      mileage     ? `Kms: ${Number(mileage).toLocaleString()} km` : null,
-      transmission ? `Transmission: ${transmission}` : null,
-      condition    ? `Condition: ${condition}` : null,
-      `Listing Price: $${Number(listingPrice).toLocaleString()}`,
-    ].filter(Boolean).join('\n');
-
-    const mileageGuide = [
-      '',
-      'KMS DEPRECIATION GUIDE (AU market — use when interpolating from cohort data):',
-      '- Under 80,000 km:    premium — add 10–20% above cohort median',
-      '- 80,000–130,000 km:  normal use — at cohort median',
-      '- 130,000–180,000 km: moderate discount (~10–20% below median)',
-      '- 180,000–250,000 km: significant discount (~25–40% below median)',
-      '- Over 250,000 km:    hard sell — well below median, long time-to-sell',
-    ].join('\n');
-
-    const prompt = [
-      'You are an expert Australian used-vehicle flipper and market analyst. Your goal is accurate, conservative valuation grounded in real market data.',
-      dbMarketContext,
-      '',
-      'VEHICLE DETAILS:',
-      vehicleDetails,
-      mileageGuide,
-      '',
-      `LISTING TITLE: ${title || '(not provided)'}`,
-      'FULL LISTING DESCRIPTION:',
-      '"""',
-      fullDescription || '(not provided)',
-      '"""',
-      '',
-      'EXTRACT AND FACTOR IN FROM DESCRIPTION:',
-      '- Exact variant/trim/series (VE SS, FG XR6, GU TDI, SR5 etc) — significantly affects value',
-      '- Engine (3.6L V6, 6.0L V8, 3.0 diesel etc) — extract if not in title',
-      '- Extras (towbar, lift kit, ARB gear, new tyres, canopy, leather, sunroof) — add value',
-      '- Service history (logbooks, one owner, recently serviced) — adds significant value',
-      '- Defects (rust, oil leaks, engine noise, worn interior, needs RWC, accident history) — reduce value, add red flags',
-      '- Urgency signals (must sell, moving, price reduced) — negotiation leverage',
-      '- Rego status (registered until X, unregistered, interstate) — affects buyer cost',
-      '',
-      'MISSING INFORMATION RULES — absence of info is NOT neutral, treat it as a red flag:',
-      '- No service history mentioned → assume none exists, reduce value 10–15%, add as red flag',
-      '- No condition mentioned → assume average/fair condition, not good',
-      '- No kms mentioned → assume high kms, reduce value accordingly',
-      '- Vague description (one line, no detail) → seller is hiding something, flag it',
-      '',
-      'CRITICAL — WHAT THINGS ACTUALLY SELL FOR IN AU (not asking price):',
-      'The market median shown above is what sellers are ASKING. What things actually SELL for is different.',
-      'In Australian FB Marketplace, most items sell for 10–20% below the asking median.',
-      'Your estimatedResellLow must be what a buyer will realistically pay — not what you hope to get.',
-      'Price it to sell in 1–2 weeks. If it would take longer, the price is too high.',
-      '',
-      'CALCULATE PROFIT STEP BY STEP — show your working in whyItsWorth:',
-      'Step 1 — Realistic sell price: take market median, subtract 12% (AU market discount off asking)',
-      'Step 2 — Detailing/clean: $200 minimum, $400 if condition is average or unknown',
-      'Step 3 — Minor repairs: $0 if genuinely perfect, $300–800 if any issues mentioned or kms are high',
-      'Step 4 — Rego/RWC if unregistered or interstate: add $400–800',
-      'Step 5 — Your time: minimum 2 hours to list, negotiate, show, sell — factor it in',
-      'Step 6 — estimatedProfit = realistic sell price MINUS buy price MINUS steps 2–4',
-      'Step 7 — roiPercent = estimatedProfit divided by buy price, expressed as percentage',
-      '',
-      'estimatedResellLow = Step 1 result (realistic sell, priced to move)',
-      'estimatedResellHigh = market median minus 5% (best case, patient seller)',
-      'estimatedProfit = estimatedResellLow minus listingPrice minus all costs from steps 2–4',
-      '',
-      'VERDICT RULES — apply strictly:',
-      '- roiPercent > 30% after ALL costs → STEAL',
-      '- roiPercent 15–30% after ALL costs → GOOD DEAL',
-      '- roiPercent 5–15% after ALL costs → FAIR',
-      '- roiPercent 0–5% after ALL costs → FAIR (barely worth it)',
-      '- roiPercent < 0% → PASS',
-      '- A $300 profit on a $4000 car is FAIR, not GOOD DEAL. Be honest.',
-      '',
-      'NEGATIVE PROFIT RULE — critical:',
-      'If your calculation produces a negative profit (you would lose money flipping this):',
-      '- DO NOT show a negative estimatedProfit — set it to 0',
-      '- DO NOT show a negative roiPercent — set it to 0',
-      '- Set estimatedResellLow to approximately the listing price (what you paid)',
-      '- Set estimatedResellHigh to listing price plus 3–5% at most',
-      '- The message to the user is: you would need to sell for roughly what you paid just to break even',
-      '- Set verdict to PASS and dealScore to 15 or lower',
-      '- The oneLiner should honestly say something like "You would need to sell for at least $X just to break even after costs"',
-      '- Do not invent profit that does not exist',
-      '',
-      'Broken/project cars: if listing mentions "spares or repairs", "not running", "blown", "needs work", "as-is" — set isBrokenOrProject true, provide repairEstimate, cap verdict at FAIR unless post-repair ROI is exceptional.',
-      '',
-      'Respond ONLY in this exact JSON format (no markdown, no text outside JSON):',
-      '{',
-      '  "verdict": "STEAL|GOOD DEAL|FAIR|PASS",',
-      '  "dealScore": 0-100,',
-      '  "oneLiner": "one punchy sentence",',
-      '  "extractedTitle": "cleaned listing title",',
-      '  "extractedPrice": number,',
-      '  "estimatedMarketValue": number,',
-      '  "estimatedResellLow": number,',
-      '  "estimatedResellHigh": number,',
-      '  "recommendedOffer": number,',
-      '  "walkAwayPrice": number,',
-      '  "estimatedProfit": number,',
-      '  "roiPercent": number,',
-      '  "timeToSell": "1-3 days / 3-7 days / 1-2 weeks / 2-4 weeks",',
-      '  "demandLevel": "🔥 High or 📈 Moderate or 📉 Low",',
-      '  "whyItsWorth": "1-2 sentences referencing the actual price numbers",',
-      '  "greenFlags": ["..."],',
-      '  "redFlags": ["..."],',
-      '  "whatToCheckInPerson": ["..."],',
-      '  "negotiationScript": "what to say to the seller",',
-      '  "isBrokenOrProject": false,',
-      '  "repairEstimate": 0,',
-      '  "repairNotes": "",',
-      '  "aiGenerated": true',
-      '}',
-    ].join('\n');
-
-    // ── Step 5: Call AI ────────────────────────────────────
-    let text = '';
-    const hasImage = !!(imageBase64 || imageUrl);
-
-    if (GEMINI_API_KEY && hasImage) {
-      const parts = [];
-      if (imageBase64 && imageMime) {
-        parts.push({ inline_data: { mime_type: imageMime, data: imageBase64 } });
-      } else if (imageUrl) {
-        try {
-          const imgRes = await axios.get(imageUrl, {
-            responseType: 'arraybuffer', timeout: 10000,
-            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
-          });
-          parts.push({ inline_data: { mime_type: imgRes.headers['content-type'] || 'image/jpeg', data: Buffer.from(imgRes.data).toString('base64') } });
-        } catch (_) {}
-      }
-      parts.push({ text: prompt });
-      const geminiRes = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
-      );
-      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    } else if (GEMINI_API_KEY) {
-      const geminiRes = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
-      );
-      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    } else {
-      const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1500,
-        messages: [{ role: 'user', content: prompt }],
-      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 60000 });
-      text = claudeRes.data?.content?.[0]?.text || '';
-    }
-
-    // ── Step 6: Parse and apply DB hard-override if trusted ──
-    let parsed = null;
-    try {
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
-    } catch (_) {}
-
-    if (parsed) {
-      if (dbPreferred) {
-        // DB is fully trusted — lock the price fields
-        // AI still owns: verdict rationale, flags, negotiation script, inspection checklist
-        parsed.estimatedMarketValue = dbResult.marketMedian;
-        parsed.estimatedResellLow   = dbResult.marketLow;
-        parsed.estimatedResellHigh  = dbResult.marketHigh;
-        parsed.low                  = dbResult.marketLow;
-        parsed.median               = dbResult.marketMedian;
-        parsed.high                 = dbResult.marketHigh;
-        // Realistic sell price = 10% below median (priced to actually sell, not sit)
-        const realisticSellPrice = Math.round(dbResult.marketMedian * 0.90);
-        // Realistic costs: detailing + minor prep (conservative estimate)
-        const flipCosts = listingPrice < 5000 ? 300 : listingPrice < 15000 ? 500 : 800;
-        const realisticProfit = realisticSellPrice - listingPrice - flipCosts;
-
-        parsed.estimatedResellLow   = realisticSellPrice;
-        parsed.estimatedResellHigh  = Math.round(dbResult.marketMedian * 0.97); // best case just under median
-        parsed.estimatedMarketValue = dbResult.marketMedian;
-        parsed.low                  = dbResult.marketLow;
-        parsed.median               = dbResult.marketMedian;
-        parsed.high                 = dbResult.marketHigh;
-        if (realisticProfit <= 0) {
-          // Negative flip — set resell to around what was paid, profit to 0
-          parsed.estimatedProfit      = 0;
-          parsed.roiPercent           = 0;
-          parsed.estimatedResellLow   = listingPrice;
-          parsed.estimatedResellHigh  = Math.round(listingPrice * 1.04);
-        } else {
-          parsed.estimatedProfit      = Math.round(realisticProfit);
-          parsed.roiPercent           = Math.round((realisticProfit / listingPrice) * 100);
-        }
-
-        // Verdict anchored to realistic ROI after all costs
-        if      (parsed.roiPercent >= 30) { parsed.verdict = 'STEAL';     parsed.dealScore = Math.min(95, Math.max(parsed.dealScore || 0, 85)); }
-        else if (parsed.roiPercent >= 15) { parsed.verdict = 'GOOD DEAL'; parsed.dealScore = Math.min(84, Math.max(parsed.dealScore || 0, 65)); }
-        else if (parsed.roiPercent >= 5)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(64, Math.max(parsed.dealScore || 0, 45)); }
-        else if (parsed.roiPercent >= 0)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(44, 40); }
-        else                              { parsed.verdict = 'PASS';      parsed.dealScore = Math.min(parsed.dealScore || 25, 25); }
-      }
-
-      // Strip internal fields — never send to user
-      delete parsed.sourceLabel;
-      delete parsed.confidence;
-      delete parsed.dataPoints;
-      delete parsed.dbData;
-      delete parsed._pricingCorrected;
-
-      const finalResult = { ...parsed, text, usedCache: false };
-      await setAppraisalCache(listingId, title, listingPrice, keyword, finalResult).catch(e =>
-        console.error('[AprCache] Write error:', e.message)
-      );
-      res.json(finalResult);
-    } else {
-      res.json({ text, usedCache: false });
-    }
-  } catch (e) {
-    console.error('[AI/vehicle]', e.response?.data || e.message);
-    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
-  }
-});
-
-// POST /ai/image — image scan via Gemini Flash
-// Body: { parts: [ { inline_data: { mime_type, data } }, { text: prompt } ] }
-app.post('/ai/image', authMiddleware, async (req, res) => {
-  try {
-    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
-    const { parts } = req.body;
-    if (!parts || !Array.isArray(parts)) return res.status(400).json({ error: 'parts array required' });
-
-    // Check appraisal limit
-    const cr = await consumeAppraisal(req.userId);
-    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
-
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 30000,
+      // Subscribe to push
+      var appServerKey = urlBase64ToUint8Array(publicKey);
+      return reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: appServerKey
+      });
+    }).then(function(subscription) {
+      if (!subscription) return;
+      // Send subscription to backend
+      fetch(backendUrl + '/push/subscribe', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ subscription: subscription.toJSON() })
+      });
+      console.log('[SW] Push subscribed');
+    }).catch(function(e) {
+      console.log('[SW] Push subscribe error:', e.message);
     });
-    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    res.json({ text });
-  } catch (e) {
-    console.error('[AI/image]', e.response?.data || e.message);
-    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }).catch(function(e) {
+    console.log('[SW] Registration failed:', e.message);
+  });
+}
+
+function urlBase64ToUint8Array(base64String) {
+  var padding = '='.repeat((4 - base64String.length % 4) % 4);
+  var base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  var rawData = window.atob(base64);
+  var outputArray = new Uint8Array(rawData.length);
+  for (var i = 0; i < rawData.length; ++i) { outputArray[i] = rawData.charCodeAt(i); }
+  return outputArray;
+}
+
+// Init push after login
+setTimeout(function() {
+  if (getAuthToken()) initWebPush();
+}, 2000);
+
+
+function autoAppraise(items) {
+  var BATCH_SIZE = 10;
+  var batches = [];
+  for (var i = 0; i < items.length; i += BATCH_SIZE) {
+    batches.push(items.slice(i, i + BATCH_SIZE));
   }
-});
 
-// POST /ai/text — text-only calls via Claude Haiku
-// Body: { prompt: string }
-app.post('/ai/text', authMiddleware, async (req, res) => {
-  try {
-    if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Anthropic not configured on server' });
-    const { prompt, max_tokens, listingId, title, price, keyword } = req.body;
-    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+  function runBatch(batchIndex) {
+    if (batchIndex >= batches.length) return;
+    var batch = batches[batchIndex];
+    var lines = batch.map(function(l, i) {
+      var priceStr = l.price ? 'AUD $' + l.price : 'price not listed';
+      return i + '. "' + l.title + '" listed for ' + priceStr;
+    }).join(' | ');
 
-    // ── Appraisal cache check — free hit, no point consumed ──
-    const cached = await getAppraisalCache(listingId, title, price, keyword);
-    if (cached) {
-      console.log(`[AI/text] Cache hit — skipping AI + appraisal deduction`);
-      return res.json({ ...cached, usedCache: true });
-    }
+    var watchKeyword = batch[0] ? (batch[0].keyword || '') : '';
 
-    // Check appraisal limit
-    const cr = await consumeAppraisal(req.userId);
-    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+    var prompt = 'You are an Australian secondhand market expert filtering and rating listings for someone searching: "' + watchKeyword + '". Decide if each listing is relevant then rate it. VEHICLES: if searching for a car/ute/van/bike model (e.g. "bmw e36", "hilux", "patrol") then the actual vehicle = relevant:true. Parts, wrecking, manuals, merchandise, toys, models, books about that car = relevant:false. NON-VEHICLES: if searching "electric scooter" then electric/motorised scooters, any brand (Ninebot, Segway etc) = relevant:true. Trick/stunt/push/kids scooters = relevant:false. If searching "golf clubs" then actual clubs, irons, drivers, putters, wedges = relevant:true. Golf balls, shoes, bags alone, books, accessories = relevant:false. For ALL other keywords use common sense — only mark relevant:false if it clearly has nothing to do with what they want. When in doubt: relevant:true. Rate relevant items: Green=30%+ below market, Yellow=fair, Red=overpriced, Rainbow=50%+ below market steal. Reply ONLY as JSON array: [{"idx":0,"rating":"yellow","reason":"Fair price","relevant":true}]. Max 6 words reason. Listings: ' + lines;
 
-    const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: max_tokens || 1500,
-      messages: [{ role: 'user', content: prompt }],
-    }, {
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      timeout: 60000,
-    });
-    const text = claudeRes.data?.content?.[0]?.text || '';
-    const result = { text, usedCache: false };
+    var ratingCall = getBackendUrl()
+      ? callBackendAI('/ai/text', { prompt: prompt, max_tokens: 1000 }).then(function(d) { return d._raw || JSON.stringify(d); })
+      : fetchWithRetry('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type':'application/json','x-api-key':API_KEY,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true' },
+          body: JSON.stringify({ model:'claude-haiku-4-5-20251001', max_tokens:1000, messages:[{ role:'user', content:prompt }] })
+        }).then(function(r){return r.json();}).then(function(data){ return data.content && data.content[0] ? data.content[0].text : ''; });
 
-    // Store in cache for future users
-    if (listingId || (title && price)) {
-      await setAppraisalCache(listingId, title, price, keyword, result).catch(e =>
-        console.error('[AprCache] Write error (text):', e.message)
-      );
-    }
-
-    res.json(result);
-  } catch (e) {
-    console.error('[AI/text]', e.response?.data || e.message);
-    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
-  }
-});
-
-// POST /ai/text-image — text scan with an image fetched via URL (listing image)
-// Body: { prompt: string, imageUrl: string }
-app.post('/ai/text-image', authMiddleware, async (req, res) => {
-  try {
-    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
-    const { prompt, imageUrl, listingId, title, price, keyword } = req.body;
-    if (!prompt) return res.status(400).json({ error: 'prompt required' });
-
-    // ── Appraisal cache check — free hit, no point consumed ──
-    const cached = await getAppraisalCache(listingId, title, price, keyword);
-    if (cached) {
-      console.log(`[AI/text-image] Cache hit — skipping AI + appraisal deduction`);
-      return res.json({ ...cached, usedCache: true });
-    }
-
-    // Check appraisal limit
-    const cr = await consumeAppraisal(req.userId);
-    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
-
-    var parts = [{ text: prompt }];
-
-    // If there's an image URL, fetch and include it
-    if (imageUrl) {
+    ratingCall
+    .then(function(text) {
+      var match = text.match(/\[[\s\S]*\]/);
+      if (!match) return;
+      var match = text.match(/\[[\s\S]*\]/);
+      if (!match) return;
       try {
-        const imgRes = await axios.get(imageUrl, {
-          responseType: 'arraybuffer', timeout: 10000,
-          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' }
+        var ratings = JSON.parse(match[0]);
+        var ratingMap = getCachedRatings() || {};
+        var irrelevantIds = [];
+
+        ratings.forEach(function(r) {
+          var listing = batch[r.idx];
+          if (!listing || !listing.id) return;
+          var reason = (r.reason || '').toLowerCase();
+          var REASON_BLOCKS = ['trick scooter','stunt scooter','push scooter','kick scooter',
+            'kids scooter','micro scooter','mini scooter','park scooter','pro scooter',
+            'toddler scooter','razor scooter','phone case only','charger only',
+            'golf balls only','golf ball pack','golf shoes only','golf accessories only'];
+          var blockedByReason = REASON_BLOCKS.some(function(w) { return reason.includes(w); });
+          var blockedReasonWord = REASON_BLOCKS.find(function(w) { return reason.includes(w); });
+
+          if (r.relevant === false || blockedByReason) {
+            irrelevantIds.push(listing.id);
+            if (r.relevant === false) {
+              console.log('[AutoAppraise] REMOVED (AI relevant:false) —', listing.title, '| reason:', r.reason);
+            } else {
+              console.log('[AutoAppraise] REMOVED (reason match: "' + blockedReasonWord + '") —', listing.title, '| reason:', r.reason);
+            }
+          } else {
+            console.log('[AutoAppraise] KEPT —', listing.title, '| rating:', r.rating, '| reason:', r.reason);
+            ratingMap[listing.id] = r;
+          }
         });
-        const b64 = Buffer.from(imgRes.data).toString('base64');
-        const mime = imgRes.headers['content-type'] || 'image/jpeg';
-        parts = [{ inline_data: { mime_type: mime, data: b64 } }, { text: prompt }];
-      } catch(e) {
-        console.log('[AI/text-image] Could not fetch image, proceeding text-only');
+
+        if (irrelevantIds.length > 0) {
+          _feedItems = _feedItems.filter(function(l) { return irrelevantIds.indexOf(l.id) === -1; });
+          var cached = getCachedListings().filter(function(l) { return irrelevantIds.indexOf(l.id) === -1; });
+          saveCachedListings(cached);
+          var backendUrl = getBackendUrl();
+          if (backendUrl) {
+            fetch(backendUrl + '/listings/remove', {
+              method: 'POST',
+              headers: authHeaders(),
+              body: JSON.stringify({ ids: irrelevantIds })
+            }).catch(function(){});
+          }
+        }
+
+        saveCachedRatings(ratingMap);
+        renderListingsFeed(_feedItems.length ? _feedItems : batch, ratingMap);
+        setTimeout(function() { runBatch(batchIndex + 1); }, 1500);
+      } catch(e) { console.log('Rating parse error', e); }
+    })
+    .catch(function(e) { console.log('Auto-appraise error:', e); });
+  }
+
+  runBatch(0);
+}
+
+function formatAgo(iso) {
+  var diff = Math.floor((Date.now() - new Date(iso)) / 1000);
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+  return Math.floor(diff/86400) + 'd ago';
+}
+
+function renderListingsFeed(items, ratingMap) {
+  _feedItems = items;
+  var el = document.getElementById('listingsFeed');
+  if (!items || !items.length) {
+    el.innerHTML = '<div style="text-align:center;padding:60px 20px;color:var(--mu)"><div style="font-size:48px;margin-bottom:12px">&#x1F4EB;</div><div>No listings yet</div><div style="font-size:13px;margin-top:8px">Add keywords in the Watch tab</div></div>';
+    return;
+  }
+  // Apply keyword filter
+  var filtered = (_feedFilter && _feedFilter !== 'all')
+    ? items.filter(function(l) { return l.keyword === _feedFilter; })
+    : items;
+  if (!filtered.length) {
+    el.innerHTML = '<div style="text-align:center;padding:40px 20px;color:var(--mu)"><div style="font-size:36px;margin-bottom:10px">🔍</div><div>No listings for "' + _feedFilter + '" yet</div></div>';
+    return;
+  }
+  // Final safety net — strip any excluded keywords before rendering
+  var _safeExclude = getAllExcludeWordsList();
+  if (_safeExclude.length) {
+    filtered = filtered.filter(function(l) { return !listingMatchesExclude(l, _safeExclude); });
+  }
+  // Sort by Facebook listing date, newest first
+  filtered = filtered.slice().sort(function(a, b) {
+    return new Date(b.listedAt || b.foundAt) - new Date(a.listedAt || a.foundAt);
+  });
+  // Both vehicle and general listings use 2-col grid
+  var isVehicleFeed = filtered.some(function(l) { return l.mileage || l.year || l.make; });
+  var html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">';
+
+  for (var i = 0; i < filtered.length; i++) {
+    var l = filtered[i];
+    var priceStr = l.isOfferPrice ? '<span style="color:var(--mu);font-size:14px;font-style:italic">Make Offer</span>' : (l.price ? '$' + l.price.toLocaleString() : '—');
+    var timeAgo = (l.listedAt || l.foundAt) ? formatAgo(l.listedAt || l.foundAt) : '';
+    var rating = ratingMap ? (ratingMap[l.id] || null) : null;
+    var borderColor = 'var(--bd)';
+    var cardBg = 'var(--s1)';
+    var badgeHtml = '';
+    var isRainbow = false;
+    if (rating) {
+      if (rating.rating === 'rainbow') {
+        isRainbow = true;
+        borderColor = 'rgba(255,0,0,0.4)'; cardBg = '';
+        badgeHtml = '<div style="font-size:10px;font-weight:700;letter-spacing:.5px;margin-bottom:4px;background:linear-gradient(90deg,#ff0000,#ff8800,#ffff00,#00ff88,#0088ff,#8800ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text">&#x1F308; GREAT DEAL · ' + rating.reason + '</div>';
+      } else if (rating.rating === 'green') {
+        borderColor = 'rgba(0,221,85,0.55)'; cardBg = 'rgba(0,221,85,0.20)';
+        badgeHtml = '<div style="font-size:10px;color:#00dd55;font-weight:700;letter-spacing:.5px;margin-bottom:4px">&#x1F7E2; GOOD DEAL · ' + rating.reason + '</div>';
+      } else if (rating.rating === 'yellow') {
+        borderColor = 'rgba(255,200,0,0.55)'; cardBg = 'rgba(255,200,0,0.18)';
+        badgeHtml = '<div style="font-size:10px;color:#ffc800;font-weight:700;letter-spacing:.5px;margin-bottom:4px">&#x1F7E1; FAIR · ' + rating.reason + '</div>';
+      } else if (rating.rating === 'red') {
+        borderColor = 'rgba(255,60,60,0.55)'; cardBg = 'rgba(255,60,60,0.20)';
+        badgeHtml = '<div style="font-size:10px;color:#ff4f4f;font-weight:700;letter-spacing:.5px;margin-bottom:4px">&#x1F534; BAD DEAL · ' + rating.reason + '</div>';
       }
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 30000,
-    });
-    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    const result = { text, usedCache: false };
-
-    // Store in cache for future users
-    if (listingId || (title && price)) {
-      await setAppraisalCache(listingId, title, price, keyword, result).catch(e =>
-        console.error('[AprCache] Write error (text-image):', e.message)
-      );
+    // Offer price listings: always grey, always "unknown price" — never coloured
+    if (l.isOfferPrice) {
+      cardBg      = 'rgba(150,150,150,0.09)';
+      borderColor = 'rgba(150,150,150,0.22)';
+      isRainbow   = false;
+      badgeHtml   = '<div style="font-size:10px;color:var(--mu);font-weight:600;letter-spacing:.5px;margin-bottom:4px">⬜ UNKNOWN PRICE · MAKE OFFER</div>';
     }
 
-    res.json(result);
-  } catch (e) {
-    console.error('[AI/text-image]', e.response?.data || e.message);
-    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
-  }
-});
+    var newBadge = l._isNew ? '<div id="new-badge-' + l.id + '" style="position:absolute;top:8px;left:8px;z-index:10;background:#00ff88;color:#000;font-size:9px;font-weight:800;letter-spacing:1px;padding:3px 7px;border-radius:20px">NEW</div>' : '';
 
-// ── Appraisal cache admin ─────────────────────────────────
-// GET /appraisal-cache?listingId=xxx  — check if a result is cached
-app.get('/appraisal-cache', authMiddleware, async (req, res) => {
-  try {
-    const { listingId, title, price, keyword } = req.query;
-    const cached = await getAppraisalCache(listingId, title, price, keyword);
-    res.json({ found: !!cached, cached: cached || null });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
+    if (isVehicleFeed) {
+      // ── Vehicle card: horizontal layout ──
+      var imgHtml = l.image
+        ? '<div style="width:100%;height:210px;overflow:hidden;flex-shrink:0">' +
+            '<img src="' + l.image + '" style="width:100%;height:100%;object-fit:cover;display:block">' +
+          '</div>'
+        : '<div style="width:100%;height:210px;background:var(--s2);display:flex;align-items:center;justify-content:center;font-size:32px;flex-shrink:0">🚗</div>';
 
-// DELETE /appraisal-cache?listingId=xxx  — bust a specific cache entry (owner only)
-app.delete('/appraisal-cache', authMiddleware, async (req, res) => {
-  try {
-    const user = await getUser(req.userId);
-    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
-    const { listingId, title, price, keyword } = req.query;
-    if (listingId) await redisDel(K.appraisalById(listingId));
-    if (title && price) {
-      const hash = buildAppraisalHash(title, price, keyword);
-      await redisDel(K.appraisalByHash(hash));
-    }
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
-});
+      html += '<div data-id="' + l.id + '" style="position:relative;background:var(--s1);border:none;border-radius:14px;overflow:hidden;display:flex;flex-direction:column">';
+      html += newBadge;
+      html += '<div class="lnk-img" data-idx="' + i + '" style="cursor:pointer;flex-shrink:0">' + imgHtml + '</div>';
+      html += '<div class="' + (isRainbow ? 'rainbow-card' : '') + '" style="padding:8px;flex:1;display:flex;flex-direction:column;min-width:0;background:' + (isRainbow ? '' : cardBg) + ';transition:background 0.4s">';
+      html += badgeHtml;
+      // Title
+      html += '<div style="font-size:12px;font-weight:700;color:#fff;line-height:1.3;margin-bottom:3px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">' + l.title + '</div>';
+      // Price
+      html += '<div style="font-family:Bebas Neue,sans-serif;font-size:20px;color:var(--g);line-height:1;margin-bottom:3px">' + priceStr + '</div>';
+      // Vehicle specs row
+      var specs = [];
+      if (l.year) specs.push('<span style="color:#fff;font-weight:700">' + l.year + '</span>');
+      if (l.make) specs.push('<span style="color:var(--mu)">' + l.make + (l.model ? ' ' + l.model : '') + '</span>');
+      if (specs.length) html += '<div style="font-size:11px;margin-bottom:4px">' + specs.join(' · ') + '</div>';
+      // Key stats chips
+      var chips = '';
+      if (l.mileage) chips += '<span style="background:rgba(0,255,136,.12);border:1px solid rgba(0,255,136,.25);border-radius:20px;padding:2px 7px;font-size:10px;color:#00ff88;font-weight:700">🔢 ' + l.mileage.toLocaleString() + 'km</span>';
+      if (l.transmission) chips += '<span style="background:rgba(255,255,255,.07);border:1px solid var(--bd);border-radius:20px;padding:2px 7px;font-size:10px;color:var(--mu)">⚙️ ' + l.transmission + '</span>';
+      if (l.fuelType) chips += '<span style="background:rgba(255,255,255,.07);border:1px solid var(--bd);border-radius:20px;padding:2px 7px;font-size:10px;color:var(--mu)">⛽ ' + l.fuelType + '</span>';
+      if (chips) html += '<div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:5px">' + chips + '</div>';
+      // Location + time
+      html += '<div style="font-size:10px;color:var(--mu);margin-bottom:6px">' + timeAgo + (l.location && typeof l.location === 'string' ? ' · ' + l.location : '') + '</div>';
+      // Action buttons
+      html += '<div style="display:flex;gap:5px;margin-top:auto">';
+      var isSavedItem = isSaved(l.id);
+      html += '<button class="save-btn" data-idx="' + i + '" style="flex:1;padding:6px 4px;background:' + (isSavedItem ? 'rgba(255,200,0,.2)' : 'rgba(255,255,255,.07)') + ';border:1px solid ' + (isSavedItem ? 'rgba(255,200,0,.5)' : 'var(--bd)') + ';border-radius:8px;color:' + (isSavedItem ? '#ffc800' : '#fff') + ';font-size:13px;cursor:pointer">' + (isSavedItem ? '⭐' : '☆') + '</button>';
+      html += '<button class="lnk-btn" data-url="' + (l.url||'') + '" style="flex:1;padding:6px 4px;background:rgba(255,255,255,.07);border:1px solid var(--bd);border-radius:8px;color:#fff;font-size:11px;cursor:pointer">&#x1F517;</button>';
+      html += '<button data-idx="' + i + '" onclick="appraiseIdx(this)" style="flex:2;padding:6px 4px;background:rgba(0,255,136,.12);border:1px solid rgba(0,255,136,.25);border-radius:8px;color:var(--g);font-size:11px;font-weight:700;cursor:pointer">&#x1F916; Appraise</button>';
+      html += '</div>';
+      html += '</div></div>';
 
-// ── DEV: force-set plan (secret-gated, remove before public launch) ──
-// POST /dev/set-plan  { secret: "...", plan: "premium" }
-const DEV_SECRET = process.env.DEV_SECRET || 'flipradar-dev';
-app.post('/dev/set-plan', authMiddleware, async (req, res) => {
-  const { secret, plan } = req.body;
-  if (secret !== DEV_SECRET) return res.status(403).json({ error: 'Forbidden' });
-  const validPlans = ['free', 'basic', 'premium'];
-  if (!validPlans.includes(plan)) return res.status(400).json({ error: 'plan must be free, basic, or premium' });
-  const user = await getUser(req.userId);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  user.plan = plan;
-  await saveUser(user);
-  console.log(`[Dev] Set plan for ${user.email} → ${plan}`);
-  res.json({ ok: true, plan });
-});
-
-// ── Start ─────────────────────────────────────────────────
-
-// ── Vehicle identity helpers ─────────────────────────────
-// Reads make/model/year/km from SociaVault structured fields first,
-// falls back to what the scan already extracted from the title.
-function parseVehicleInfoFields(item) {
-  if (!item) return {};
-  const vi = item.vehicle_info || item.listing_vehicle_data || item.vehicleInfo || {};
-  const attrs = item.attributes ? Object.values(item.attributes) : [];
-  const attr = (name) => {
-    const a = attrs.find(x => String(x.attribute_name || x.name || '').toLowerCase() === name.toLowerCase());
-    return a ? (a.label || a.value || null) : null;
-  };
-  const toInt = (v) => { if (v == null) return null; const n = parseInt(String(v).replace(/[^0-9]/g,''),10); return Number.isFinite(n)?n:null; };
-  const year = toInt(vi.year || vi.model_year || vi.manufacture_year || attr('Year'));
-  return {
-    make:         vi.make || vi.manufacturer || vi.brand || attr('Make') || null,
-    model:        vi.model || vi.model_name || attr('Model') || null,
-    year:         (year >= 1970 && year <= new Date().getFullYear()+1) ? year : null,
-    kms:          toInt(vi.odometer || vi.mileage || vi.kilometres || vi.kilometers || attr('Odometer')),
-    transmission: vi.transmission || vi.gearbox || attr('Transmission') || null,
-    fuel_type:    vi.fuel_type || vi.fuel || attr('Fuel type') || null,
-    body_style:   vi.body_style || vi.body || vi.body_type || attr('Body style') || null,
-  };
-}
-
-// ── Vehicle blend valuation ──────────────────────────────
-// Prices a specific car by sliding comparable listings to its km,
-// weighting closest-km comps most, and blending with AI when data is thin.
-const REF_FALLBACK_PERKM = 0.08;
-const KM_HALF_WEIGHT = 50000;
-const ENOUGH_COMPS = 8;
-
-function slideToKm(price, fromKm, toKm, make) {
-  // VERIFY: DEP_TABLE must be keyed by lowercase make with a perKm field
-  const perKm = (DEP_TABLE?.[String(make||'').toLowerCase()]?.perKm) || REF_FALLBACK_PERKM;
-  const adjusted = price + (fromKm - toKm) * perKm;
-  return Math.max(price * 0.25, adjusted);
-}
-
-async function getVehicleComps(target) {
-  const scopes = [
-    'make=$1 AND model=$2 AND series IS NOT DISTINCT FROM $3 AND variant IS NOT DISTINCT FROM $4',
-    'make=$1 AND model=$2 AND series IS NOT DISTINCT FROM $3',
-    'make=$1 AND model=$2',
-  ];
-  for (const where of scopes) {
-    const { rows } = await pool.query(
-      `SELECT price, kms, year, scraped_at FROM listings WHERE category='vehicle' AND is_active=TRUE AND in_price_pool=TRUE AND price>0 AND kms>0 AND ${where} AND scraped_at > NOW() - INTERVAL '120 days'`,
-      [target.make, target.model, target.series||null, target.variant||null]);
-    if (rows.length >= 3) return rows;
-  }
-  return [];
-}
-
-async function aiEstimateVehicle(target) {
-  const ck = `vest:${[target.make,target.model,target.series,target.year,Math.round((target.kms||0)/20000)].join('|')}`;
-  const cached = await redisGet(ck);
-  if (cached?.est) return cached.est;
-  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
-  const prompt = `Typical USED private-sale price AUD on Australian Facebook Marketplace:\n${target.year||''} ${target.make||''} ${target.model||''} ${target.series||''} ${target.variant||''}, ${target.kms||'?'} km.\nReturn ONLY JSON: { "est_aud": number }`;
-  try {
-    let text = '';
-    if (GEMINI_API_KEY) {
-      const r = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        {contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},
-        {headers:{'Content-Type':'application/json'},timeout:10000});
-      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';
     } else {
-      const r = await axios.post('https://api.anthropic.com/v1/messages',
-        {model:'claude-haiku-4-5-20251001',max_tokens:80,messages:[{role:'user',content:prompt}]},
-        {headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},timeout:10000});
-      text = r.data?.content?.[0]?.text||'';
+      // ── Standard 2-col card ──
+      var imgHtml2 = l.image
+        ? '<div style="width:100%;height:210px;overflow:hidden;flex-shrink:0">' +
+            '<img src="' + l.image + '" style="width:100%;height:100%;object-fit:cover;display:block">' +
+          '</div>'
+        : '<div style="width:100%;height:210px;background:var(--s2);display:flex;align-items:center;justify-content:center;font-size:32px;flex-shrink:0">🏷️</div>';
+      html += '<div data-id="' + l.id + '" style="position:relative;background:var(--s1);border:none;border-radius:12px;overflow:hidden;display:flex;flex-direction:column">';
+      html += newBadge;
+      html += '<div class="lnk-img" data-idx="' + i + '" style="cursor:pointer;flex-shrink:0">' + imgHtml2 + '</div>';
+      html += '<div class="' + (isRainbow ? 'rainbow-card' : '') + '" style="padding:8px;flex:1;display:flex;flex-direction:column;background:' + (isRainbow ? '' : cardBg) + ';transition:background 0.4s">';
+      html += badgeHtml;
+      html += '<div style="font-size:12px;font-weight:600;color:#fff;line-height:1.3;margin-bottom:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">' + l.title + '</div>';
+      html += '<div style="font-family:Bebas Neue,sans-serif;font-size:20px;color:var(--g);line-height:1;margin-bottom:3px">' + priceStr + '</div>';
+      html += '<div style="font-size:10px;color:var(--mu);margin-bottom:6px">' + timeAgo + (l.location && typeof l.location === 'string' ? ' · ' + l.location : '') + '</div>';
+      html += '<div style="display:flex;gap:5px;margin-top:auto">';
+      var isSavedItem2 = isSaved(l.id);
+      html += '<button class="save-btn" data-idx="' + i + '" style="flex:1;padding:6px 4px;background:' + (isSavedItem2 ? 'rgba(255,200,0,.2)' : 'rgba(255,255,255,.07)') + ';border:1px solid ' + (isSavedItem2 ? 'rgba(255,200,0,.5)' : 'var(--bd)') + ';border-radius:8px;color:' + (isSavedItem2 ? '#ffc800' : '#fff') + ';font-size:13px;cursor:pointer">' + (isSavedItem2 ? '⭐' : '☆') + '</button>';
+      html += '<button class="lnk-btn" data-url="' + (l.url||'') + '" style="flex:1;padding:6px 4px;background:rgba(255,255,255,.07);border:1px solid var(--bd);border-radius:8px;color:#fff;font-size:11px;cursor:pointer">&#x1F517;</button>';
+      html += '<button data-idx="' + i + '" onclick="appraiseIdx(this)" style="flex:2;padding:6px 4px;background:rgba(0,255,136,.12);border:1px solid rgba(0,255,136,.25);border-radius:8px;color:var(--g);font-size:11px;font-weight:600;cursor:pointer">&#x1F916; Appraise</button>';
+      html += '</div></div></div>';
     }
-    const m = text.match(/\{[\s\S]*\}/);
-    const est = m ? Math.round(JSON.parse(m[0]).est_aud) : null;
-    if (est > 0) { await redisSet(ck,{est},14*24*3600); return est; }
-  } catch(e) { console.error('[VEst]',e.message); }
-  return null;
-}
-
-async function appraiseVehicleValue(target) {
-  if (!target.kms || target.kms <= 0) {
-    const aiEst = await aiEstimateVehicle(target);
-    return aiEst ? {value:aiEst,confidence:15,source:'ai_only',poolN:0,aiEst} : {value:null,confidence:0,source:'none',poolN:0};
   }
-  const comps = await getVehicleComps(target);
-  const adj = comps.map(c => {
-    const price = slideToKm(c.price, c.kms, target.kms, target.make);
-    const kmW = 1/(1+Math.abs(c.kms-target.kms)/KM_HALF_WEIGHT);
-    const ageDays = (Date.now()-new Date(c.scraped_at))/86400000;
-    const recW = ageDays<30?1:ageDays<90?0.7:0.4;
-    return {price, w:kmW*recW, kmGap:Math.abs(c.kms-target.kms)};
+  html += '</div>';
+  el.innerHTML = html;
+  el.querySelectorAll('.lnk-img').forEach(function(el) {
+    el.addEventListener('click', function() { appraiseIdx(this); });
   });
-  let poolValue=null, poolN=0;
-  if (adj.length) {
-    const sorted = adj.map(a=>a.price).sort((x,y)=>x-y);
-    const q = p => sorted[Math.floor(p*(sorted.length-1))];
-    const lo=q(0.25)-1.5*(q(0.75)-q(0.25)), hi=q(0.75)+1.5*(q(0.75)-q(0.25));
-    const kept = adj.filter(a=>a.price>=lo&&a.price<=hi);
-    const wsum = kept.reduce((s,a)=>s+a.w,0);
-    poolValue = wsum?Math.round(kept.reduce((s,a)=>s+a.price*a.w,0)/wsum):null;
-    poolN = kept.length;
+  el.querySelectorAll('.lnk-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() { window.open(this.getAttribute('data-url'), '_blank'); });
+  });
+  el.querySelectorAll('.save-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var idx = parseInt(this.getAttribute('data-idx'));
+      var listing = _feedItems[idx];
+      if (listing) toggleSaved(listing);
+    });
+  });
+
+  // Remove NEW badge 60s after card scrolls into view
+  var newTimers = {};
+  var observer = new IntersectionObserver(function(entries) {
+    entries.forEach(function(entry) {
+      var id = entry.target.getAttribute('data-id');
+      if (!id) return;
+      var badge = document.getElementById('new-badge-' + id);
+      if (!badge) return;
+      if (entry.isIntersecting) {
+        if (!newTimers[id]) {
+          newTimers[id] = setTimeout(function() {
+            if (badge && badge.parentNode) {
+              badge.style.transition = 'opacity 0.4s';
+              badge.style.opacity = '0';
+              setTimeout(function() { if (badge.parentNode) badge.parentNode.removeChild(badge); }, 400);
+            }
+            delete newTimers[id];
+          }, 60000);
+        }
+      } else {
+        // Card scrolled out — cancel timer so clock only runs while visible
+        if (newTimers[id]) { clearTimeout(newTimers[id]); delete newTimers[id]; }
+      }
+    });
+  }, { threshold: 0.3 });
+
+  el.querySelectorAll('[data-id]').forEach(function(card) {
+    if (document.getElementById('new-badge-' + card.getAttribute('data-id'))) {
+      observer.observe(card);
+    }
+  });
+}
+
+function goBackFromAppraise() {
+  window._appraiseFromFeed = false;
+  document.getElementById('rw').classList.remove('on');
+  var backBar = document.getElementById('rwBackBar');
+  if (backBar) backBar.style.display = 'none';
+  tab('feed');
+}
+
+function appraiseListing(listing) {
+  window._appraiseFromFeed = true;
+  var keyword = listing.keyword || listing.watchKeyword || '';
+
+  var txt = listing.title + '\n';
+  if (listing.year)         txt += 'Year: ' + listing.year + '\n';
+  if (listing.make)         txt += 'Make: ' + listing.make + '\n';
+  if (listing.transmission) txt += 'Transmission: ' + listing.transmission + '\n';
+  if (listing.fuelType)     txt += 'Fuel type: ' + listing.fuelType + '\n';
+  if (listing.exteriorColor)txt += 'Exterior colour: ' + listing.exteriorColor + '\n';
+  if (listing.interiorColor)txt += 'Interior colour: ' + listing.interiorColor + '\n';
+  if (listing.bodyStyle)    txt += 'Body style: ' + listing.bodyStyle + '\n';
+  if (listing.model)        txt += 'Model: ' + listing.model + '\n';
+  if (listing.price && !listing.isOfferPrice) txt += 'Price: $' + listing.price + '\n';
+  if (listing.isOfferPrice) txt += 'Price: Not stated — seller is using a placeholder price ($' + listing.price + ') meaning they want offers. Treat the actual price as unknown and focus on what a fair offer would be.\n';
+  if (listing.mileage)      txt += 'Odometer: ' + listing.mileage.toLocaleString() + ' km\n';
+  if (listing.location)     txt += 'Location: ' + listing.location + '\n';
+  if (listing.description)  txt += 'Description: ' + listing.description + '\n';
+  txt += 'Facebook Marketplace listing\nURL: ' + listing.url;
+
+  window._appraisalContext    = { imageB64: null, mediaType: null, proxyFailed: false };
+  window._currentListingUrl   = listing.url;
+  window._currentListingTitle = listing.title;
+  window._currentListingImage = listing.image || null;
+
+  tab('scan');
+  document.getElementById('scrScan').classList.remove('on');
+  document.getElementById('rw').classList.remove('on');
+  document.getElementById('lw').classList.add('on');
+  document.getElementById('main').scrollTop = 0;
+
+  var ps = ['p1','p2','p3','p4'];
+  for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp';
+  document.getElementById('p1').classList.add('ac');
+  var si = 0;
+  var stepTimer = setInterval(function() {
+    if (si < ps.length - 1) {
+      document.getElementById(ps[si]).className = 'stp dn';
+      si++;
+      document.getElementById(ps[si]).classList.add('ac');
+    }
+  }, 900);
+
+  var backendUrl = getBackendUrl();
+
+  // Proxy listing image immediately — FB CDN URLs expire within hours, so we fetch
+  // and cache as base64 now rather than letting the backend try a stale URL later.
+  var imageProxyPromise = (listing.image && backendUrl)
+    ? fetch(backendUrl + '/proxy-image?url=' + encodeURIComponent(listing.image), { headers: authHeaders() })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d && d.base64) {
+            window._appraisalContext.imageB64  = d.base64;
+            window._appraisalContext.mediaType = d.mediaType || 'image/jpeg';
+          } else {
+            window._appraisalContext.proxyFailed = true;
+          }
+        })
+        .catch(function() { window._appraisalContext.proxyFailed = true; })
+    : Promise.resolve();
+
+  // Always go straight to AI — no market data pre-check
+  var appraisePromise = Promise.resolve(null);
+
+  // Inline helper — shared by cache-hit and AI paths
+  function showResult(r) {
+    render(r);
+    document.getElementById('lw').classList.remove('on');
+    document.getElementById('rw').classList.add('on');
+    document.getElementById('main').scrollTop = 0;
+    var _bb = document.getElementById('rwBackBar');
+    if (_bb) _bb.style.display = 'block';
+    var existingHeader = document.getElementById('listingHeader');
+    if (existingHeader) existingHeader.remove();
+    var rwEl = document.getElementById('rw');
+    if (rwEl && (window._currentListingImage || window._currentListingUrl)) {
+      var header = document.createElement('div');
+      header.id = 'listingHeader';
+      header.style = 'margin-bottom:16px;border-radius:14px;overflow:hidden;border:1px solid var(--bd)';
+      var inner = '';
+      if (window._currentListingImage) {
+        inner += '<div style="width:100%;height:260px;position:relative;overflow:hidden"><img src="' + window._currentListingImage + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(16px) brightness(0.45);transform:scale(1.1)"><img src="' + window._currentListingImage + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain"></div>';
+      }
+      if (window._currentListingUrl) {
+        inner += '<a href="' + window._currentListingUrl + '" target="_blank" style="display:block;padding:12px;background:rgba(0,255,136,.12);border-top:1px solid rgba(0,255,136,.2);color:var(--g);text-align:center;font-weight:700;font-size:14px;text-decoration:none">&#x1F517; View on Facebook Marketplace</a>';
+      }
+      header.innerHTML = inner;
+      rwEl.insertBefore(header, rwEl.firstChild);
+    }
   }
-  const aiEst = await aiEstimateVehicle(target);
-  const trust = Math.min(poolN/ENOUGH_COMPS,1);
-  let value, source;
-  if (poolN>0&&aiEst) { value=Math.round(poolValue*trust+aiEst*(1-trust)); source='blend'; }
-  else if (poolN>0) { value=poolValue; source='comps_only'; }
-  else if (aiEst) { value=aiEst; source='ai_only'; }
-  else { return {value:null,confidence:0,source:'none',poolN:0}; }
-  const nearestGap = adj.length?Math.min(...adj.map(a=>a.kmGap)):Infinity;
-  const agr = (a,b)=>{ if(!a||!b)return 0; const d=Math.abs(a-b)/Math.max(a,b); return d<0.07?1:d<0.15?0.6:d<0.25?0.2:0; };
-  let confidence = Math.round(55*trust+20*(poolN>0&&aiEst?agr(poolValue,aiEst):0)+15*(nearestGap<30000?1:nearestGap<80000?0.5:0)+10*(source==='comps_only'?1:source==='blend'?0.6:0));
-  confidence = Math.max(5,Math.min(confidence,100));
-  return {value,confidence,source,poolN,aiEst,poolValue};
-}
 
-// ── General goods normaliser ─────────────────────────────
-// Turns a title into { category, brand, product_line, variant, norm_key }
-// so general items get precise cohorts instead of broad keyword buckets.
-const _slug = s => String(s||'').toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
-const _tc   = s => String(s||'').replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
-const _pick = (pairs,t) => { for(const [k,re] of pairs) if(re.test(t)) return k; return null; };
-const CATEGORY_SIGNALS=[['gaming',/\b(ps5|ps4|playstation|xbox|series x|series s|nintendo switch|steam deck|quest ?[23]|oculus)\b/i],['phone',/\b(iphone|galaxy s\d|galaxy note|pixel \d|ipad)\b/i],['power_tool',/\b(milwaukee|makita|de ?walt|ryobi|festool|hilti|metabo|hikoki|m18|m12|18v|impact driver|angle grinder|circular saw|hammer drill)\b/i],['computer',/\b(macbook|imac|thinkpad|dell xps|rtx ?\d{3,4}|graphics card)\b/i],['audio',/\b(sonos|airpods|bose|wh.?1000|quietcomfort|soundbar|turntable)\b/i],['vacuum',/\b(dyson|stick vac|cordless vacuum)\b/i]];
-function detectNormCategory(text){for(const[cat,re]of CATEGORY_SIGNALS)if(re.test(text))return cat;return 'general';}
-const PT_BRANDS=[['milwaukee',/\bmilwaukee\b/i],['makita',/\bmakita\b/i],['dewalt',/\bde ?walt\b/i],['ryobi',/\bryobi\b/i],['festool',/\bfestool\b/i],['hilti',/\bhilti\b/i],['metabo',/\b(metabo|hikoki|hitachi)\b/i],['bosch',/\bbosch\b/i],['ego',/\bego\b/i]];
-const PT_LINE={milwaukee:[['m18',/\bm18\b/i],['m12',/\bm12\b/i]],makita:[['xgt-40v',/\bxgt\b|\b40v\b/i],['cxt-12v',/\bcxt\b|\b12v\b/i],['lxt-18v',/\blxt\b|\b18v\b/i]],dewalt:[['xr-18v',/\bxr\b|\b18v\b|\b20v\b/i]],ryobi:[['one-plus-18v',/\bone\+?\b|\b18v\b/i]]};
-const PT_TOOL=[['hammer-drill',/hammer ?drill|combi ?drill/i],['impact-driver',/impact ?driver/i],['impact-wrench',/impact ?wrench|rattle ?gun/i],['drill',/\bdrill( ?driver)?\b/i],['angle-grinder',/angle ?grinder|\bgrinder\b/i],['circular-saw',/circular ?saw/i],['recip-saw',/recip(rocating)? ?saw|sawzall/i],['multi-tool',/multi ?tool|oscillating/i],['blower',/\bblower\b/i],['nailer',/nail ?gun|nailer/i]];
-function resolvePowerTool(t){const brand=_pick(PT_BRANDS,t);const line=brand&&PT_LINE[brand]?_pick(PT_LINE[brand],t):null;const tool=_pick(PT_TOOL,t);const isKit=/\b(kit|combo|set)\b/i.test(t);const isBare=/\b(bare|skin only|tool only|body only)\b/i.test(t);return{brand,product_line:[line,tool].filter(Boolean).join(' ')||null,variant:isBare?'bare':(isKit?'kit':null),attributes:{kit:isKit,bare:isBare}};}
-const IPHONE=[['iphone-16-pro-max',/iphone ?16 ?pro ?max/i],['iphone-16-pro',/iphone ?16 ?pro/i],['iphone-16',/iphone ?16/i],['iphone-15-pro-max',/iphone ?15 ?pro ?max/i],['iphone-15-pro',/iphone ?15 ?pro/i],['iphone-15',/iphone ?15/i],['iphone-14-pro-max',/iphone ?14 ?pro ?max/i],['iphone-14-pro',/iphone ?14 ?pro/i],['iphone-14',/iphone ?14/i],['iphone-13-pro',/iphone ?13 ?pro/i],['iphone-13',/iphone ?13/i],['iphone-12',/iphone ?12/i],['iphone-11',/iphone ?11/i]];
-const GALAXY=[['galaxy-s24-ultra',/s24 ?ultra/i],['galaxy-s24',/galaxy ?s24/i],['galaxy-s23-ultra',/s23 ?ultra/i],['galaxy-s23',/galaxy ?s23/i],['galaxy-s22',/galaxy ?s22/i]];
-function resolvePhone(t){const brand=/\b(iphone|apple)\b/i.test(t)?'apple':/\b(samsung|galaxy)\b/i.test(t)?'samsung':/\b(pixel|google)\b/i.test(t)?'google':null;const model=brand==='apple'?_pick(IPHONE,t):brand==='samsung'?_pick(GALAXY,t):null;const gb=(t.match(/\b(64|128|256|512)\s?gb\b/i)||[])[1]||(/\b1\s?tb\b/i.test(t)?'1024':null);const locked=/\blocked\b/i.test(t)&&!/\bunlocked\b/i.test(t);return{brand,product_line:model,variant:[gb?`${gb}gb`:null,locked?'locked':null].filter(Boolean).join('-')||null,attributes:{storage_gb:gb?+gb:null,locked}};}
-const CONSOLE=[['ps5-pro',/ps5 ?pro/i],['ps5-slim',/ps5 ?slim/i],['ps5',/ps5|playstation ?5/i],['ps4-pro',/ps4 ?pro/i],['ps4',/ps4|playstation ?4/i],['xbox-series-x',/series ?x/i],['xbox-series-s',/series ?s/i],['switch-oled',/switch ?oled/i],['switch-lite',/switch ?lite/i],['switch',/nintendo ?switch|\bswitch\b/i],['steam-deck',/steam ?deck/i],['quest-3',/quest ?3/i],['quest-2',/quest ?2/i]];
-const CONSOLE_BRAND={'ps5':'sony','ps5-pro':'sony','ps5-slim':'sony','ps4':'sony','ps4-pro':'sony','xbox-series-x':'microsoft','xbox-series-s':'microsoft','switch':'nintendo','switch-oled':'nintendo','switch-lite':'nintendo','steam-deck':'valve','quest-3':'meta','quest-2':'meta'};
-function resolveGaming(t){const model=_pick(CONSOLE,t);let edition=null;if(model&&(model.startsWith('ps5')||model==='xbox-series-x')){if(/digital/i.test(t))edition='digital';else if(/disc/i.test(t))edition='disc';}return{brand:model?CONSOLE_BRAND[model]||null:null,product_line:model,variant:edition,attributes:{edition}};}
-const DYSON_MODELS=[['v15',/v15/i],['v12',/v12/i],['v11',/v11/i],['v10',/v10/i],['v8',/v8/i]];
-function resolveVacuum(t){const brand=/dyson/i.test(t)?'dyson':null;return{brand,product_line:brand?_pick(DYSON_MODELS,t):null,variant:null,attributes:{}};}
-const AUDIO_LIST=[['apple','airpods-pro-2',/airpods ?pro ?(2|2nd)/i],['apple','airpods-pro',/airpods ?pro/i],['apple','airpods-max',/airpods ?max/i],['apple','airpods',/airpods/i],['sony','wh-1000xm5',/wh.?1000xm5|\bxm5\b/i],['sony','wh-1000xm4',/wh.?1000xm4|\bxm4\b/i],['bose','quietcomfort',/quietcomfort|\bqc\b/i],['sonos','sonos',/sonos/i]];
-function resolveAudio(t){for(const[brand,line,re]of AUDIO_LIST)if(re.test(t))return{brand,product_line:line,variant:null,attributes:{}};return{};}
-const MAC_MODELS=[['macbook-pro-16',/macbook ?pro ?16/i],['macbook-pro-14',/macbook ?pro ?14/i],['macbook-pro',/macbook ?pro/i],['macbook-air',/macbook ?air/i],['imac',/imac/i]];
-function resolveComputer(t){const brand=/macbook|imac|apple/i.test(t)?'apple':null;const chip=(t.match(/\bm([1234])\b/i)||[])[1];return{brand,product_line:brand?_pick(MAC_MODELS,t):null,variant:chip?`m${chip}`:null,attributes:{chip:chip?`m${chip}`:null}};}
-const NORM_RESOLVERS={power_tool:resolvePowerTool,phone:resolvePhone,gaming:resolveGaming,vacuum:resolveVacuum,audio:resolveAudio,computer:resolveComputer};
-function normalizeGeneralProduct(listing){
-  const text=`${listing.keyword||''} ${listing.title||''}`;
-  const category=detectNormCategory(text);
-  const r=(NORM_RESOLVERS[category]?NORM_RESOLVERS[category](text):{})||{};
-  const brand=r.brand||null;const product_line=r.product_line||null;const variant=r.variant||null;
-  const resolved=!!(brand&&product_line);
-  return{category,brand,product_line,variant,attributes:r.attributes||{},
-    norm_key:resolved?_slug([category,brand,product_line,variant].filter(Boolean).join(' ')):null,
-    display_name:resolved?_tc([brand,product_line,variant].filter(Boolean).join(' ')):null,resolved};
-}
-
-// ── Keyword price anchor (AI ballpark for the real product) ──────────
-const BROAD_KEYWORD_STOPLIST=new Set(['bmw','mercedes','audi','toyota','ford','holden','honda','nissan','mazda','mitsubishi','hyundai','kia','subaru','volkswagen','vw','jeep','lexus','volvo','car','cars','ute','van','truck','phone','laptop','tv','furniture','tools','desk','chair','table','couch','sofa']);
-function isBroadKeyword(kw){return BROAD_KEYWORD_STOPLIST.has(String(kw||'').toLowerCase().trim());}
-async function getKeywordPriceAnchor(keyword,sampleTitles=[]){
-  const cacheKey=`anchor:${_slug(keyword).slice(0,60)}`;
-  const cached=await redisGet(cacheKey);if(cached&&cached.anchor)return cached.anchor;
-  if(!GEMINI_API_KEY&&!ANTHROPIC_API_KEY)return null;
-  const prompt=['You estimate the typical USED resale price in AUD on Australian Facebook Marketplace.',`Product keyword: "${keyword}"`,sampleTitles.length?`Example titles:\n- ${sampleTitles.slice(0,6).join('\n- ')}`:'','Give ONE rough typical price for the MAIN product in good used condition (NOT accessories/parts).','Return ONLY JSON: { "anchor_aud": number }'].filter(Boolean).join('\n');
-  try{
-    let text='';
-    if(GEMINI_API_KEY){const r=await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,{contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},{headers:{'Content-Type':'application/json'},timeout:10000});text=r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';}
-    else{const r=await axios.post('https://api.anthropic.com/v1/messages',{model:'claude-haiku-4-5-20251001',max_tokens:100,messages:[{role:'user',content:prompt}]},{headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},timeout:10000});text=r.data?.content?.[0]?.text||'';}
-    const m=text.match(/\{[\s\S]*\}/);const anchor=m?Math.round(JSON.parse(m[0]).anchor_aud):null;
-    if(anchor&&anchor>0){await redisSet(cacheKey,{anchor},30*24*3600);return anchor;}
-  }catch(e){console.error('[Anchor]',keyword,e.message);}
-  return null;
-}
-async function refreshKeywordAnchors(){
-  try{
-    const{rows}=await pool.query(`SELECT keyword,COUNT(*)::INT AS n,(ARRAY_AGG(title ORDER BY scraped_at DESC))[1:6] AS sample_titles FROM listings WHERE keyword IS NOT NULL AND category!='vehicle' AND price>0 AND is_active=TRUE GROUP BY keyword HAVING COUNT(*)>=8`);
-    for(const r of rows){if(isBroadKeyword(r.keyword))continue;const anchor=await getKeywordPriceAnchor(r.keyword,r.sample_titles||[]);if(anchor){await pool.query(`INSERT INTO keyword_anchors(keyword,anchor_price,updated_at)VALUES($1,$2,NOW())ON CONFLICT(keyword)DO UPDATE SET anchor_price=EXCLUDED.anchor_price,updated_at=NOW()`,[r.keyword,anchor]);}await new Promise(res=>setTimeout(res,200));}
-    console.log(`[Anchor] refreshed ${rows.length} keyword anchors`);
-  }catch(e){console.error('[Anchor] refresh error:',e.message);}
-}
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`FlipRadar backend on port ${PORT}`);
-  console.log(`SociaVault: ${SOCIAVAULT_API_KEY ? 'set' : 'NO TOKEN — add SOCIAVAULT_API_KEY'}`);
-  console.log(`Redis:      ${REDIS_URL           ? 'connected' : 'NOT SET'}`);
-  console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
-  console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
-  await initDB();          // create tables if not exist
-  await loadAllWatches();
-  const dbSummary = await getDBSummary();
-  if (dbSummary) {
-    console.log(`[DB] ${dbSummary.total_listings} listings · ${dbSummary.unique_keywords} keywords · ${dbSummary.unique_makes} vehicle makes`);
+  function _showErr(msg) {
+    clearInterval(stepTimer);
+    document.getElementById('lw').classList.remove('on');
+    document.getElementById('scrScan').classList.add('on');
+    showErr(msg);
   }
-  console.log('[Ready] Server fully loaded');
-  runSeedJob().catch(e => console.error('[Seed] startup run error:', e.message));
-});
+
+  function _finishAI(r) {
+    clearInterval(stepTimer);
+    for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
+    r = Object.assign({
+      extractedTitle:      listing.title,
+      extractedPrice:      listing.price || 0,
+      extractedMileage:    listing.mileage || null,
+      timeToSell:          '—',
+      demandLevel:         '—',
+      greenFlags:          [],
+      redFlags:            [],
+      whatToCheckInPerson: [],
+      whyItsWorth:         ''
+    }, r);
+    if (listing.isOfferPrice) normalizeOfferPriceResult(r);
+    var entry = { id: Date.now(), title: r.extractedTitle, price: r.extractedPrice || listing.price, image: listing.image || null, url: listing.url || null, result: r, date: new Date().toLocaleDateString('en-AU') };
+    hist.unshift(entry); sv(); updatePill();
+    setTimeout(function() { showResult(r); }, 400);
+  }
+
+  // /appraise resolves first — check for cache hit or limit hit immediately (no image needed)
+  appraisePromise.then(function(appraiseData) {
+
+    // ── Limit hit ──
+    if (appraiseData && appraiseData.error) {
+      _showErr('❌ ' + appraiseData.error);
+      return;
+    }
+
+    // ── Race image proxy vs 1.5s timeout — don't block AI for a slow/expired image ──
+    Promise.race([
+      imageProxyPromise,
+      new Promise(function(resolve) { setTimeout(resolve, 1500); })
+    ]).then(function() {
+
+      // Vehicle path — /ai/vehicle with mileage/year/make context + image if available
+      if (listing.make && backendUrl) {
+        var vehiclePayload = {
+          make: listing.make,
+          model: listing.model || '',
+          year: listing.year,
+          mileage: listing.mileage || null,
+          transmission: listing.transmission || null,
+          listingPrice: listing.price,
+          title: listing.title,
+          description: listing.description || '',
+          listingId: listing.id || null,
+          listingUrl: listing.url || null
+        };
+        var imgCtx = window._appraisalContext;
+        if (imgCtx && imgCtx.imageB64 && !imgCtx.proxyFailed) {
+          vehiclePayload.imageBase64 = imgCtx.imageB64;
+          vehiclePayload.imageMime   = imgCtx.mediaType || 'image/jpeg';
+        }
+        fetch(backendUrl + '/ai/vehicle', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify(vehiclePayload)
+        }).then(function(resp) { return resp.json(); })
+          .then(_finishAI)
+          .catch(function(e) { _showErr('Error: ' + e.message); });
+        return;
+      }
+
+      // Non-vehicle — call AI text path
+      callAI_text(txt, keyword).then(function(r) {
+        clearInterval(stepTimer);
+        for (var i = 0; i < ps.length; i++) document.getElementById(ps[i]).className = 'stp dn';
+        if (listing.isOfferPrice) normalizeOfferPriceResult(r);
+        var entry = { id: Date.now(), title: r.extractedTitle || listing.title, price: r.extractedPrice || listing.price, image: listing.image || null, url: listing.url || null, result: r, date: new Date().toLocaleDateString('en-AU') };
+        hist.unshift(entry); sv(); updatePill();
+        setTimeout(function() { showResult(r); }, 400);
+      }).catch(function(e) { _showErr('Error: ' + e.message); });
+
+    }).catch(function(e) { _showErr('Error: ' + e.message); });
+
+  }).catch(function(e) { _showErr('Error: ' + e.message); });
+}
+
+function appraiseIdx(el) {
+  var elCopy = el;
+  checkAppraisalLimit().then(function(allowed) { if (allowed) _doAppraiseIdx(elCopy); });
+}
+function _doAppraiseIdx(el) {
+  var idx = parseInt(el.getAttribute('data-idx'));
+  var listing = _feedItems[idx];
+  if (!listing) return;
+  appraiseListing(listing);
+}
+
+function closeBlockedModal() {
+  var m = document.getElementById('blockedModal');
+  if (m) m.remove();
+}
+
+function showBlockedListings() {
+  var url = getBackendUrl();
+  if (!url) { toast('No backend connected'); return; }
+  fetch(url + '/listings/blocked', { headers: authHeaders() })
+    .then(function(r) { return r.json(); })
+    .then(function(blocked) {
+      if (!blocked.length) { toast('No blocked listings'); return; }
+      // Show modal with blocked listings
+      var modal = document.createElement('div');
+      modal.id = 'blockedModal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:9999;overflow-y:auto;padding:20px';
+      modal.innerHTML = '<div style="max-width:500px;margin:0 auto">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">' +
+        '<div style="font-size:18px;font-weight:800;color:#fff">🚫 Blocked Listings (' + blocked.length + ')</div>' +
+        '<button onclick="closeBlockedModal()" style="background:none;border:none;color:#888;font-size:20px;cursor:pointer">✕</button>' +
+        '</div>' +
+        '<div style="font-size:12px;color:#666;margin-bottom:12px">These were filtered out. Tap Restore to add back to your feed.</div>' +
+        blocked.map(function(l) {
+          return '<div class="blocked-item" style="background:#0d0d1a;border:1px solid #1a1a2e;border-radius:12px;padding:12px;margin-bottom:8px;display:flex;gap:10px;align-items:center">' +
+            (l.image ? '<img src="' + l.image + '" style="width:50px;height:50px;object-fit:cover;border-radius:8px;flex-shrink:0">' : '<div style="width:50px;height:50px;background:#1a1a2e;border-radius:8px;flex-shrink:0"></div>') +
+            '<div style="flex:1;min-width:0">' +
+            '<div style="color:#fff;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + (l.title || '—') + '</div>' +
+            '<div style="color:#00ff88;font-size:12px">' + (l.price ? '$' + l.price : 'No price') + '</div>' +
+            '<div style="color:#555;font-size:11px">' + (l.keyword || '') + '</div>' +
+            '</div>' +
+            '<button data-id="' + l.id + '" onclick="unblockListing(this.dataset.id,this)" style="padding:6px 10px;background:rgba(0,255,136,.15);border:1px solid rgba(0,255,136,.3);border-radius:8px;color:#00ff88;font-size:12px;cursor:pointer;flex-shrink:0">Restore</button>' +
+            '</div>';
+        }).join('') +
+        '</div>';
+      document.body.appendChild(modal);
+    })
+    .catch(function() { toast('Could not load blocked listings'); });
+}
+
+function unblockListing(id, btn) {
+  var url = getBackendUrl();
+  if (!url) return;
+  btn.textContent = '...';
+  btn.disabled = true;
+  fetch(url + '/listings/unblock', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ id: id })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      btn.closest('.blocked-item').remove();
+      refreshListings();
+      toast('✅ Restored to feed');
+    }
+  }).catch(function() { btn.textContent = 'Restore'; btn.disabled = false; });
+}
+
+function clearListings() {
+  var url = getBackendUrl();
+  if (!url) return;
+  if (!confirm('Clear all listings?')) return;
+  fetch(url + '/listings', { method: 'DELETE', headers: authHeaders() })
+    .then(function() { localStorage.removeItem('fr_last_fetch'); saveCachedListings([]); toast('🗑️ Listings cleared'); refreshListings(); })
+    .catch(function() { toast('Failed to clear'); });
+}
