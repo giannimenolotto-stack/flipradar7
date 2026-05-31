@@ -3362,39 +3362,95 @@ async function rebuildGlobalDeals() {
   try {
     // Pull recent listings with a known keyword median so we can compute % off.
     // Only real prices, active, not spam/damage, scraped within 14 days.
-    const { rows } = await pool.query(`
-      SELECT
-        l.listing_id,
-        l.title,
-        l.price,
-        l.image_url,
-        l.url,
-        l.location,
-        l.state,
-        l.keyword,
-        l.category,
-        l.make,
-        l.model,
-        l.year,
-        l.kms       AS mileage,
-        l.transmission,
-        l.fuel_type AS "fuelType",
-        l.listed_at AS "listedAt",
-        k.median_price AS median
-      FROM listings l
-      JOIN keyword_price_stats k ON k.keyword = l.keyword
-      WHERE l.is_active = TRUE
-        AND l.is_offer_price = FALSE
-        AND l.price > 0
-        AND l.price_quality IN ('ok')
-        AND l.in_price_pool = TRUE
-        AND l.scraped_at > NOW() - INTERVAL '14 days'
-        AND k.median_price > 0
-        AND k.sample_count >= 6
-        AND l.price < k.median_price * 0.92   -- must be at least 8% below median to qualify
-      ORDER BY (k.median_price - l.price)::float / k.median_price DESC
-      LIMIT 500
-    `);
+    // ── Step 1: try to get deals using keyword_price_stats (IQR-cleaned medians) ──
+    // Falls back to a live per-keyword median if stats table isn't populated yet.
+    let rows;
+    const statsCheck = await pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats');
+    const hasStats = statsCheck.rows[0].cnt >= 5;
+
+    if (hasStats) {
+      // Normal path — join against pre-built stats table
+      ({ rows } = await pool.query(`
+        SELECT
+          l.listing_id,
+          l.title,
+          l.price,
+          l.image_url,
+          l.url,
+          l.location,
+          l.state,
+          l.keyword,
+          l.category,
+          l.make,
+          l.model,
+          l.year,
+          l.kms       AS mileage,
+          l.transmission,
+          l.fuel_type AS "fuelType",
+          l.listed_at AS "listedAt",
+          k.median_price AS median
+        FROM listings l
+        JOIN keyword_price_stats k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE
+          AND l.is_offer_price = FALSE
+          AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND k.median_price > 0
+          AND k.sample_count >= 4
+          AND l.price < k.median_price * 0.92
+        ORDER BY (k.median_price - l.price)::float / k.median_price DESC
+        LIMIT 500
+      `));
+    } else {
+      // Fallback — compute live medians on the fly per keyword so deals work
+      // immediately after seed scan before nightly cron has run
+      console.log('[Deals] keyword_price_stats not ready — using live medians');
+      ({ rows } = await pool.query(`
+        WITH kmedians AS (
+          SELECT
+            keyword,
+            COUNT(*)::INT AS cnt,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+          FROM listings
+          WHERE price > 0
+            AND is_offer_price = FALSE
+            AND is_active = TRUE
+            AND scraped_at > NOW() - INTERVAL '30 days'
+            AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          GROUP BY keyword
+          HAVING COUNT(*) >= 4
+        )
+        SELECT
+          l.listing_id,
+          l.title,
+          l.price,
+          l.image_url,
+          l.url,
+          l.location,
+          l.state,
+          l.keyword,
+          l.category,
+          l.make,
+          l.model,
+          l.year,
+          l.kms       AS mileage,
+          l.transmission,
+          l.fuel_type AS "fuelType",
+          l.listed_at AS "listedAt",
+          k.median_price AS median
+        FROM listings l
+        JOIN kmedians k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE
+          AND l.is_offer_price = FALSE
+          AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND l.price < k.median_price * 0.92
+        ORDER BY (k.median_price - l.price)::float / k.median_price DESC
+        LIMIT 500
+      `));
+    }
 
     // Compute pctOff and base score
     const deals = rows.map(r => {
@@ -3433,8 +3489,66 @@ async function rebuildGlobalDeals() {
   }
 }
 
-// Rebuild on boot (after a short delay so DB is warm) + every 90 min
+// Rebuild deals on boot immediately
 setTimeout(() => rebuildGlobalDeals().catch(() => {}), 15000);
+
+// After seed scan completes, run a quick stats pass so deals are populated right away
+// (full nightly cron also runs at 2am — this just ensures first-boot experience works)
+async function quickStatsAndDealsRebuild() {
+  try {
+    console.log('[Boot] Running quick keyword stats pass...');
+    await pool.query(`
+      INSERT INTO keyword_price_stats
+        (keyword, raw_count, sample_count, median_price, p25_price, p75_price,
+         floor_price, ceiling_price, updated_at)
+      WITH base AS (
+        SELECT keyword,
+          COUNT(*)::INT AS raw_count,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25_raw,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75_raw
+        FROM listings
+        WHERE price > 0 AND is_offer_price = FALSE AND is_active = TRUE
+          AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+        GROUP BY keyword HAVING COUNT(*) >= 4
+      )
+      SELECT
+        b.keyword,
+        b.raw_count,
+        COUNT(l.id)::INT,
+        PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT,
+        GREATEST(0, b.p25_raw - 1.5*(b.p75_raw - b.p25_raw))::INT,
+        (b.p75_raw + 1.5*(b.p75_raw - b.p25_raw))::INT,
+        NOW()
+      FROM listings l
+      JOIN base b ON b.keyword = l.keyword
+      WHERE l.price BETWEEN GREATEST(0, b.p25_raw - 1.5*(b.p75_raw-b.p25_raw))
+                        AND (b.p75_raw + 1.5*(b.p75_raw-b.p25_raw))
+        AND l.price > 0 AND l.is_offer_price = FALSE AND l.is_active = TRUE
+        AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+      GROUP BY b.keyword, b.raw_count, b.p25_raw, b.p75_raw
+      HAVING COUNT(l.id) >= 4
+      ON CONFLICT (keyword) DO UPDATE SET
+        raw_count    = EXCLUDED.raw_count,
+        sample_count = EXCLUDED.sample_count,
+        median_price = EXCLUDED.median_price,
+        p25_price    = EXCLUDED.p25_price,
+        p75_price    = EXCLUDED.p75_price,
+        floor_price  = EXCLUDED.floor_price,
+        ceiling_price= EXCLUDED.ceiling_price,
+        updated_at   = NOW()
+    `);
+    const { rows } = await pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats');
+    console.log(`[Boot] Quick stats done — ${rows[0].cnt} keywords in stats table`);
+    await rebuildGlobalDeals();
+  } catch (e) {
+    console.error('[Boot] Quick stats/deals rebuild failed:', e.message);
+  }
+}
+
+// Run quick stats rebuild 5 minutes after boot (gives seed scan time to fill some data)
+setTimeout(() => quickStatsAndDealsRebuild(), 5 * 60 * 1000);
 cron.schedule('0 */2 * * *', () => rebuildGlobalDeals().catch(e => console.error('[Deals Cron]', e.message)));
 
 // ── Seed Keyword Scanner ──────────────────────────────────
