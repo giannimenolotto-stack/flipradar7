@@ -546,7 +546,7 @@ Look at the photo and return ONLY this JSON (no markdown):
 Be strict on matches_keyword — only false if the item in the photo is clearly a DIFFERENT type of product. Minor brand differences are fine.`;
 
     const res = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: [
         { inline_data: { mime_type: imgMime, data: imgBase64 } },
         { text: prompt }
@@ -2879,7 +2879,7 @@ Scoring guide:
             } catch (_) {}
           }
           const res = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
             { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
             { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
           );
@@ -3007,7 +3007,7 @@ Return ONLY valid JSON (no markdown):
 Be strict on matches_keyword — only mark false if the item in the photo is clearly a DIFFERENT type of product than the keyword describes. Minor brand/model differences are fine.`;
 
         const geminiRes = await axios.post(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
           { contents: [{ parts: [
             { inline_data: { mime_type: imgMime, data: imgBase64 } },
             { text: prompt }
@@ -3915,11 +3915,7 @@ async function rebuildGlobalDeals() {
   }
 }
 
-// Rebuild deals on boot immediately
-setTimeout(() => rebuildGlobalDeals().catch(() => {}), 15000);
-
-// After seed scan completes, run a quick stats pass so deals are populated right away
-// (full nightly cron also runs at 2am — this just ensures first-boot experience works)
+// Boot sequence is handled by runFullBootSequence() — see below
 async function quickStatsAndDealsRebuild() {
   try {
     console.log('[Boot] Running quick keyword stats pass...');
@@ -3983,8 +3979,69 @@ async function quickStatsAndDealsRebuild() {
 }
 
 // Run quick stats rebuild 5 minutes after boot (gives seed scan time to fill some data)
-setTimeout(() => quickStatsAndDealsRebuild(), 5 * 60 * 1000);
+// Boot sequence handles stats rebuild — see runFullBootSequence()
 cron.schedule('0 */2 * * *', () => rebuildGlobalDeals().catch(e => console.error('[Deals Cron]', e.message)));
+
+// ── Full boot sequence ────────────────────────────────────────────────────────
+// Runs everything in the right order immediately on deploy.
+// Steps are chained so each one has data from the previous step.
+
+async function runFullBootSequence() {
+  console.log('[Boot] Starting full boot sequence...');
+  try {
+    // Step 1: Seed scan — fills DB with fresh listings across all 332 keywords
+    // This runs in background and doesn't block the rest of the sequence
+    console.log('[Boot] Step 1 — Starting seed scan in background...');
+    runFullSeedScanOnce().catch(e => console.error('[Boot] Seed scan error:', e.message));
+
+    // Step 2: Anchor refresh — Gemini prices every keyword
+    // Wait 2 min first so seed scan has had time to land some initial data
+    console.log('[Boot] Step 2 — Waiting 2min for initial seed data, then refreshing anchors...');
+    await new Promise(r => setTimeout(r, 2 * 60 * 1000));
+    await refreshKeywordAnchors();
+    console.log('[Boot] Anchors refreshed');
+
+    // Step 3: Stats rebuild — anchor-gated IQR-cleaned medians
+    console.log('[Boot] Step 3 — Rebuilding keyword stats...');
+    await quickStatsAndDealsRebuild();
+    console.log('[Boot] Stats + deals rebuilt');
+
+    // Step 4: Score all listings — quality pass
+    console.log('[Boot] Step 4 — Running quality scoring pass...');
+    await pool.query(`
+      UPDATE listings SET price_quality = 'ok'
+      WHERE price_quality = 'unscored'
+        AND price > 0
+        AND is_offer_price = FALSE
+        AND title NOT ~* '\\y(wanted|wtb|wtt|swap|trade|parts only|wrecking|for parts|not working|broken|faulty|damaged|cracked|smashed|as is|spares)\\y'
+    `);
+    console.log('[Boot] Quality pass done');
+
+    // Step 5: AI product extraction — identify exact products from titles
+    console.log('[Boot] Step 5 — AI product extraction...');
+    await extractProductsNightly();
+
+    // Step 6: Rebuild product price stats
+    console.log('[Boot] Step 6 — Rebuilding product stats...');
+    await rebuildProductPriceStats();
+
+    // Step 7: Gemini image analysis — any unanalysed listings
+    console.log('[Boot] Step 7 — Gemini image analysis...');
+    await analyseListingImagesNightly();
+
+    // Step 8: AI flip scoring
+    console.log('[Boot] Step 8 — AI flip scoring...');
+    await scoreDealsWithAINightly();
+
+    // Step 9: Final deals rebuild with all fresh data
+    console.log('[Boot] Step 9 — Final deals rebuild...');
+    await rebuildGlobalDeals();
+
+    console.log('[Boot] ✅ Full boot sequence complete — everything is live');
+  } catch (e) {
+    console.error('[Boot] Sequence error:', e.message);
+  }
+}
 
 // ── Seed Keyword Scanner ──────────────────────────────────
 // Scans a broad list of keywords to build the price database independently
@@ -4234,7 +4291,7 @@ async function runFullSeedScanOnce() {
   console.log(`[SeedScan] ✅ Done — ${totalSaved} new listings saved, ${skippedDb} keywords skipped (already in DB)`);
 }
 
-setTimeout(() => runFullSeedScanOnce().catch(e => console.error('[SeedScan Boot]', e.message)), 30000);
+// Seed scan triggered by runFullBootSequence()
 
 // Admin endpoint to check seed scan status
 app.get('/admin/seed-status', authMiddleware, async (req, res) => {
@@ -4396,7 +4453,7 @@ Look at the photo and return ONLY this JSON (no markdown):
 Only mark matches_keyword false if it is clearly a DIFFERENT type of product.`;
 
     const geminiRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: [
         { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
         { text: prompt }
@@ -5203,7 +5260,7 @@ Return ONLY JSON (no markdown):
     if (imgData) identifyParts.unshift({ inline_data: imgData });
 
     const identRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: identifyParts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
       { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
     );
@@ -5395,7 +5452,7 @@ Max 6 words per reason. Be specific — mention the actual value if you know it.
 
     if (useGemini) {
       const r = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
         { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
       );
@@ -5699,10 +5756,45 @@ app.listen(PORT, async () => {
   console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
   console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
   await initDB();          // create tables if not exist
+
+  // ── One-time data quality reset ──────────────────────────────────────────
+  // Runs once per deploy via a flag in Redis. Clears polluted price stats
+  // and resets price pool flags so tonight's nightly rebuilds everything
+  // cleanly with the anchor gate in place.
+  const RESET_FLAG = 'fr:migration:anchor-reset-v1';
+  const alreadyReset = await redisGet(RESET_FLAG);
+  if (!alreadyReset) {
+    try {
+      console.log('[Migration] Running one-time anchor reset...');
+
+      // Clear polluted stats tables — will be rebuilt cleanly at 2am
+      await pool.query('TRUNCATE keyword_price_stats');
+      await pool.query('TRUNCATE keyword_anchors');
+
+      // Reset price_quality on non-vehicle listings that weren't manually flagged
+      // so the nightly re-scores them through the anchor filter
+      const { rowCount } = await pool.query(`
+        UPDATE listings
+        SET in_price_pool = TRUE,
+            price_quality = 'unscored'
+        WHERE category != 'vehicle'
+          AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+      `);
+
+      await redisSet(RESET_FLAG, { doneAt: new Date().toISOString() });
+      console.log(`[Migration] ✅ Done — reset ${rowCount} listings, cleared price stats.`);
+    } catch (e) {
+      console.error('[Migration] Reset failed:', e.message);
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────
   await loadAllWatches();
   const dbSummary = await getDBSummary();
   if (dbSummary) {
     console.log(`[DB] ${dbSummary.total_listings} listings · ${dbSummary.unique_keywords} keywords · ${dbSummary.unique_makes} vehicle makes`);
   }
   console.log('[Ready] Server fully loaded');
+
+  // Kick off full boot sequence — runs everything now rather than waiting for cron
+  setTimeout(() => runFullBootSequence(), 5000);
 });
