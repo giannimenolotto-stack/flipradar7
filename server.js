@@ -218,6 +218,14 @@ async function initDB() {
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS img_matches_keyword BOOLEAN',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS img_mismatch_reason TEXT',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS img_analysed_at TIMESTAMPTZ',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_score INTEGER',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_deal_type TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_demand TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_estimated_resale INTEGER',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_estimated_margin INTEGER',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_fix_cost INTEGER',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_reasoning TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_scored_at TIMESTAMPTZ',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS previous_price INTEGER',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_dropped_at TIMESTAMPTZ',
@@ -2670,10 +2678,7198 @@ cron.schedule('0 2 * * *', async () => {
     // ── Step 10: Gemini image analysis ───────────────────────
     await analyseListingImagesNightly();
 
+    // ── Step 11: AI flip scoring ──────────────────────────────
+    await scoreDealsWithAINightly();
+
   } catch (e) {
     console.error('[Cron] Stats rebuild error:', e.message);
   }
 });
+
+// ── AI Flip Scoring ─────────────────────────────────────────────────────────
+// Reads title + description + price + image analysis results and asks Gemini
+// to score each listing as a flip opportunity. One API call per listing.
+// Runs nightly, never re-scores. Only scores listings that are in the price pool.
+
+async function scoreDealsWithAINightly() {
+  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) {
+    console.log('[FlipScore] No AI key — skipping'); return;
+  }
+
+  const BATCH = 30;
+  let processed = 0;
+
+  while (true) {
+    // Pick unscored listings that are active, real-priced, not already spam/damage-excluded
+    const { rows } = await pool.query(`
+      SELECT
+        l.id, l.listing_id, l.title, l.description, l.price,
+        l.keyword, l.category, l.make, l.model, l.year, l.kms,
+        l.image_url, l.img_condition, l.img_matches_keyword,
+        l.extracted_product, l.extracted_category, l.extracted_brand,
+        k.median_price, k.p25_price, k.p75_price
+      FROM listings l
+      LEFT JOIN keyword_price_stats k ON k.keyword = l.keyword
+      WHERE l.flip_scored_at IS NULL
+        AND l.price > 0
+        AND l.is_offer_price = FALSE
+        AND l.is_active = TRUE
+        AND l.price_quality NOT IN ('spam','swap','accessory')
+        AND l.img_matches_keyword IS NOT FALSE
+      ORDER BY l.scraped_at DESC
+      LIMIT $1
+    `, [BATCH]);
+
+    if (!rows.length) break;
+    console.log(`[FlipScore] Scoring batch of ${rows.length} listings...`);
+
+    for (const row of rows) {
+      try {
+        const median    = row.median_price || null;
+        const product   = row.extracted_product || row.title || row.keyword || 'unknown item';
+        const condition = row.img_condition || 'unknown';
+        const desc      = (row.description || '').slice(0, 300);
+        const isBroken  = /\b(broken|faulty|not working|dead|cracked|smashed|parts only|as is|for parts|damaged|repair|needs work|spares)\b/i.test((row.title || '') + ' ' + desc);
+
+        const prompt = `You are an expert Australian marketplace flipper scoring a Facebook Marketplace listing as a flip opportunity.
+
+Listing:
+- Product: ${product}
+- Title: "${(row.title||'').slice(0,120)}"
+- Description: "${desc}"
+- Listed price: ${row.price} AUD
+- Photo condition assessment: ${condition}
+- Keyword median market price: ${median ? '
+// Analyses each listing photo to:
+//   1. Assess item condition (new/like_new/good/fair/poor/damaged)
+//   2. Verify the photo actually matches the keyword — flags mismatches (e.g. moped listed as electric scooter)
+// Runs nightly, never re-analyses a listing. Costs ~$0.000075 per image.
+
+async function analyseListingImagesNightly() {
+  if (!GEMINI_API_KEY) { console.log('[ImgAnalysis] No Gemini key — skipping'); return; }
+
+  const BATCH = 20;
+  let processed = 0;
+  let flagged = 0;
+
+  while (true) {
+    const { rows } = await pool.query(`
+      SELECT id, listing_id, title, keyword, price, image_url,
+             extracted_product, extracted_category
+      FROM listings
+      WHERE img_analysed_at IS NULL
+        AND image_url IS NOT NULL AND image_url != ''
+        AND price > 0
+        AND is_active = TRUE
+      ORDER BY scraped_at DESC
+      LIMIT $1
+    `, [BATCH]);
+
+    if (!rows.length) break;
+
+    console.log(`[ImgAnalysis] Analysing batch of ${rows.length} images...`);
+
+    for (const row of rows) {
+      try {
+        // Fetch image
+        let imgBase64 = null, imgMime = 'image/jpeg';
+        try {
+          const imgRes = await axios.get(row.image_url, {
+            responseType: 'arraybuffer', timeout: 12000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+          });
+          imgBase64 = Buffer.from(imgRes.data).toString('base64');
+          imgMime = imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg';
+        } catch (_) {
+          await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+          continue;
+        }
+
+        const keyword  = row.keyword || row.extracted_product || row.title || 'unknown';
+        const category = row.extracted_category || 'general';
+
+        const prompt = `Analyse this Facebook Marketplace listing photo.
+
+Listing:
+- Search keyword: "${keyword}"
+- Title: "${(row.title||'').slice(0,120)}"
+- Category: ${category}
+- Price: ${row.price} AUD
+
+Return ONLY valid JSON (no markdown):
+{
+  "condition": "new" | "like_new" | "good" | "fair" | "poor" | "damaged" | "cannot_assess",
+  "matches_keyword": true | false,
+  "mismatch_reason": null | "short reason e.g. photo shows a petrol moped not an electric scooter",
+  "visible_damage": true | false,
+  "is_stock_photo": true | false
+}
+
+Be strict on matches_keyword — only mark false if the item in the photo is clearly a DIFFERENT type of product than the keyword describes. Minor brand/model differences are fine.`;
+
+        const geminiRes = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+          { contents: [{ parts: [
+            { inline_data: { mime_type: imgMime, data: imgBase64 } },
+            { text: prompt }
+          ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+        );
+
+        const raw = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (!match) {
+          await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+          continue;
+        }
+
+        const result = JSON.parse(match[0]);
+
+        // Determine quality penalty
+        let newQuality = null;
+        if (result.matches_keyword === false) {
+          newQuality = 'spam'; // wrong item — exclude from price pool and deals
+          flagged++;
+          console.log(`[ImgAnalysis] ❌ MISMATCH: "${row.title}" (kw: ${keyword}) — ${result.mismatch_reason}`);
+        } else if (result.condition === 'damaged' || result.visible_damage) {
+          newQuality = 'damage'; // still shows in deals but tint is capped
+        }
+
+        await pool.query(`
+          UPDATE listings SET
+            img_condition       = $1,
+            img_matches_keyword = $2,
+            img_mismatch_reason = $3,
+            img_analysed_at     = NOW(),
+            price_quality = CASE
+              WHEN $4::TEXT IS NOT NULL THEN $4
+              ELSE price_quality
+            END
+          WHERE id = $5
+        `, [
+          result.condition || null,
+          result.matches_keyword !== false,
+          result.mismatch_reason || null,
+          newQuality,
+          row.id,
+        ]);
+
+        processed++;
+        await new Promise(r => setTimeout(r, 400));
+
+      } catch (e) {
+        console.error(`[ImgAnalysis] Error on ${row.listing_id}:`, e.message);
+        await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+      }
+    }
+
+    console.log(`[ImgAnalysis] Running total: ${processed} analysed, ${flagged} mismatches flagged`);
+  }
+
+  console.log(`[ImgAnalysis] ✅ Done — ${processed} images analysed, ${flagged} removed as mismatches`);
+}
+
+// ── Product Extraction ────────────────────────────────────
+// Reads unprocessed listing titles in batches of 50, asks Claude to identify
+// the exact product, saves back to DB. Runs nightly — never re-processes a listing.
+
+async function extractProductsNightly() {
+  if (!ANTHROPIC_API_KEY) { console.log('[Extract] No Anthropic key — skipping'); return; }
+
+  const BATCH = 50;
+  let processed = 0;
+
+  while (true) {
+    // Grab next batch of unextracted listings (non-vehicle, has a real price)
+    const { rows } = await pool.query(`
+      SELECT id, listing_id, title, keyword, price
+      FROM listings
+      WHERE extracted_at IS NULL
+        AND category != 'vehicle'
+        AND price > 0
+        AND is_offer_price = FALSE
+        AND price_quality IN ('ok', 'unscored')
+        AND title IS NOT NULL AND title != ''
+      ORDER BY scraped_at DESC
+      LIMIT $1
+    `, [BATCH]);
+
+    if (!rows.length) break;
+
+    console.log(`[Extract] Processing batch of ${rows.length} listings...`);
+
+    // Build prompt — ask Claude to classify all titles in one call
+    const items = rows.map((r, i) => `${i+1}. "${r.title.replace(/"/g, "'").slice(0, 120)}" (keyword: ${r.keyword || 'unknown'}, price: ${r.price})`).join('\n');
+
+    const prompt = `You are extracting structured product data from Australian Facebook Marketplace listing titles.
+
+For each listing, identify the EXACT product being sold. Focus on the specific model/item, not accessories or bundles.
+
+Rules:
+- extracted_product: the clean standardised product name (e.g. "Milwaukee M18 Impact Driver", "iPhone 15 Pro 256GB", "Weber Q2200 BBQ", "Dyson V15 Detect", "Trek Marlin 7 Mountain Bike")
+- brand: the manufacturer/brand (e.g. "Milwaukee", "Apple", "Weber", "Trek")  
+- category: one of: phones | laptops | tablets | gaming | tvs | audio | power_tools | hand_tools | garden | camping | vehicles | bikes | furniture | appliances | fitness | musical_instruments | photography | baby_kids | clothing | watches | collectibles | trade_industrial | general
+- variant: any key differentiator like storage size, colour, voltage, size (e.g. "256GB", "18V", "65 inch", "XL") — null if none
+- confidence: "high" if you are certain of the exact product, "medium" if you made a reasonable guess, "low" if the title is too vague
+
+Listings:
+${items}
+
+Return ONLY a JSON array with ${rows.length} objects in the same order:
+[{"extracted_product":"...","brand":"...","category":"...","variant":"...","confidence":"..."},...]
+
+No explanation. No markdown. Start with [ and end with ].`;
+
+    try {
+      const resp = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 4000,
+        messages: [{ role: 'user', content: prompt }],
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        timeout: 30000,
+      });
+
+      const text = resp.data?.content?.[0]?.text || '';
+      const match = text.match(/\[[\s\S]*\]/);
+      if (!match) { console.error('[Extract] Bad response, skipping batch'); break; }
+
+      const results = JSON.parse(match[0]);
+
+      // Write results back to DB
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const r = results[i] || {};
+        await pool.query(`
+          UPDATE listings SET
+            extracted_product     = $1,
+            extracted_brand       = $2,
+            extracted_category    = $3,
+            extracted_variant     = $4,
+            extraction_confidence = $5,
+            extracted_at          = NOW()
+          WHERE id = $6
+        `, [
+          r.extracted_product || null,
+          r.brand             || null,
+          r.category          || null,
+          r.variant           || null,
+          r.confidence        || 'low',
+          row.id,
+        ]);
+      }
+
+      processed += rows.length;
+      console.log(`[Extract] ${processed} listings extracted so far...`);
+
+      // Small delay between batches — be gentle on API
+      await new Promise(res => setTimeout(res, 1000));
+
+    } catch (e) {
+      console.error('[Extract] Batch failed:', e.message);
+      // Mark these as attempted so we don't retry in an infinite loop
+      const ids = rows.map(r => r.id);
+      await pool.query(`UPDATE listings SET extracted_at = NOW() WHERE id = ANY($1)`, [ids]);
+      break;
+    }
+  }
+
+  console.log(`[Extract] ✅ Done — ${processed} listings extracted`);
+}
+
+// Rebuild product_price_stats from extracted data
+// Groups by extracted_product, runs IQR clean, computes median/p25/p75
+async function rebuildProductPriceStats() {
+  try {
+    await pool.query(`
+      INSERT INTO product_price_stats
+        (product_key, display_name, brand, category, variant,
+         sample_count, median_price, p25_price, p75_price,
+         low_price, high_price, updated_at)
+      WITH base AS (
+        SELECT
+          LOWER(REGEXP_REPLACE(extracted_product, '[^a-z0-9]+', '-', 'gi')) AS product_key,
+          extracted_product  AS display_name,
+          extracted_brand    AS brand,
+          extracted_category AS category,
+          extracted_variant  AS variant,
+          COUNT(*)::INT AS raw_count,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
+        FROM listings
+        WHERE extracted_product IS NOT NULL
+          AND extraction_confidence IN ('high', 'medium')
+          AND price > 0
+          AND is_offer_price = FALSE
+          AND price_quality = 'ok'
+          AND is_active = TRUE
+          AND scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY product_key, display_name, brand, category, variant
+        HAVING COUNT(*) >= 3
+      ),
+      fenced AS (
+        SELECT
+          b.product_key, b.display_name, b.brand, b.category, b.variant,
+          b.raw_count,
+          COUNT(l.id)::INT AS clean_count,
+          PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT AS median,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT AS p25_clean,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT AS p75_clean,
+          MIN(l.price)::INT AS low,
+          MAX(l.price)::INT AS high
+        FROM listings l
+        JOIN base b ON LOWER(REGEXP_REPLACE(l.extracted_product, '[^a-z0-9]+', '-', 'gi')) = b.product_key
+        WHERE l.price BETWEEN GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))
+                          AND (b.p75 + 1.5*(b.p75-b.p25))
+          AND l.is_offer_price = FALSE
+          AND l.price_quality = 'ok'
+          AND l.is_active = TRUE
+          AND l.scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY b.product_key, b.display_name, b.brand, b.category, b.variant, b.raw_count
+        HAVING COUNT(l.id) >= 3
+      )
+      SELECT product_key, display_name, brand, category, variant,
+             clean_count, raw_count, median, p25_clean, p75_clean, low, high, NOW()
+      FROM fenced
+      ON CONFLICT (product_key) DO UPDATE SET
+        display_name  = EXCLUDED.display_name,
+        brand         = EXCLUDED.brand,
+        category      = EXCLUDED.category,
+        variant       = EXCLUDED.variant,
+        sample_count  = EXCLUDED.sample_count,
+        median_price  = EXCLUDED.median_price,
+        p25_price     = EXCLUDED.p25_price,
+        p75_price     = EXCLUDED.p75_price,
+        low_price     = EXCLUDED.low_price,
+        high_price    = EXCLUDED.high_price,
+        updated_at    = NOW()
+    `);
+
+    const { rows } = await pool.query('SELECT COUNT(*)::INT AS cnt FROM product_price_stats');
+    console.log(`[ProductStats] ✅ Rebuilt — ${rows[0].cnt} unique products in stats table`);
+  } catch (e) {
+    console.error('[ProductStats] Rebuild failed:', e.message);
+  }
+}
+
+// ── Boot: load all watches from Redis ─────────────────────
+async function loadAllWatches() {
+  // Resolve owner userId so watcher-level plan checks work
+  const ownerUid = await redisGet(K.emailIdx(OWNER_EMAIL));
+  if (ownerUid) { ownerUserId = ownerUid; console.log(`[Boot] Owner account resolved: ${ownerUid}`); }
+
+  const allIds = await redisGet('fr:all-watch-ids') || [];
+  const watches = await Promise.all(allIds.map(getWatch));
+  watchlist = watches.filter(Boolean);
+  console.log(`[Boot] Loaded ${watchlist.length} watch(es)`);
+  watchlist.forEach(w => { if (!w.paused) startWatchTimer(w); });
+}
+
+async function addToGlobalWatchIndex(watchId) {
+  const ids = await redisGet('fr:all-watch-ids') || [];
+  if (!ids.includes(watchId)) ids.push(watchId);
+  await redisSet('fr:all-watch-ids', ids);
+}
+async function removeFromGlobalWatchIndex(watchId) {
+  const ids = await redisGet('fr:all-watch-ids') || [];
+  await redisSet('fr:all-watch-ids', ids.filter(id => id !== watchId));
+}
+
+// Keep Render awake
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
+if (SELF_URL) {
+  setInterval(() => axios.get(SELF_URL + '/').catch(() => {}), 14 * 60 * 1000);
+}
+
+// ── Routes ────────────────────────────────────────────────
+app.get('/', async (req, res) => {
+  const dbSummary = await getDBSummary().catch(() => null);
+  res.json({
+    status:   'ok',
+    redis:    REDIS_URL ? 'connected' : 'not set',
+    database: DATABASE_URL ? 'connected' : 'not set',
+    db: dbSummary ? {
+      totalListings:    dbSummary.total_listings,
+      activeListings:   dbSummary.active_listings,
+      uniqueKeywords:   dbSummary.unique_keywords,
+      uniqueMakes:      dbSummary.unique_makes,
+      lastScraped:      dbSummary.last_scraped,
+    } : null,
+    watches:  watchlist.length,
+    timers:   Object.keys(watchTimers).length,
+    lastScan: lastScanTime,
+    lastScanNewListings: lastScanCount,
+  });
+});
+
+// GET /db/stats — detailed database statistics (owner-gated)
+app.get('/db/stats', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+
+    const [summary, topKeywords, topMakes, recentActivity] = await Promise.all([
+      getDBSummary(),
+      pool.query(`
+        SELECT keyword, sample_count, median_price, p25_price, p75_price, updated_at
+        FROM keyword_price_stats
+        ORDER BY sample_count DESC LIMIT 20
+      `),
+      pool.query(`
+        SELECT make, COUNT(*)::INT AS count, AVG(price)::INT AS avg_price,
+               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+        FROM listings
+        WHERE make IS NOT NULL AND price > 0 AND is_offer_price = FALSE
+        GROUP BY make ORDER BY count DESC LIMIT 15
+      `),
+      pool.query(`
+        SELECT DATE(scraped_at) AS day, COUNT(*)::INT AS listings_scraped
+        FROM listings
+        WHERE scraped_at > NOW() - INTERVAL '14 days'
+        GROUP BY day ORDER BY day DESC
+      `),
+    ]);
+
+    res.json({
+      summary,
+      topKeywords:    topKeywords.rows,
+      topVehicleMakes: topMakes.rows,
+      dailyActivity:  recentActivity.rows,
+    });
+  } catch (e) {
+    console.error('[DB/stats]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /db/comparables?keyword=ps5&limit=20 — raw comparables for a keyword
+app.get('/db/comparables', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, limit } = req.query;
+    if (!keyword) return res.status(400).json({ error: 'keyword required' });
+    const rows = await getDBComparables(keyword, parseInt(limit) || 20);
+    res.json({ keyword, count: rows.length, comparables: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /db/prices?keyword=hilux — price stats for a keyword
+app.get('/db/prices', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, make, model, year, mileage } = req.query;
+    if (make && year) {
+      const stats = await getDBVehicleStats(make, model, parseInt(year), mileage ? parseInt(mileage) : null);
+      return res.json({ found: !!stats, type: 'vehicle', ...stats });
+    }
+    if (!keyword) return res.status(400).json({ error: 'keyword or make+year required' });
+    const stats = await getDBPriceStats(keyword);
+    res.json({ found: !!stats, type: 'keyword', ...stats });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── Auth routes ───────────────────────────────────────────
+app.post('/auth/signup', async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    const existing = await getUserByEmail(email);
+    if (existing) return res.status(409).json({ error: 'An account already exists for this email' });
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const verifyCode   = String(Math.floor(100000 + Math.random() * 900000));
+    const user = {
+      id: uuidv4(),
+      email: email.toLowerCase().trim(),
+      name:  (name || email.split('@')[0]).trim(),
+      passwordHash,
+      createdAt:     new Date().toISOString(),
+      lastSeen:      new Date().toISOString(),
+      plan:          'basic',
+      emailVerified: false,
+      verifyCode,
+      verifyExpiry:  new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    };
+    await saveUser(user);
+    await redisSet(K.emailIdx(user.email), user.id);
+    const token = makeToken(user.id);
+    console.log(`[Auth] Signup: ${user.email}`);
+    verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Verify failed:', e.message));
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user), emailVerified: false } });
+  } catch (e) { console.error('[Signup]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/verify-email', authMiddleware, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Verification code required' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    if (!user.verifyCode || user.verifyCode !== String(code).trim())
+      return res.status(400).json({ error: 'Incorrect code. Please check your email and try again.' });
+    if (new Date(user.verifyExpiry) < new Date())
+      return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    user.emailVerified = true;
+    delete user.verifyCode;
+    delete user.verifyExpiry;
+    await saveUser(user);
+    console.log(`[Auth] Email verified: ${user.email}`);
+    welcomeEmail(user.name, user.email).catch(e => console.error('[Email] Welcome failed:', e.message));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/resend-verify', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    const verifyCode  = String(Math.floor(100000 + Math.random() * 900000));
+    user.verifyCode   = verifyCode;
+    user.verifyExpiry = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    await saveUser(user);
+    verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Resend verify failed:', e.message));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    const user = await getUserByEmail(email);
+    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) return res.status(401).json({ error: 'Invalid email or password' });
+    user.lastSeen = new Date().toISOString();
+    await saveUser(user);
+    const token = makeToken(user.id);
+    console.log(`[Auth] Login: ${user.email}`);
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user) } });
+  } catch (e) { console.error('[Login]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/ping', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    user.lastSeen = new Date().toISOString();
+    await saveUser(user);
+    let resumed = 0;
+    const userWatches = watchlist.filter(w => w.userId === req.userId && w.paused);
+    for (const w of userWatches) {
+      w.paused = false;
+      await saveWatch(w);
+      startWatchTimer(w);
+      resumed++;
+    }
+    if (resumed > 0) console.log(`[Ping] Resumed ${resumed} watch(es) for ${user.email}`);
+    res.json({ ok: true, lastSeen: user.lastSeen, resumed });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.get('/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user), lastSeen: user.lastSeen });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Watchlist routes ──────────────────────────────────────
+app.get('/watchlist', authMiddleware, async (req, res) => {
+  try {
+    const watches = await getUserWatches(req.userId);
+    res.json(watches);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/watchlist', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, maxPrice, minPrice, pushoverToken, pushoverUser, plan, name, speed } = req.body;
+    if (!keyword || keyword.trim().length < 2)
+      return res.status(400).json({ error: 'Keyword required' });
+    const user = await getUser(req.userId);
+    const planLimit = PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)];
+    const existingWatches = await getUserWatches(req.userId);
+    if (!isOwner(user) && existingWatches.length >= planLimit)
+      return res.status(403).json({ error: 'Watchlist limit reached for your plan', plan: getEffectivePlan(user), limit: planLimit });
+    const watchPlan = plan || (speed === 'premium' ? 'premium' : 'basic');
+    const rawExclude = req.body.excludeWords || [];
+    const excludeWords = Array.isArray(rawExclude)
+      ? rawExclude.map(w => w.toLowerCase().trim()).filter(Boolean)
+      : [];
+
+    const item = {
+      id: uuidv4(),
+      userId:   req.userId,
+      keyword:  keyword.trim().toLowerCase(),
+      name:     name || keyword.trim(),
+      maxPrice: maxPrice ? parseInt(maxPrice) : null,
+      minPrice: minPrice ? parseInt(minPrice) : null,
+      location: req.body.location || null,
+      lat:      req.body.lat    ? parseFloat(req.body.lat)  : null,
+      lng:      req.body.lng    ? parseFloat(req.body.lng)  : null,
+      radius:   req.body.radius ? parseInt(req.body.radius) : 50,
+      plan:     watchPlan,
+      pushoverToken: pushoverToken || null,
+      pushoverUser:  pushoverUser  || null,
+      excludeWords,
+      // Vehicle-specific filters
+      minYear:       req.body.minYear       ? parseInt(req.body.minYear)       : null,
+      maxYear:       req.body.maxYear       ? parseInt(req.body.maxYear)       : null,
+      minKms:        req.body.minKms        ? parseInt(req.body.minKms)        : null,
+      maxKms:        req.body.maxKms        ? parseInt(req.body.maxKms)        : null,
+      transmission:  req.body.transmission  ? req.body.transmission.trim()     : null, // 'auto', 'manual', or null
+      paused:    false,
+      addedAt:   new Date().toISOString(),
+      lastScanned: null,
+    };
+    await saveWatch(item);
+    await addWatchId(req.userId, item.id);
+    await addToGlobalWatchIndex(item.id);
+    watchlist.push(item);
+    startWatchTimer(item);
+    console.log(`[Watch] Added "${item.keyword}" for user ${req.userId}`);
+    res.json(item);
+    // Initial backfill — runs once when watch is added
+    scanWatchItem(item, { initialScan: true })
+      .then(n => console.log(`[InitialScan] "${item.keyword}" → ${n} listing(s)`))
+      .catch(e => console.error(`[InitialScan] Error:`, e.message));
+  } catch (e) { console.error('[AddWatch]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// PATCH /watchlist/:id — update watch filters
+app.patch('/watchlist/:id', authMiddleware, async (req, res) => {
+  try {
+    const watch = await getWatch(req.params.id);
+    if (!watch || watch.userId !== req.userId)
+      return res.status(404).json({ error: 'Not found' });
+
+    const { excludeWords, minYear, maxYear, minKms, maxKms, transmission, minPrice, maxPrice } = req.body;
+
+    if (Array.isArray(excludeWords))
+      watch.excludeWords = excludeWords.map(w => w.toLowerCase().trim()).filter(Boolean);
+    if (minPrice  !== undefined) watch.minPrice  = minPrice  ? parseInt(minPrice)  : null;
+    if (maxPrice  !== undefined) watch.maxPrice  = maxPrice  ? parseInt(maxPrice)  : null;
+    if (minYear   !== undefined) watch.minYear   = minYear   ? parseInt(minYear)   : null;
+    if (maxYear   !== undefined) watch.maxYear   = maxYear   ? parseInt(maxYear)   : null;
+    if (minKms    !== undefined) watch.minKms    = minKms    ? parseInt(minKms)    : null;
+    if (maxKms    !== undefined) watch.maxKms    = maxKms    ? parseInt(maxKms)    : null;
+    if (transmission !== undefined) watch.transmission = transmission ? transmission.trim() : null;
+
+    await saveWatch(watch);
+    const idx = watchlist.findIndex(w => w.id === req.params.id);
+    if (idx !== -1) watchlist[idx] = { ...watchlist[idx], ...watch };
+
+    res.json({ ok: true, watch });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/watchlist/:id', authMiddleware, async (req, res) => {
+  try {
+    const watch = await getWatch(req.params.id);
+    if (!watch || watch.userId !== req.userId)
+      return res.status(404).json({ error: 'Not found' });
+    const keyword = watch.keyword;
+    stopWatchTimer(req.params.id);
+    await deleteWatch(req.params.id);
+    await removeWatchId(req.userId, req.params.id);
+    await removeFromGlobalWatchIndex(req.params.id);
+    watchlist = watchlist.filter(w => w.id !== req.params.id);
+
+    // Clear blocked listings for this keyword so they show fresh if re-added
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    const remaining = blocked.filter(l => l.keyword !== keyword);
+    await redisSet(K.blocked(req.userId), remaining);
+
+    // Clear seen cache entries for this keyword so re-adding starts truly fresh
+    const seen = await getUserSeen(req.userId);
+    const prefix = `${keyword}:`;
+    const prunedSeen = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
+    await saveUserSeen(req.userId, prunedSeen, { merge: false }); // replace — we're removing entries
+    const clearedSeen = Object.keys(seen).length - Object.keys(prunedSeen).length;
+    console.log(`[Watch] Deleted "${keyword}" — cleared ${blocked.length - remaining.length} blocked, ${clearedSeen} seen entries`);
+
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Listings routes ───────────────────────────────────────
+app.get('/listings', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, since } = req.query;
+    let result = await getUserListings(req.userId);
+    if (keyword) result = result.filter(l => l.keyword === keyword);
+    if (since) {
+      const sinceMs = new Date(since).getTime();
+      if (!isNaN(sinceMs)) result = result.filter(l => new Date(l.foundAt).getTime() > sinceMs);
+    }
+    result = [...result].sort((a, b) => {
+        // Push listings with unknown dates to the bottom
+        return new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt);
+      });
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/listings', authMiddleware, async (req, res) => {
+  try {
+    await saveUserListings(req.userId, []);
+    await saveUserSeen(req.userId, {}, { merge: false }); // full reset — replace, don't merge
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /listings/blocked — get listings that were filtered out
+app.get('/listings/blocked', authMiddleware, async (req, res) => {
+  try {
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    res.json(blocked);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /listings/unblock — move a blocked listing back into the feed
+app.post('/listings/unblock', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ error: 'id required' });
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    const listing = blocked.find(l => l.id === id);
+    if (!listing) return res.status(404).json({ error: 'Not found' });
+    // Remove from blocked
+    await redisSet(K.blocked(req.userId), blocked.filter(l => l.id !== id));
+    // Add to user listings
+    const listings = await getUserListings(req.userId);
+    if (!listings.find(l => l.id === id)) {
+      listings.unshift({ ...listing, foundAt: new Date().toISOString() });
+      listings.sort((a, b) => {
+        // Push listings with unknown dates to the bottom
+        return new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt);
+      });
+      await saveUserListings(req.userId, listings);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /listings/remove — remove specific listings by ID (irrelevant ones flagged by AI)
+app.post('/listings/remove', authMiddleware, async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids)) return res.status(400).json({ error: 'ids array required' });
+    const listings = await getUserListings(req.userId);
+    const filtered = listings.filter(l => !ids.includes(l.id));
+    await saveUserListings(req.userId, filtered);
+    // Don't mark as permanently seen — if user re-adds the keyword they should see fresh listings
+    console.log(`[Filter] Removed ${ids.length} irrelevant listing(s) for user ${req.userId}`);
+    res.json({ ok: true, removed: ids.length });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Price cache route — lets frontend check own scan history before triggering AI ──
+app.get('/prices', authMiddleware, async (req, res) => {
+  try {
+    const { keyword } = req.query;
+    if (!keyword) return res.status(400).json({ error: 'keyword required' });
+    const priceData = await getPriceCacheForKeyword(keyword);
+    console.log('[Prices] Result for', keyword, ':', priceData ? 'found (' + priceData.count + ' prices, median $' + priceData.median + ')' : 'not found');
+    if (!priceData) return res.json({ found: false, keyword });
+    res.json({ found: true, keyword, ...priceData });
+  } catch (e) { console.error('[Prices] Error:', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /prices/vehicle?make=Toyota&model=Camry&year=2019&mileage=72000
+// Returns VPX market stats for a specific vehicle cohort
+app.get('/prices/vehicle', authMiddleware, async (req, res) => {
+  try {
+    const { make, model, year, mileage } = req.query;
+    if (!make || !year) return res.status(400).json({ error: 'make and year required' });
+    const resolvedModel = model || null;
+    const stats = await getDBVehicleStats(make, resolvedModel, parseInt(year), mileage ? parseInt(mileage) : null);
+    if (!stats) return res.json({ found: false, make, model, year });
+    res.json({ found: true, ...stats });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Appraisal route — limit check only, always defers to AI ──
+// POST /appraise  { keyword, price }
+app.post('/appraise', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, price } = req.body;
+    if (!keyword || !price) return res.status(400).json({ error: 'keyword and price required' });
+    const user = await _getUserCached(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today = new Date().toISOString().slice(0, 10);
+    if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
+    const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
+    if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
+    res.json({ found: false, usedCache: false });
+  } catch (e) { console.error('[Appraise]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Misc routes ───────────────────────────────────────────
+app.get('/proxy-image', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  try {
+    const response = await axios.get(url, {
+      responseType: 'arraybuffer', timeout: 10000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
+        'Referer': 'https://www.facebook.com/'
+      }
+    });
+    res.json({
+      base64: Buffer.from(response.data).toString('base64'),
+      mediaType: response.headers['content-type'] || 'image/jpeg'
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/scan/now', authMiddleware, async (req, res) => {
+  res.json({ ok: true, message: 'Scan started' });
+  const watches = watchlist.filter(w => w.userId === req.userId && !w.paused);
+  for (const w of watches) {
+    await scanWatchItem(w).catch(e => console.error(`[Scan/now]`, e.message));
+    await sleep(500);
+  }
+});
+
+app.post('/scan/test', async (req, res) => {
+  const { keyword } = req.body;
+  if (!keyword) return res.status(400).json({ error: 'keyword required' });
+  try {
+    const found = await scrapeKeyword(keyword, {});
+    res.json({ keyword, count: found.length, listings: found });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Global Deals ─────────────────────────────────────────
+// Rebuilds every 90 min — no SociaVault credits used.
+// Pulls listings from the DB that have a known median (so we can compute % off),
+// filters to active + real-price, scores by discount depth, adds small jitter.
+
+async function rebuildGlobalDeals() {
+  console.log('[Deals] Rebuilding deals:global cache...');
+  try {
+    // Pull recent listings with a known keyword median so we can compute % off.
+    // Only real prices, active, not spam/damage, scraped within 14 days.
+    // ── Step 1: try to get deals using keyword_price_stats (IQR-cleaned medians) ──
+    // Falls back to a live per-keyword median if stats table isn't populated yet.
+    let rows;
+    const statsCheck = await pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats');
+    const hasStats = statsCheck.rows[0].cnt >= 5;
+
+    if (hasStats) {
+      // Normal path — join against pre-built stats table
+      ({ rows } = await pool.query(`
+        SELECT
+          l.listing_id,
+          l.title,
+          l.price,
+          l.image_url,
+          l.url,
+          l.location,
+          l.state,
+          l.keyword,
+          l.category,
+          l.make,
+          l.model,
+          l.year,
+          l.kms       AS mileage,
+          l.transmission,
+          l.fuel_type AS "fuelType",
+          l.listed_at AS "listedAt",
+          l.img_condition,
+          l.img_matches_keyword,
+          l.flip_score,
+          l.flip_deal_type,
+          l.flip_demand,
+          l.flip_estimated_resale,
+          l.flip_estimated_margin,
+          l.flip_fix_cost,
+          l.flip_reasoning,
+          k.median_price AS median
+        FROM listings l
+        JOIN keyword_price_stats k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE
+          AND l.is_offer_price = FALSE
+          AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND k.median_price > 0
+          AND k.sample_count >= 4
+          AND (
+            -- AI scored: use flip_score threshold
+            (l.flip_scored_at IS NOT NULL AND l.flip_score >= 45)
+            OR
+            -- Not yet AI scored: fall back to price discount method
+            (l.flip_scored_at IS NULL AND l.price < k.median_price * 0.92 AND (k.median_price - l.price) >= 100)
+          )
+        ORDER BY COALESCE(l.flip_score, LEAST(80, ROUND(((k.median_price - l.price)::float / k.median_price * 100) * 1.5)::INT)) DESC
+        LIMIT 500
+      `));
+    } else {
+      // Fallback — compute live medians on the fly per keyword so deals work
+      // immediately after seed scan before nightly cron has run
+      console.log('[Deals] keyword_price_stats not ready — using live medians');
+      ({ rows } = await pool.query(`
+        WITH kmedians AS (
+          SELECT
+            keyword,
+            COUNT(*)::INT AS cnt,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+          FROM listings
+          WHERE price > 0
+            AND is_offer_price = FALSE
+            AND is_active = TRUE
+            AND scraped_at > NOW() - INTERVAL '30 days'
+            AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          GROUP BY keyword
+          HAVING COUNT(*) >= 4
+        )
+        SELECT
+          l.listing_id,
+          l.title,
+          l.price,
+          l.image_url,
+          l.url,
+          l.location,
+          l.state,
+          l.keyword,
+          l.category,
+          l.make,
+          l.model,
+          l.year,
+          l.kms       AS mileage,
+          l.transmission,
+          l.fuel_type AS "fuelType",
+          l.listed_at AS "listedAt",
+          l.img_condition,
+          l.img_matches_keyword,
+          l.flip_score,
+          l.flip_deal_type,
+          l.flip_demand,
+          l.flip_estimated_resale,
+          l.flip_estimated_margin,
+          l.flip_fix_cost,
+          l.flip_reasoning,
+          k.median_price AS median
+        FROM listings l
+        JOIN kmedians k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE
+          AND l.is_offer_price = FALSE
+          AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND (
+            (l.flip_scored_at IS NOT NULL AND l.flip_score >= 45)
+            OR
+            (l.flip_scored_at IS NULL AND l.price < k.median_price * 0.92 AND (k.median_price - l.price) >= 100)
+          )
+        ORDER BY COALESCE(l.flip_score, LEAST(80, ROUND(((k.median_price - l.price)::float / k.median_price * 100) * 1.5)::INT)) DESC
+        LIMIT 500
+      `));
+    }
+
+    // Compute pctOff and base score
+    const deals = rows.map(r => {
+      const pctOff   = Math.round(((r.median - r.price) / r.median) * 100);
+      // base deal score 0-100 — pure discount depth
+      const baseScore = Math.min(100, pctOff * 1.8);
+      return {
+        id:           r.listing_id,
+        title:        r.title,
+        price:        r.price,
+        median:       r.median,
+        pctOff,
+        image:        r.image_url || null,
+        url:          r.url || null,
+        location:     r.location || null,
+        state:        r.state || null,
+        keyword:      r.keyword || null,
+        category:     r.category || 'general',
+        make:         r.make || null,
+        model:        r.model || null,
+        year:         r.year || null,
+        mileage:      r.mileage || null,
+        transmission: r.transmission || null,
+        fuelType:     r.fuelType || null,
+        listedAt:     r.listedAt ? r.listedAt.toISOString() : null,
+        imgCondition:   r.img_condition || null,
+        imgVerified:    r.img_matches_keyword !== false,
+        flipScore:      r.flip_score || null,
+        dealType:       r.flip_deal_type || null,
+        demand:         r.flip_demand || null,
+        estResale:      r.flip_estimated_resale || null,
+        estMargin:      r.flip_estimated_margin || null,
+        fixCost:        r.flip_fix_cost || null,
+        reasoning:      r.flip_reasoning || null,
+        baseScore,
+        // Tint: use AI flip_score when available, fall back to discount math.
+        // Damaged items are always capped one level down.
+        const saving = r.median - r.price;
+        const isDamaged = r.img_condition === 'damaged' || r.img_condition === 'poor';
+        const score = r.flip_score;
+        const tintRaw = score != null
+          ? (score >= 85 ? 'rainbow' : score >= 65 ? 'green' : score >= 45 ? 'yellow' : 'grey')
+          : (saving >= 500 && pctOff >= 20 ? 'rainbow'
+           : saving >= 200 && pctOff >= 15 ? 'green'
+           : saving >= 100                 ? 'yellow' : 'grey');
+        tint: isDamaged && tintRaw === 'rainbow' ? 'green'
+            : isDamaged && tintRaw === 'green'   ? 'yellow'
+            : tintRaw,
+      };
+    });
+
+    await redisSet('deals:global', { deals, builtAt: new Date().toISOString() }, 6000); // 100 min TTL
+    console.log(`[Deals] Rebuilt deals:global — ${deals.length} deals`);
+  } catch (e) {
+    console.error('[Deals] Rebuild failed:', e.message);
+  }
+}
+
+// Rebuild deals on boot immediately
+setTimeout(() => rebuildGlobalDeals().catch(() => {}), 15000);
+
+// After seed scan completes, run a quick stats pass so deals are populated right away
+// (full nightly cron also runs at 2am — this just ensures first-boot experience works)
+async function quickStatsAndDealsRebuild() {
+  try {
+    console.log('[Boot] Running quick keyword stats pass...');
+    await pool.query(`
+      INSERT INTO keyword_price_stats
+        (keyword, raw_count, sample_count, median_price, p25_price, p75_price,
+         floor_price, ceiling_price, updated_at)
+      WITH base AS (
+        SELECT keyword,
+          COUNT(*)::INT AS raw_count,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25_raw,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75_raw
+        FROM listings
+        WHERE price > 0 AND is_offer_price = FALSE AND is_active = TRUE
+          AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+        GROUP BY keyword HAVING COUNT(*) >= 4
+      )
+      SELECT
+        b.keyword,
+        b.raw_count,
+        COUNT(l.id)::INT,
+        PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT,
+        GREATEST(0, b.p25_raw - 1.5*(b.p75_raw - b.p25_raw))::INT,
+        (b.p75_raw + 1.5*(b.p75_raw - b.p25_raw))::INT,
+        NOW()
+      FROM listings l
+      JOIN base b ON b.keyword = l.keyword
+      WHERE l.price BETWEEN GREATEST(0, b.p25_raw - 1.5*(b.p75_raw-b.p25_raw))
+                        AND (b.p75_raw + 1.5*(b.p75_raw-b.p25_raw))
+        AND l.price > 0 AND l.is_offer_price = FALSE AND l.is_active = TRUE
+        AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+      GROUP BY b.keyword, b.raw_count, b.p25_raw, b.p75_raw
+      HAVING COUNT(l.id) >= 4
+      ON CONFLICT (keyword) DO UPDATE SET
+        raw_count    = EXCLUDED.raw_count,
+        sample_count = EXCLUDED.sample_count,
+        median_price = EXCLUDED.median_price,
+        p25_price    = EXCLUDED.p25_price,
+        p75_price    = EXCLUDED.p75_price,
+        floor_price  = EXCLUDED.floor_price,
+        ceiling_price= EXCLUDED.ceiling_price,
+        updated_at   = NOW()
+    `);
+    const { rows } = await pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats');
+    console.log(`[Boot] Quick stats done — ${rows[0].cnt} keywords in stats table`);
+    await rebuildGlobalDeals();
+  } catch (e) {
+    console.error('[Boot] Quick stats/deals rebuild failed:', e.message);
+  }
+}
+
+// Run quick stats rebuild 5 minutes after boot (gives seed scan time to fill some data)
+setTimeout(() => quickStatsAndDealsRebuild(), 5 * 60 * 1000);
+cron.schedule('0 */2 * * *', () => rebuildGlobalDeals().catch(e => console.error('[Deals Cron]', e.message)));
+
+// ── Seed Keyword Scanner ──────────────────────────────────
+// Scans a broad list of keywords to build the price database independently
+// of user watchlists. 1 credit per keyword per scan. Staggered so we don't
+// hammer all keywords at once — splits into 6 batches across 6 hours.
+// Full rotation = 6 hours. At ~150 keywords that's 150 credits per rotation.
+
+const SEED_KEYWORDS = [
+  // ── Phones ───────────────────────────────────────────────
+  'iphone 16 pro', 'iphone 16', 'iphone 15 pro', 'iphone 15', 'iphone 14 pro',
+  'iphone 14', 'iphone 13', 'iphone 12', 'iphone 11', 'iphone se',
+  'samsung galaxy s25', 'samsung galaxy s24', 'samsung galaxy s23', 'samsung galaxy s22',
+  'samsung galaxy a55', 'samsung galaxy a54', 'google pixel 9', 'google pixel 8',
+  'oneplus 12', 'oppo find x8',
+
+  // ── Laptops & Computers ──────────────────────────────────
+  'macbook pro m3', 'macbook pro m2', 'macbook pro m1', 'macbook air m2', 'macbook air m1',
+  'macbook air m3', 'imac m3', 'imac m1',
+  'dell xps 15', 'dell xps 13', 'hp spectre x360', 'hp envy laptop',
+  'lenovo thinkpad', 'lenovo yoga', 'asus rog laptop', 'asus zenbook',
+  'surface pro', 'surface laptop', 'razer blade laptop', 'acer swift laptop',
+  'gaming pc', 'desktop computer',
+
+  // ── Tablets ──────────────────────────────────────────────
+  'ipad pro', 'ipad air', 'ipad mini', 'samsung galaxy tab s9', 'samsung galaxy tab s8',
+
+  // ── Gaming ───────────────────────────────────────────────
+  'ps5 console', 'ps5 digital', 'ps4 pro', 'ps4 console',
+  'xbox series x', 'xbox series s', 'xbox one x',
+  'nintendo switch oled', 'nintendo switch', 'nintendo switch lite',
+  'steam deck', 'meta quest 3', 'meta quest 2',
+  'gaming chair', 'gaming monitor',
+
+  // ── TVs & Audio ───────────────────────────────────────────
+  'samsung 65 inch tv', 'samsung 55 inch tv', 'lg oled tv', 'sony bravia tv',
+  'lg 65 tv', 'samsung qled tv', 'tcl tv', 'hisense tv',
+  'sonos speaker', 'jbl speaker', 'bose speaker', 'marshall speaker',
+  'sony wh1000xm5', 'airpods pro', 'airpods max', 'bose quietcomfort',
+
+  // ── Power Tools ──────────────────────────────────────────
+  'milwaukee m18 drill', 'milwaukee m18 impact driver', 'milwaukee m18 grinder',
+  'milwaukee m18 circular saw', 'milwaukee m18 multi tool', 'milwaukee m18 jigsaw',
+  'milwaukee m18 reciprocating saw', 'milwaukee m18 kit', 'milwaukee m12',
+  'dewalt 18v drill', 'dewalt 18v impact driver', 'dewalt 18v grinder',
+  'dewalt 18v circular saw', 'dewalt xr kit',
+  'makita 18v drill', 'makita 18v impact driver', 'makita 18v grinder',
+  'makita 18v circular saw', 'makita combo kit',
+  'ryobi 18v drill', 'ryobi 18v kit', 'ryobi one plus',
+  'bosch 18v drill', 'hikoki drill', 'festool sander', 'festool track saw',
+  'air compressor', 'bench grinder', 'angle grinder', 'drop saw',
+  'table saw', 'thicknesser', 'router table', 'laser level',
+
+  // ── Outdoor & Garden ─────────────────────────────────────
+  'husqvarna mower', 'honda mower', 'ride on mower', 'zero turn mower',
+  'ego lawn mower', 'greenworks mower', 'lawn mower petrol',
+  'husqvarna chainsaw', 'stihl chainsaw', 'echo chainsaw',
+  'pressure washer', 'karcher pressure washer', 'leaf blower',
+  'garden trailer', 'wood chipper', 'post hole digger',
+
+  // ── Camping & Outdoors ────────────────────────────────────
+  'engel fridge', 'waeco fridge', 'dometic fridge', 'arb fridge',
+  'camp trailer', 'roof top tent', 'swag', 'camping trailer',
+  'weber bbq', 'traeger bbq', 'bbq grill', 'kamado bbq',
+  'kayak', 'canoe', 'stand up paddle board', 'inflatable kayak',
+  'fishing rod', 'fishing reel', 'fishing kayak',
+  'hiking boots', 'tent', 'sleeping bag',
+
+  // ── Vehicles ─────────────────────────────────────────────
+  'toyota hilux', 'toyota landcruiser 200', 'toyota landcruiser 79',
+  'toyota prado', 'toyota rav4', 'toyota camry', 'toyota corolla',
+  'ford ranger', 'ford everest', 'ford mustang',
+  'holden commodore', 'holden colorado',
+  'nissan patrol', 'nissan navara', 'nissan x trail',
+  'mitsubishi triton', 'mitsubishi pajero', 'mitsubishi outlander',
+  'isuzu dmax', 'isuzu mu x',
+  'mazda cx5', 'mazda bt50', 'mazda 3',
+  'subaru forester', 'subaru outback', 'subaru wrx',
+  'hyundai tucson', 'hyundai i30', 'kia sportage',
+  'jeep wrangler', 'jeep gladiator',
+  'bmw 3 series', 'mercedes c class', 'audi a4',
+  'motorcycle', 'dirt bike', 'trail bike', 'enduro bike',
+  'honda cbr', 'yamaha r1', 'kawasaki ninja', 'suzuki gsxr',
+  'caravan', 'camper trailer', 'pop top caravan',
+
+  // ── Vehicles — Parts & Accessories ───────────────────────
+  'bull bar', 'winch', 'lift kit', 'snorkel', 'roof rack',
+  'drawer system', 'dual battery system',
+
+  // ── Bikes & Scooters ─────────────────────────────────────
+  'mountain bike', 'road bike', 'bmx bike', 'electric bike',
+  'trek bike', 'specialized bike', 'giant bike', 'scott bike',
+  'electric scooter', 'segway ninebot',
+
+  // ── Furniture ─────────────────────────────────────────────
+  'couch lounge', 'sectional sofa', 'leather couch', '3 seater lounge',
+  'dining table', 'dining chairs', 'coffee table', 'tv unit',
+  'queen bed frame', 'king bed frame', 'bedside table',
+  'office desk', 'standing desk', 'ergonomic chair', 'office chair',
+  'wardrobe', 'chest of drawers', 'bookshelf',
+
+  // ── Baby & Kids ───────────────────────────────────────────
+  'pram stroller', 'baby cot', 'baby capsule', 'baby carrier',
+  'kids bike', 'trampoline', 'swing set', 'lego',
+
+  // ── Sports & Fitness ──────────────────────────────────────
+  'treadmill', 'rowing machine', 'spin bike', 'exercise bike',
+  'bowflex', 'home gym', 'barbell set', 'dumbbells',
+  'squat rack', 'bench press', 'weight plates',
+  'golf clubs', 'callaway driver', 'titleist irons',
+  'surfboard', 'skateboard', 'snowboard',
+  'tennis racket', 'basketball hoop',
+
+  // ── Musical Instruments ────────────────────────────────────
+  'electric guitar', 'acoustic guitar', 'fender stratocaster', 'gibson les paul',
+  'fender telecaster', 'marshall amp', 'fender amp',
+  'drum kit', 'electronic drums', 'keyboard piano', 'yamaha keyboard',
+  'bass guitar', 'ukulele',
+
+  // ── Photography ───────────────────────────────────────────
+  'sony a7', 'sony a6', 'canon eos r', 'canon 5d', 'nikon z6', 'nikon d750',
+  'fujifilm xt', 'fujifilm x100', 'drone dji', 'dji mini', 'dji mavic',
+  'camera lens', 'gopro',
+
+  // ── Appliances ─────────────────────────────────────────────
+  'thermomix', 'kitchenaid mixer', 'breville coffee machine',
+  'delonghi coffee machine', 'nespresso machine', 'coffee grinder',
+  'dyson vacuum', 'roomba', 'dyson v11', 'dyson v12', 'dyson v15',
+  'washing machine', 'dryer', 'dishwasher', 'fridge freezer',
+  'air fryer', 'instant pot', 'ninja foodi',
+
+  // ── Tech Accessories ──────────────────────────────────────
+  'monitor 27 inch', 'monitor 32 inch', 'ultrawide monitor',
+  'mechanical keyboard', 'logitech mx keys',
+  'standing desk converter', 'webcam',
+
+  // ── Collectibles & Fashion ────────────────────────────────
+  'vintage levi jeans', 'vintage adidas', 'nike air jordan',
+  'rolex watch', 'omega watch', 'seiko watch',
+  'vintage camera', 'vinyl records', 'trading cards',
+
+  // ── Trade & Industrial ────────────────────────────────────
+  'generator', 'inverter generator', 'honda generator', 'yamaha generator',
+  'welder', 'mig welder', 'tig welder',
+  'scaffolding', 'trailer', 'box trailer', 'car trailer', 'boat trailer',
+  'forklift', 'pallet jack', 'scissor lift',
+];
+
+// How many keywords per batch — spread evenly across 6 hourly slots
+const SEED_BATCH_SIZE = Math.ceil(SEED_KEYWORDS.length / 6);
+let _seedBatchIndex = 0;
+
+async function runSeedBatch() {
+  const start = _seedBatchIndex * SEED_BATCH_SIZE;
+  const batch = SEED_KEYWORDS.slice(start, start + SEED_BATCH_SIZE);
+  _seedBatchIndex = (_seedBatchIndex + 1) % 6;
+
+  console.log(`[SeedScan] Batch ${_seedBatchIndex}/${6} — scanning ${batch.length} keywords (starting at index ${start})`);
+
+  let saved = 0;
+  for (const keyword of batch) {
+    try {
+      // Use shared scan cache — if recently cached, costs 0 credits
+      const cached = await redisGet(K.sharedScan(keyword));
+      if (cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
+        console.log(`[SeedScan] "${keyword}" — cache hit, skipping`);
+        continue;
+      }
+
+      const raw = await scrapeKeyword(keyword, {
+        city: 'Melbourne', lat: -37.8136, lng: 144.9631, radius: 100,
+      });
+
+      if (!Array.isArray(raw) || !raw.length) continue;
+
+      // Cache for shared use by user watchlists
+      await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
+
+      // Save to DB for price stats
+      for (const item of raw) {
+        try { await upsertListingToDB({ ...item, keyword }); } catch (e) { /* skip bad rows */ }
+      }
+
+      saved += raw.length;
+      console.log(`[SeedScan] "${keyword}" → ${raw.length} listings saved`);
+
+      // Small delay between keywords — be gentle on SociaVault
+      await new Promise(r => setTimeout(r, 800));
+    } catch (e) {
+      console.error(`[SeedScan] "${keyword}" failed:`, e.message);
+    }
+  }
+  console.log(`[SeedScan] Batch done — ${saved} total listings saved`);
+}
+
+// One-time full scan on boot — scans all seed keywords once, then stops.
+// Re-deploy to trigger again. No recurring cron.
+async function runFullSeedScanOnce() {
+  console.log(`[SeedScan] Starting one-time full scan of ${SEED_KEYWORDS.length} keywords...`);
+  let totalSaved = 0;
+  for (let i = 0; i < SEED_KEYWORDS.length; i++) {
+    const keyword = SEED_KEYWORDS[i];
+    try {
+      const cached = await redisGet(K.sharedScan(keyword));
+      if (cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
+        console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" — cache hit, skipping`);
+        continue;
+      }
+      const raw = await scrapeKeyword(keyword, {
+        city: 'Melbourne', lat: -37.8136, lng: 144.9631, radius: 100,
+      });
+      if (!Array.isArray(raw) || !raw.length) {
+        console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" — 0 results`);
+        continue;
+      }
+      await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
+      for (const item of raw) {
+        try { await upsertListingToDB({ ...item, keyword }); } catch (e) { /* skip bad rows */ }
+      }
+      totalSaved += raw.length;
+      console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" → ${raw.length} listings`);
+      await new Promise(r => setTimeout(r, 600));
+    } catch (e) {
+      console.error(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" failed:`, e.message);
+    }
+  }
+  console.log(`[SeedScan] ✅ Done — ${totalSaved} listings saved across ${SEED_KEYWORDS.length} keywords`);
+}
+
+setTimeout(() => runFullSeedScanOnce().catch(e => console.error('[SeedScan Boot]', e.message)), 30000);
+
+// Admin endpoint to check seed scan status
+app.get('/admin/seed-status', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    const counts = await Promise.all(SEED_KEYWORDS.map(async kw => {
+      const cached = await redisGet(K.sharedScan(kw));
+      return { keyword: kw, cached: !!cached, cachedAt: cached?.scannedAt || null, count: cached?.listings?.length || 0 };
+    }));
+    const dbCount = await pool.query('SELECT keyword, COUNT(*)::INT as n FROM listings WHERE keyword = ANY($1) GROUP BY keyword ORDER BY n DESC', [SEED_KEYWORDS]);
+    res.json({ total: SEED_KEYWORDS.length, batchSize: SEED_BATCH_SIZE, nextBatch: _seedBatchIndex, cache: counts, db: dbCount.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin endpoint to manually re-trigger the full one-time scan
+app.post('/admin/seed-scan-all', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    res.json({ ok: true, message: `Starting full scan of ${SEED_KEYWORDS.length} keywords in background` });
+    runFullSeedScanOnce().catch(e => console.error('[SeedScan Manual]', e.message));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: full deals pipeline diagnostic
+app.get('/admin/deals-debug', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+
+    const [
+      totalListings,
+      activeListings,
+      inPricePool,
+      withImages,
+      statsCount,
+      dealsCache,
+      qualityBreakdown,
+      sampleDeals,
+    ] = await Promise.all([
+      pool.query('SELECT COUNT(*)::INT AS n FROM listings'),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE is_active = TRUE"),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE in_price_pool = TRUE AND is_active = TRUE"),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE image_url IS NOT NULL AND image_url != ''"),
+      pool.query('SELECT COUNT(*)::INT AS n FROM keyword_price_stats'),
+      redisGet('deals:global'),
+      pool.query("SELECT price_quality, COUNT(*)::INT AS n FROM listings GROUP BY price_quality ORDER BY n DESC"),
+      // Try the exact deals query and return first 5 results
+      pool.query(`
+        WITH kmedians AS (
+          SELECT keyword,
+            COUNT(*)::INT AS cnt,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+          FROM listings
+          WHERE price > 0 AND is_offer_price = FALSE AND is_active = TRUE
+            AND scraped_at > NOW() - INTERVAL '30 days'
+            AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          GROUP BY keyword HAVING COUNT(*) >= 4
+        )
+        SELECT l.title, l.price, l.keyword, k.median_price,
+               (k.median_price - l.price) AS saving,
+               ROUND(((k.median_price - l.price)::float / k.median_price * 100)::numeric, 1) AS pct_off
+        FROM listings l
+        JOIN kmedians k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE AND l.is_offer_price = FALSE AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND l.price < k.median_price * 0.92
+          AND (k.median_price - l.price) >= 100
+        ORDER BY saving DESC LIMIT 5
+      `),
+    ]);
+
+    res.json({
+      db: {
+        total_listings:   totalListings.rows[0].n,
+        active_listings:  activeListings.rows[0].n,
+        in_price_pool:    inPricePool.rows[0].n,
+        with_images:      withImages.rows[0].n,
+        keyword_stats_rows: statsCount.rows[0].n,
+        quality_breakdown: qualityBreakdown.rows,
+      },
+      deals_cache: {
+        exists:    !!(dealsCache?.deals),
+        count:     dealsCache?.deals?.length || 0,
+        built_at:  dealsCache?.builtAt || null,
+      },
+      sample_qualifying_deals: sampleDeals.rows,
+      diagnosis: !totalListings.rows[0].n
+        ? '❌ No listings in DB at all — seed scan hasnt run or failed'
+        : !activeListings.rows[0].n
+        ? '❌ No active listings — check is_active flag on upsert'
+        : !statsCount.rows[0].n
+        ? '⚠️ keyword_price_stats empty — quickStats rebuild hasnt run yet (fires 5min after boot)'
+        : !sampleDeals.rows.length
+        ? '⚠️ No qualifying deals — not enough price spread yet, need more listings per keyword'
+        : dealsCache?.deals?.length
+        ? `✅ ${dealsCache.deals.length} deals in cache — check frontend auth/premium flag`
+        : '⚠️ Deals qualify in DB but cache is empty — trigger /admin/deals-rebuild',
+    });
+  } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+});
+
+// Admin: force rebuild deals cache right now
+app.post('/admin/deals-rebuild', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    await quickStatsAndDealsRebuild();
+    const cache = await redisGet('deals:global');
+    res.json({ ok: true, deals_in_cache: cache?.deals?.length || 0, built_at: cache?.builtAt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /deals — personalised deal feed for premium users
+// Scores deals against the user's watchlist keywords/makes with jitter so order shifts each visit.
+app.get('/deals', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    if (getEffectivePlan(user) !== 'premium') return res.status(403).json({ error: 'premium_required' });
+
+    const cached = await redisGet('deals:global');
+    if (!cached || !cached.deals) return res.json({ deals: [], builtAt: null });
+
+    const watches    = await getUserWatches(req.userId);
+    const watchKeys  = watches.map(w => (w.keyword || '').toLowerCase().trim()).filter(Boolean);
+    const watchMakes = watches.map(w => (w.keyword || '').toLowerCase().trim())
+                              .filter(kw => kw.split(' ').length <= 2); // crude make heuristic
+
+    // Score each deal — watched keywords/makes bubble up; random jitter per request
+    const scored = cached.deals.map(d => {
+      let boost = 0;
+      const kw = (d.keyword || '').toLowerCase();
+      const make = (d.make || '').toLowerCase();
+      // Boost for exact keyword match
+      if (watchKeys.some(wk => kw === wk || kw.includes(wk) || wk.includes(kw))) boost += 40;
+      // Boost for make match
+      if (make && watchMakes.some(wm => make.includes(wm) || wm.includes(make))) boost += 20;
+      // Small random jitter — makes the feed feel alive on refresh
+      const jitter = (Math.random() - 0.5) * 18;
+      return { ...d, _score: d.baseScore + boost + jitter, _watched: boost > 0 };
+    });
+
+    scored.sort((a, b) => b._score - a._score);
+
+    // Remove internal scoring fields before sending
+    const deals = scored.map(({ _score, baseScore, ...d }) => d);
+
+    res.json({ deals, builtAt: cached.builtAt });
+  } catch (e) {
+    console.error('[Deals]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── Stripe routes ─────────────────────────────────────────
+app.post('/stripe/create-checkout', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const { priceId } = req.body;
+    if (!priceId || !Object.values(PRICE_IDS).includes(priceId))
+      return res.status(400).json({ error: 'Invalid price' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: 'https://flip-radar.app?upgraded=1',
+      cancel_url:  'https://flip-radar.app?cancelled=1',
+      customer_email: user.email,
+      metadata: { userId: user.id, priceId },
+      subscription_data: { metadata: { userId: user.id, priceId } },
+    });
+    res.json({ url: session.url });
+  } catch (e) { console.error('[Stripe] Checkout error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/stripe/create-intent', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const { priceId } = req.body;
+    if (!priceId || !Object.values(PRICE_IDS).includes(priceId))
+      return res.status(400).json({ error: 'Invalid price' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    let customerId = user.stripeCustomerId;
+    if (!customerId) {
+      const customer = await stripe.customers.create({ email: user.email, name: user.name, metadata: { userId: user.id } });
+      customerId = customer.id;
+      user.stripeCustomerId = customerId;
+      await saveUser(user);
+    }
+    const subscription = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [{ price: priceId }],
+      payment_behavior: 'default_incomplete',
+      payment_settings: { save_default_payment_method: 'on_subscription' },
+      expand: ['latest_invoice.payment_intent'],
+      metadata: { userId: user.id, priceId },
+    });
+    const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
+    res.json({ clientSecret, subscriptionId: subscription.id });
+  } catch (e) { console.error('[Stripe] Intent error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/stripe/portal', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const user = await getUser(req.userId);
+    if (!user || !user.stripeCustomerId) return res.status(400).json({ error: 'No subscription found' });
+    const session = await stripe.billingPortal.sessions.create({
+      customer: user.stripeCustomerId,
+      return_url: 'https://flip-radar.app',
+    });
+    res.json({ url: session.url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.json({ ok: true });
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (e) { console.error('[Stripe] Webhook sig failed:', e.message); return res.status(400).send('Webhook Error'); }
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const userId  = session.metadata?.userId;
+      const priceId = session.metadata?.priceId;
+      if (userId && priceId) {
+        const user = await getUser(userId);
+        if (user) {
+          user.plan = PRICE_TO_PLAN[priceId] || 'basic';
+          user.stripeCustomerId     = session.customer;
+          user.stripeSubscriptionId = session.subscription;
+          await saveUser(user);
+          console.log(`[Stripe] Upgraded ${user.email} to ${user.plan}`);
+        }
+      }
+    }
+    if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.paused') {
+      const sub    = event.data.object;
+      const userId = sub.metadata?.userId;
+      if (userId) {
+        const user = await getUser(userId);
+        if (user) {
+          user.plan = 'free';
+          user.stripeSubscriptionId = null;
+          await saveUser(user);
+          console.log(`[Stripe] Downgraded ${user.email} to free`);
+        }
+      }
+    }
+  } catch (e) { console.error('[Stripe] Webhook handler error:', e.message); }
+  res.json({ received: true });
+});
+
+app.get('/auth/plan', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today    = new Date().toISOString().slice(0, 10);
+    const appraised = user.appraisalDate === today ? (user.appraisalsToday || 0) : 0;
+    const limit     = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
+    res.json({
+      plan: getEffectivePlan(user),
+      appraisalsUsedToday: appraised,
+      appraisalsLimit:     limit === Infinity ? -1 : limit,
+      watchlistLimit:      PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
+    });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /onboarding — tells the frontend what state the user is in
+// Used to show/hide onboarding screen and tips
+app.get('/onboarding', authMiddleware, async (req, res) => {
+  try {
+    const user    = await getUser(req.userId);
+    const watches = await getUserWatches(req.userId);
+    const listings = await getUserListings(req.userId);
+    res.json({
+      hasWatches:    watches.length > 0,
+      watchCount:    watches.length,
+      hasListings:   listings.length > 0,
+      listingCount:  listings.length,
+      plan:          getEffectivePlan(user),
+      watchLimit:    PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
+      // Steps completed
+      steps: {
+        addedWatch:    watches.length > 0,
+        gotListings:   listings.length > 0,
+        usedAppraisal: (user.appraisalsToday || 0) > 0 || user.appraisalDate != null,
+      },
+    });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /listings/price-drops — listings that have dropped in price recently
+app.get('/listings/price-drops', authMiddleware, async (req, res) => {
+  try {
+    const listings = await getUserListings(req.userId);
+    const drops = listings.filter(l => l.priceDropped && l.previousPrice);
+    res.json(drops);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/appraisal', authMiddleware, async (req, res) => {
+  try {
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+    res.json({ ok: true, used: cr.used, limit: cr.limit });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Web Push notification sender ─────────────────────────
+async function sendWebPush(userId, payload) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  try {
+    const subs = await redisGet(K_push(userId));
+    if (!subs || !subs.length) return;
+    webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    const msg = JSON.stringify(payload);
+    const results = await Promise.allSettled(
+      subs.map(sub => webpush.sendNotification(sub, msg))
+    );
+    // Remove expired/invalid subscriptions
+    const valid = subs.filter((_, i) => results[i].status === 'fulfilled');
+    if (valid.length !== subs.length) await redisSet(K_push(userId), valid);
+  } catch (e) {
+    console.error('[WebPush] Error:', e.message);
+  }
+}
+
+// POST /push/subscribe — save user's push subscription
+app.post('/push/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const { subscription } = req.body;
+    if (!subscription || !subscription.endpoint) return res.status(400).json({ error: 'subscription required' });
+    const subs = await redisGet(K_push(req.userId)) || [];
+    // Avoid duplicates
+    const exists = subs.find(s => s.endpoint === subscription.endpoint);
+    if (!exists) {
+      subs.push(subscription);
+      await redisSet(K_push(req.userId), subs);
+    }
+    console.log(`[WebPush] Subscribed user ${req.userId}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE /push/subscribe — remove subscription
+app.delete('/push/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    const subs = await redisGet(K_push(req.userId)) || [];
+    await redisSet(K_push(req.userId), subs.filter(s => s.endpoint !== endpoint));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /push/vapid-key — gives frontend the public key to subscribe with
+app.get('/push/vapid-key', (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.status(500).json({ error: 'Push not configured' });
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+// ── AI proxy routes — keys live on server, never in browser ──
+const GEMINI_API_KEY    = process.env.GEMINI_API_KEY    || null;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
+
+// ── Web Push (VAPID) ──────────────────────────────────────
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
+const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
+
+
+// Redis key for push subscriptions
+const K_push = userId => `fr:push:${userId}`;
+
+// POST /ai/vehicle — vehicle appraisal grounded in DB data when available
+// DB data is fetched FIRST so AI can reason from real market numbers.
+app.post('/ai/vehicle', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
+
+    const { make, model, year, mileage, transmission, listingPrice, title, description,
+            imageUrl, imageBase64, imageMime, listingId, listingUrl } = req.body;
+    if (!listingPrice) return res.status(400).json({ error: 'listingPrice required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const keyword = req.body.keyword || [make, model, year].filter(Boolean).join(' ');
+    const cached  = await getAppraisalCache(listingId, title, listingPrice, keyword);
+    if (cached) {
+      console.log(`[AI/vehicle] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    // ── Step 1: Fetch DB market data BEFORE building prompt ──
+    // Key change: DB data feeds INTO the prompt so AI reasons from
+    // real AU market numbers rather than training data alone.
+    const dbResult = (make && model && year)
+      ? await fetchBestVehiclePrice(make, model, year, mileage, {
+          series: req.body.series, variant: req.body.variant, transmission
+        }).catch(() => null)
+      : null;
+
+    const dbPreferred = dbResult && !dbResult.belowThreshold;
+    const dbAvailable = !!dbResult;
+
+    // ── Step 2: Fetch full listing details from SociaVault ──
+    let fullDescription = description || '';
+    let condition = null;
+    if (listingId || listingUrl) {
+      const details = await fetchListingDetails(listingId, listingUrl);
+      if (details) {
+        if (details.description && details.description.length > (fullDescription?.length || 0)) {
+          fullDescription = details.description;
+        }
+        condition = details.condition || null;
+        console.log(`[AI/vehicle] Fetched full details — desc: ${fullDescription.length} chars, condition: ${condition}`);
+      }
+    }
+
+    // ── Step 3: Build DB market context block ────────────────
+    // Injected into the prompt — AI uses these real numbers as its anchor.
+    let dbMarketContext = '';
+    if (dbAvailable && dbResult.marketMedian) {
+      const mb        = dbResult.mileageBand || 'unknown mileage range';
+      const yb        = dbResult.yearBand    || String(year);
+      const cohortStr = [make, model, dbResult.series, dbResult.variant].filter(Boolean).join(' ');
+      const listingMileageBand = mileage ? bandMileage(mileage) : null;
+      const mileageMismatch = listingMileageBand && dbResult.mileageBand && listingMileageBand !== dbResult.mileageBand;
+
+      if (dbPreferred) {
+        const consistency = dbResult.iqr && dbResult.marketMedian
+          ? (dbResult.iqr / dbResult.marketMedian < 0.2 ? 'tight, consistent market' : 'moderate spread')
+          : '';
+        const mileageNote = mileageMismatch
+          ? `NOTE: Listing mileage (${Number(mileage).toLocaleString()} km) is outside the ${mb} cohort. ` +
+            `Use the cohort data as a baseline and adjust using the depreciation guide below.`
+          : `Listing mileage matches this cohort — use the market data directly, adjusted for condition signals.`;
+
+        dbMarketContext = [
+          '',
+          'REAL MARKET DATA FROM AU LISTINGS (use as your pricing anchor — actual observed data, not estimates):',
+          `- Vehicle cohort: ${cohortStr} · ${yb} · ${mb}`,
+          `- Market median price for this cohort: $${dbResult.marketMedian.toLocaleString()}`,
+          `- Price range (P25–P75): $${dbResult.marketLow.toLocaleString()} – $${dbResult.marketHigh.toLocaleString()}`,
+          `- Sample size: ${dbResult.samples} comparable AU listings`,
+          dbResult.iqr ? `- Market consistency (IQR): $${dbResult.iqr.toLocaleString()} — ${consistency}` : '',
+          '',
+          mileageNote,
+          'Your estimatedMarketValue MUST be grounded in these numbers.',
+          'Adjust up or down based on condition/extras/description but do not deviate >25% without stating why in whyItsWorth.',
+        ].filter(l => l !== null).join('\n');
+
+      } else {
+        dbMarketContext = [
+          '',
+          'PARTIAL MARKET DATA FROM AU LISTINGS (small sample — directional reference only):',
+          `- Vehicle cohort: ${cohortStr} · ${yb} · ${mb}`,
+          `- Observed median: $${dbResult.marketMedian.toLocaleString()}`,
+          `- Observed range: $${dbResult.marketLow.toLocaleString()} – $${dbResult.marketHigh.toLocaleString()}`,
+          `- Sample size: ${dbResult.samples} listings`,
+          mileageMismatch
+            ? `Listing mileage (${Number(mileage).toLocaleString()} km) differs from ${mb} cohort — interpolate using the depreciation guide.`
+            : '',
+          'Use alongside your own knowledge. If figures conflict with your knowledge, use judgment.',
+        ].filter(l => l !== null).join('\n');
+      }
+    } else {
+      dbMarketContext = '\nNO DATABASE DATA AVAILABLE for this vehicle cohort yet.\nUse your knowledge of the AU used-car market. Be conservative.';
+    }
+
+    // ── Step 4: Build the full prompt ─────────────────────
+    const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
+    const vehicleDetails = [
+      `Make/Model/Year: ${carLabel}`,
+      req.body.series  ? `Series: ${req.body.series}`   : null,
+      req.body.variant ? `Variant: ${req.body.variant}` : null,
+      mileage     ? `Kms: ${Number(mileage).toLocaleString()} km` : null,
+      transmission ? `Transmission: ${transmission}` : null,
+      condition    ? `Condition: ${condition}` : null,
+      `Listing Price: $${Number(listingPrice).toLocaleString()}`,
+    ].filter(Boolean).join('\n');
+
+    const mileageGuide = [
+      '',
+      'KMS DEPRECIATION GUIDE (AU market — use when interpolating from cohort data):',
+      '- Under 80,000 km:    premium — add 10–20% above cohort median',
+      '- 80,000–130,000 km:  normal use — at cohort median',
+      '- 130,000–180,000 km: moderate discount (~10–20% below median)',
+      '- 180,000–250,000 km: significant discount (~25–40% below median)',
+      '- Over 250,000 km:    hard sell — well below median, long time-to-sell',
+    ].join('\n');
+
+    const prompt = [
+      'You are an expert Australian used-vehicle flipper and market analyst. Your goal is accurate, conservative valuation grounded in real market data.',
+      dbMarketContext,
+      '',
+      'VEHICLE DETAILS:',
+      vehicleDetails,
+      mileageGuide,
+      '',
+      `LISTING TITLE: ${title || '(not provided)'}`,
+      'FULL LISTING DESCRIPTION:',
+      '"""',
+      fullDescription || '(not provided)',
+      '"""',
+      '',
+      'EXTRACT AND FACTOR IN FROM DESCRIPTION:',
+      '- Exact variant/trim/series (VE SS, FG XR6, GU TDI, SR5 etc) — significantly affects value',
+      '- Engine (3.6L V6, 6.0L V8, 3.0 diesel etc) — extract if not in title',
+      '- Extras (towbar, lift kit, ARB gear, new tyres, canopy, leather, sunroof) — add value',
+      '- Service history (logbooks, one owner, recently serviced) — adds significant value',
+      '- Defects (rust, oil leaks, engine noise, worn interior, needs RWC, accident history) — reduce value, add red flags',
+      '- Urgency signals (must sell, moving, price reduced) — negotiation leverage',
+      '- Rego status (registered until X, unregistered, interstate) — affects buyer cost',
+      '',
+      'MISSING INFORMATION RULES — absence of info is NOT neutral, treat it as a red flag:',
+      '- No service history mentioned → assume none exists, reduce value 10–15%, add as red flag',
+      '- No condition mentioned → assume average/fair condition, not good',
+      '- No kms mentioned → assume high kms, reduce value accordingly',
+      '- Vague description (one line, no detail) → seller is hiding something, flag it',
+      '',
+      'CRITICAL — WHAT THINGS ACTUALLY SELL FOR IN AU (not asking price):',
+      'The market median shown above is what sellers are ASKING. What things actually SELL for is different.',
+      'In Australian FB Marketplace, most items sell for 10–20% below the asking median.',
+      'Your estimatedResellLow must be what a buyer will realistically pay — not what you hope to get.',
+      'Price it to sell in 1–2 weeks. If it would take longer, the price is too high.',
+      '',
+      'CALCULATE PROFIT STEP BY STEP — show your working in whyItsWorth:',
+      'Step 1 — Realistic sell price: take market median, subtract 12% (AU market discount off asking)',
+      'Step 2 — Detailing/clean: $200 minimum, $400 if condition is average or unknown',
+      'Step 3 — Minor repairs: $0 if genuinely perfect, $300–800 if any issues mentioned or kms are high',
+      'Step 4 — Rego/RWC if unregistered or interstate: add $400–800',
+      'Step 5 — Your time: minimum 2 hours to list, negotiate, show, sell — factor it in',
+      'Step 6 — estimatedProfit = realistic sell price MINUS buy price MINUS steps 2–4',
+      'Step 7 — roiPercent = estimatedProfit divided by buy price, expressed as percentage',
+      '',
+      'estimatedResellLow = Step 1 result (realistic sell, priced to move)',
+      'estimatedResellHigh = market median minus 5% (best case, patient seller)',
+      'estimatedProfit = estimatedResellLow minus listingPrice minus all costs from steps 2–4',
+      '',
+      'VERDICT RULES — apply strictly:',
+      '- roiPercent > 30% after ALL costs → STEAL',
+      '- roiPercent 15–30% after ALL costs → GOOD DEAL',
+      '- roiPercent 5–15% after ALL costs → FAIR',
+      '- roiPercent 0–5% after ALL costs → FAIR (barely worth it)',
+      '- roiPercent < 0% → PASS',
+      '- A $300 profit on a $4000 car is FAIR, not GOOD DEAL. Be honest.',
+      '',
+      'NEGATIVE PROFIT RULE — critical:',
+      'If your calculation produces a negative profit (you would lose money flipping this):',
+      '- DO NOT show a negative estimatedProfit — set it to 0',
+      '- DO NOT show a negative roiPercent — set it to 0',
+      '- Set estimatedResellLow to approximately the listing price (what you paid)',
+      '- Set estimatedResellHigh to listing price plus 3–5% at most',
+      '- The message to the user is: you would need to sell for roughly what you paid just to break even',
+      '- Set verdict to PASS and dealScore to 15 or lower',
+      '- The oneLiner should honestly say something like "You would need to sell for at least $X just to break even after costs"',
+      '- Do not invent profit that does not exist',
+      '',
+      'Broken/project cars: if listing mentions "spares or repairs", "not running", "blown", "needs work", "as-is" — set isBrokenOrProject true, provide repairEstimate, cap verdict at FAIR unless post-repair ROI is exceptional.',
+      '',
+      'Respond ONLY in this exact JSON format (no markdown, no text outside JSON):',
+      '{',
+      '  "verdict": "STEAL|GOOD DEAL|FAIR|PASS",',
+      '  "dealScore": 0-100,',
+      '  "oneLiner": "one punchy sentence",',
+      '  "extractedTitle": "cleaned listing title",',
+      '  "extractedPrice": number,',
+      '  "estimatedMarketValue": number,',
+      '  "estimatedResellLow": number,',
+      '  "estimatedResellHigh": number,',
+      '  "recommendedOffer": number,',
+      '  "walkAwayPrice": number,',
+      '  "estimatedProfit": number,',
+      '  "roiPercent": number,',
+      '  "timeToSell": "1-3 days / 3-7 days / 1-2 weeks / 2-4 weeks",',
+      '  "demandLevel": "🔥 High or 📈 Moderate or 📉 Low",',
+      '  "whyItsWorth": "1-2 sentences referencing the actual price numbers",',
+      '  "greenFlags": ["..."],',
+      '  "redFlags": ["..."],',
+      '  "whatToCheckInPerson": ["..."],',
+      '  "negotiationScript": "what to say to the seller",',
+      '  "isBrokenOrProject": false,',
+      '  "repairEstimate": 0,',
+      '  "repairNotes": "",',
+      '  "aiGenerated": true',
+      '}',
+    ].join('\n');
+
+    // ── Step 5: Call AI ────────────────────────────────────
+    let text = '';
+    const hasImage = !!(imageBase64 || imageUrl);
+
+    if (GEMINI_API_KEY && hasImage) {
+      const parts = [];
+      if (imageBase64 && imageMime) {
+        parts.push({ inline_data: { mime_type: imageMime, data: imageBase64 } });
+      } else if (imageUrl) {
+        try {
+          const imgRes = await axios.get(imageUrl, {
+            responseType: 'arraybuffer', timeout: 10000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+          });
+          parts.push({ inline_data: { mime_type: imgRes.headers['content-type'] || 'image/jpeg', data: Buffer.from(imgRes.data).toString('base64') } });
+        } catch (_) {}
+      }
+      parts.push({ text: prompt });
+      const geminiRes = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+      );
+      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else if (GEMINI_API_KEY) {
+      const geminiRes = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+      );
+      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else {
+      const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1500,
+        messages: [{ role: 'user', content: prompt }],
+      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 60000 });
+      text = claudeRes.data?.content?.[0]?.text || '';
+    }
+
+    // ── Step 6: Parse and apply DB hard-override if trusted ──
+    let parsed = null;
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
+    } catch (_) {}
+
+    if (parsed) {
+      if (dbPreferred) {
+        // DB is fully trusted — lock the price fields
+        // AI still owns: verdict rationale, flags, negotiation script, inspection checklist
+        parsed.estimatedMarketValue = dbResult.marketMedian;
+        parsed.estimatedResellLow   = dbResult.marketLow;
+        parsed.estimatedResellHigh  = dbResult.marketHigh;
+        parsed.low                  = dbResult.marketLow;
+        parsed.median               = dbResult.marketMedian;
+        parsed.high                 = dbResult.marketHigh;
+        // Realistic sell price = 10% below median (priced to actually sell, not sit)
+        const realisticSellPrice = Math.round(dbResult.marketMedian * 0.90);
+        // Realistic costs: detailing + minor prep (conservative estimate)
+        const flipCosts = listingPrice < 5000 ? 300 : listingPrice < 15000 ? 500 : 800;
+        const realisticProfit = realisticSellPrice - listingPrice - flipCosts;
+
+        parsed.estimatedResellLow   = realisticSellPrice;
+        parsed.estimatedResellHigh  = Math.round(dbResult.marketMedian * 0.97); // best case just under median
+        parsed.estimatedMarketValue = dbResult.marketMedian;
+        parsed.low                  = dbResult.marketLow;
+        parsed.median               = dbResult.marketMedian;
+        parsed.high                 = dbResult.marketHigh;
+        if (realisticProfit <= 0) {
+          // Negative flip — set resell to around what was paid, profit to 0
+          parsed.estimatedProfit      = 0;
+          parsed.roiPercent           = 0;
+          parsed.estimatedResellLow   = listingPrice;
+          parsed.estimatedResellHigh  = Math.round(listingPrice * 1.04);
+        } else {
+          parsed.estimatedProfit      = Math.round(realisticProfit);
+          parsed.roiPercent           = Math.round((realisticProfit / listingPrice) * 100);
+        }
+
+        // Verdict anchored to realistic ROI after all costs
+        if      (parsed.roiPercent >= 30) { parsed.verdict = 'STEAL';     parsed.dealScore = Math.min(95, Math.max(parsed.dealScore || 0, 85)); }
+        else if (parsed.roiPercent >= 15) { parsed.verdict = 'GOOD DEAL'; parsed.dealScore = Math.min(84, Math.max(parsed.dealScore || 0, 65)); }
+        else if (parsed.roiPercent >= 5)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(64, Math.max(parsed.dealScore || 0, 45)); }
+        else if (parsed.roiPercent >= 0)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(44, 40); }
+        else                              { parsed.verdict = 'PASS';      parsed.dealScore = Math.min(parsed.dealScore || 25, 25); }
+      }
+
+      // Strip internal fields — never send to user
+      delete parsed.sourceLabel;
+      delete parsed.confidence;
+      delete parsed.dataPoints;
+      delete parsed.dbData;
+      delete parsed._pricingCorrected;
+
+      const finalResult = { ...parsed, text, usedCache: false };
+      await setAppraisalCache(listingId, title, listingPrice, keyword, finalResult).catch(e =>
+        console.error('[AprCache] Write error:', e.message)
+      );
+      res.json(finalResult);
+    } else {
+      res.json({ text, usedCache: false });
+    }
+  } catch (e) {
+    console.error('[AI/vehicle]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/image — image scan via Gemini Flash
+// Body: { parts: [ { inline_data: { mime_type, data } }, { text: prompt } ] }
+app.post('/ai/image', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
+    const { parts } = req.body;
+    if (!parts || !Array.isArray(parts)) return res.status(400).json({ error: 'parts array required' });
+
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 30000,
+    });
+    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    res.json({ text });
+  } catch (e) {
+    console.error('[AI/image]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/text — text-only calls via Claude Haiku
+// Body: { prompt: string }
+app.post('/ai/text', authMiddleware, async (req, res) => {
+  try {
+    if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Anthropic not configured on server' });
+    const { prompt, max_tokens, listingId, title, price, keyword } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    if (cached) {
+      console.log(`[AI/text] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: max_tokens || 1500,
+      messages: [{ role: 'user', content: prompt }],
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      timeout: 60000,
+    });
+    const text = claudeRes.data?.content?.[0]?.text || '';
+    const result = { text, usedCache: false };
+
+    // Store in cache for future users
+    if (listingId || (title && price)) {
+      await setAppraisalCache(listingId, title, price, keyword, result).catch(e =>
+        console.error('[AprCache] Write error (text):', e.message)
+      );
+    }
+
+    res.json(result);
+  } catch (e) {
+    console.error('[AI/text]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/text-image — text scan with an image fetched via URL (listing image)
+// Body: { prompt: string, imageUrl: string }
+app.post('/ai/text-image', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
+    const { prompt, imageUrl, listingId, title, price, keyword } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    if (cached) {
+      console.log(`[AI/text-image] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    var parts = [{ text: prompt }];
+
+    // If there's an image URL, fetch and include it
+    if (imageUrl) {
+      try {
+        const imgRes = await axios.get(imageUrl, {
+          responseType: 'arraybuffer', timeout: 10000,
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' }
+        });
+        const b64 = Buffer.from(imgRes.data).toString('base64');
+        const mime = imgRes.headers['content-type'] || 'image/jpeg';
+        parts = [{ inline_data: { mime_type: mime, data: b64 } }, { text: prompt }];
+      } catch(e) {
+        console.log('[AI/text-image] Could not fetch image, proceeding text-only');
+      }
+    }
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 30000,
+    });
+    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const result = { text, usedCache: false };
+
+    // Store in cache for future users
+    if (listingId || (title && price)) {
+      await setAppraisalCache(listingId, title, price, keyword, result).catch(e =>
+        console.error('[AprCache] Write error (text-image):', e.message)
+      );
+    }
+
+    res.json(result);
+  } catch (e) {
+    console.error('[AI/text-image]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// ── Appraisal cache admin ─────────────────────────────────
+// GET /appraisal-cache?listingId=xxx  — check if a result is cached
+app.get('/appraisal-cache', authMiddleware, async (req, res) => {
+  try {
+    const { listingId, title, price, keyword } = req.query;
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    res.json({ found: !!cached, cached: cached || null });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE /appraisal-cache?listingId=xxx  — bust a specific cache entry (owner only)
+app.delete('/appraisal-cache', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    const { listingId, title, price, keyword } = req.query;
+    if (listingId) await redisDel(K.appraisalById(listingId));
+    if (title && price) {
+      const hash = buildAppraisalHash(title, price, keyword);
+      await redisDel(K.appraisalByHash(hash));
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── DEV: force-set plan (secret-gated, remove before public launch) ──
+// POST /dev/set-plan  { secret: "...", plan: "premium" }
+const DEV_SECRET = process.env.DEV_SECRET || 'flipradar-dev';
+app.post('/dev/set-plan', authMiddleware, async (req, res) => {
+  const { secret, plan } = req.body;
+  if (secret !== DEV_SECRET) return res.status(403).json({ error: 'Forbidden' });
+  const validPlans = ['free', 'basic', 'premium'];
+  if (!validPlans.includes(plan)) return res.status(400).json({ error: 'plan must be free, basic, or premium' });
+  const user = await getUser(req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.plan = plan;
+  await saveUser(user);
+  console.log(`[Dev] Set plan for ${user.email} → ${plan}`);
+  res.json({ ok: true, plan });
+});
+
+// ── Start ─────────────────────────────────────────────────
+
+// ── Vehicle identity helpers ─────────────────────────────
+// Reads make/model/year/km from SociaVault structured fields first,
+// falls back to what the scan already extracted from the title.
+function parseVehicleInfoFields(item) {
+  if (!item) return {};
+  const vi = item.vehicle_info || item.listing_vehicle_data || item.vehicleInfo || {};
+  const attrs = item.attributes ? Object.values(item.attributes) : [];
+  const attr = (name) => {
+    const a = attrs.find(x => String(x.attribute_name || x.name || '').toLowerCase() === name.toLowerCase());
+    return a ? (a.label || a.value || null) : null;
+  };
+  const toInt = (v) => { if (v == null) return null; const n = parseInt(String(v).replace(/[^0-9]/g,''),10); return Number.isFinite(n)?n:null; };
+  const year = toInt(vi.year || vi.model_year || vi.manufacture_year || attr('Year'));
+  return {
+    make:         vi.make || vi.manufacturer || vi.brand || attr('Make') || null,
+    model:        vi.model || vi.model_name || attr('Model') || null,
+    year:         (year >= 1970 && year <= new Date().getFullYear()+1) ? year : null,
+    kms:          toInt(vi.odometer || vi.mileage || vi.kilometres || vi.kilometers || attr('Odometer')),
+    transmission: vi.transmission || vi.gearbox || attr('Transmission') || null,
+    fuel_type:    vi.fuel_type || vi.fuel || attr('Fuel type') || null,
+    body_style:   vi.body_style || vi.body || vi.body_type || attr('Body style') || null,
+  };
+}
+
+// ── Vehicle blend valuation ──────────────────────────────
+// Prices a specific car by sliding comparable listings to its km,
+// weighting closest-km comps most, and blending with AI when data is thin.
+const REF_FALLBACK_PERKM = 0.08;
+const KM_HALF_WEIGHT = 50000;
+const ENOUGH_COMPS = 8;
+
+function slideToKm(price, fromKm, toKm, make) {
+  // VERIFY: DEP_TABLE must be keyed by lowercase make with a perKm field
+  const perKm = (DEP_TABLE?.[String(make||'').toLowerCase()]?.perKm) || REF_FALLBACK_PERKM;
+  const adjusted = price + (fromKm - toKm) * perKm;
+  return Math.max(price * 0.25, adjusted);
+}
+
+async function getVehicleComps(target) {
+  const scopes = [
+    'make=$1 AND model=$2 AND series IS NOT DISTINCT FROM $3 AND variant IS NOT DISTINCT FROM $4',
+    'make=$1 AND model=$2 AND series IS NOT DISTINCT FROM $3',
+    'make=$1 AND model=$2',
+  ];
+  for (const where of scopes) {
+    const { rows } = await pool.query(
+      `SELECT price, kms, year, scraped_at FROM listings WHERE category='vehicle' AND is_active=TRUE AND in_price_pool=TRUE AND price>0 AND kms>0 AND ${where} AND scraped_at > NOW() - INTERVAL '120 days'`,
+      [target.make, target.model, target.series||null, target.variant||null]);
+    if (rows.length >= 3) return rows;
+  }
+  return [];
+}
+
+async function aiEstimateVehicle(target) {
+  const ck = `vest:${[target.make,target.model,target.series,target.year,Math.round((target.kms||0)/20000)].join('|')}`;
+  const cached = await redisGet(ck);
+  if (cached?.est) return cached.est;
+  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
+  const prompt = `Typical USED private-sale price AUD on Australian Facebook Marketplace:\n${target.year||''} ${target.make||''} ${target.model||''} ${target.series||''} ${target.variant||''}, ${target.kms||'?'} km.\nReturn ONLY JSON: { "est_aud": number }`;
+  try {
+    let text = '';
+    if (GEMINI_API_KEY) {
+      const r = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},
+        {headers:{'Content-Type':'application/json'},timeout:10000});
+      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';
+    } else {
+      const r = await axios.post('https://api.anthropic.com/v1/messages',
+        {model:'claude-haiku-4-5-20251001',max_tokens:80,messages:[{role:'user',content:prompt}]},
+        {headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},timeout:10000});
+      text = r.data?.content?.[0]?.text||'';
+    }
+    const m = text.match(/\{[\s\S]*\}/);
+    const est = m ? Math.round(JSON.parse(m[0]).est_aud) : null;
+    if (est > 0) { await redisSet(ck,{est},14*24*3600); return est; }
+  } catch(e) { console.error('[VEst]',e.message); }
+  return null;
+}
+
+async function appraiseVehicleValue(target) {
+  if (!target.kms || target.kms <= 0) {
+    const aiEst = await aiEstimateVehicle(target);
+    return aiEst ? {value:aiEst,confidence:15,source:'ai_only',poolN:0,aiEst} : {value:null,confidence:0,source:'none',poolN:0};
+  }
+  const comps = await getVehicleComps(target);
+  const adj = comps.map(c => {
+    const price = slideToKm(c.price, c.kms, target.kms, target.make);
+    const kmW = 1/(1+Math.abs(c.kms-target.kms)/KM_HALF_WEIGHT);
+    const ageDays = (Date.now()-new Date(c.scraped_at))/86400000;
+    const recW = ageDays<30?1:ageDays<90?0.7:0.4;
+    return {price, w:kmW*recW, kmGap:Math.abs(c.kms-target.kms)};
+  });
+  let poolValue=null, poolN=0;
+  if (adj.length) {
+    const sorted = adj.map(a=>a.price).sort((x,y)=>x-y);
+    const q = p => sorted[Math.floor(p*(sorted.length-1))];
+    const lo=q(0.25)-1.5*(q(0.75)-q(0.25)), hi=q(0.75)+1.5*(q(0.75)-q(0.25));
+    const kept = adj.filter(a=>a.price>=lo&&a.price<=hi);
+    const wsum = kept.reduce((s,a)=>s+a.w,0);
+    poolValue = wsum?Math.round(kept.reduce((s,a)=>s+a.price*a.w,0)/wsum):null;
+    poolN = kept.length;
+  }
+  const aiEst = await aiEstimateVehicle(target);
+  const trust = Math.min(poolN/ENOUGH_COMPS,1);
+  let value, source;
+  if (poolN>0&&aiEst) { value=Math.round(poolValue*trust+aiEst*(1-trust)); source='blend'; }
+  else if (poolN>0) { value=poolValue; source='comps_only'; }
+  else if (aiEst) { value=aiEst; source='ai_only'; }
+  else { return {value:null,confidence:0,source:'none',poolN:0}; }
+  const nearestGap = adj.length?Math.min(...adj.map(a=>a.kmGap)):Infinity;
+  const agr = (a,b)=>{ if(!a||!b)return 0; const d=Math.abs(a-b)/Math.max(a,b); return d<0.07?1:d<0.15?0.6:d<0.25?0.2:0; };
+  let confidence = Math.round(55*trust+20*(poolN>0&&aiEst?agr(poolValue,aiEst):0)+15*(nearestGap<30000?1:nearestGap<80000?0.5:0)+10*(source==='comps_only'?1:source==='blend'?0.6:0));
+  confidence = Math.max(5,Math.min(confidence,100));
+  return {value,confidence,source,poolN,aiEst,poolValue};
+}
+
+// ── General goods normaliser ─────────────────────────────
+// Turns a title into { category, brand, product_line, variant, norm_key }
+// so general items get precise cohorts instead of broad keyword buckets.
+const _slug = s => String(s||'').toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+const _tc   = s => String(s||'').replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+const _pick = (pairs,t) => { for(const [k,re] of pairs) if(re.test(t)) return k; return null; };
+const CATEGORY_SIGNALS=[['gaming',/\b(ps5|ps4|playstation|xbox|series x|series s|nintendo switch|steam deck|quest ?[23]|oculus)\b/i],['phone',/\b(iphone|galaxy s\d|galaxy note|pixel \d|ipad)\b/i],['power_tool',/\b(milwaukee|makita|de ?walt|ryobi|festool|hilti|metabo|hikoki|m18|m12|18v|impact driver|angle grinder|circular saw|hammer drill)\b/i],['computer',/\b(macbook|imac|thinkpad|dell xps|rtx ?\d{3,4}|graphics card)\b/i],['audio',/\b(sonos|airpods|bose|wh.?1000|quietcomfort|soundbar|turntable)\b/i],['vacuum',/\b(dyson|stick vac|cordless vacuum)\b/i]];
+function detectNormCategory(text){for(const[cat,re]of CATEGORY_SIGNALS)if(re.test(text))return cat;return 'general';}
+const PT_BRANDS=[['milwaukee',/\bmilwaukee\b/i],['makita',/\bmakita\b/i],['dewalt',/\bde ?walt\b/i],['ryobi',/\bryobi\b/i],['festool',/\bfestool\b/i],['hilti',/\bhilti\b/i],['metabo',/\b(metabo|hikoki|hitachi)\b/i],['bosch',/\bbosch\b/i],['ego',/\bego\b/i]];
+const PT_LINE={milwaukee:[['m18',/\bm18\b/i],['m12',/\bm12\b/i]],makita:[['xgt-40v',/\bxgt\b|\b40v\b/i],['cxt-12v',/\bcxt\b|\b12v\b/i],['lxt-18v',/\blxt\b|\b18v\b/i]],dewalt:[['xr-18v',/\bxr\b|\b18v\b|\b20v\b/i]],ryobi:[['one-plus-18v',/\bone\+?\b|\b18v\b/i]]};
+const PT_TOOL=[['hammer-drill',/hammer ?drill|combi ?drill/i],['impact-driver',/impact ?driver/i],['impact-wrench',/impact ?wrench|rattle ?gun/i],['drill',/\bdrill( ?driver)?\b/i],['angle-grinder',/angle ?grinder|\bgrinder\b/i],['circular-saw',/circular ?saw/i],['recip-saw',/recip(rocating)? ?saw|sawzall/i],['multi-tool',/multi ?tool|oscillating/i],['blower',/\bblower\b/i],['nailer',/nail ?gun|nailer/i]];
+function resolvePowerTool(t){const brand=_pick(PT_BRANDS,t);const line=brand&&PT_LINE[brand]?_pick(PT_LINE[brand],t):null;const tool=_pick(PT_TOOL,t);const isKit=/\b(kit|combo|set)\b/i.test(t);const isBare=/\b(bare|skin only|tool only|body only)\b/i.test(t);return{brand,product_line:[line,tool].filter(Boolean).join(' ')||null,variant:isBare?'bare':(isKit?'kit':null),attributes:{kit:isKit,bare:isBare}};}
+const IPHONE=[['iphone-16-pro-max',/iphone ?16 ?pro ?max/i],['iphone-16-pro',/iphone ?16 ?pro/i],['iphone-16',/iphone ?16/i],['iphone-15-pro-max',/iphone ?15 ?pro ?max/i],['iphone-15-pro',/iphone ?15 ?pro/i],['iphone-15',/iphone ?15/i],['iphone-14-pro-max',/iphone ?14 ?pro ?max/i],['iphone-14-pro',/iphone ?14 ?pro/i],['iphone-14',/iphone ?14/i],['iphone-13-pro',/iphone ?13 ?pro/i],['iphone-13',/iphone ?13/i],['iphone-12',/iphone ?12/i],['iphone-11',/iphone ?11/i]];
+const GALAXY=[['galaxy-s24-ultra',/s24 ?ultra/i],['galaxy-s24',/galaxy ?s24/i],['galaxy-s23-ultra',/s23 ?ultra/i],['galaxy-s23',/galaxy ?s23/i],['galaxy-s22',/galaxy ?s22/i]];
+function resolvePhone(t){const brand=/\b(iphone|apple)\b/i.test(t)?'apple':/\b(samsung|galaxy)\b/i.test(t)?'samsung':/\b(pixel|google)\b/i.test(t)?'google':null;const model=brand==='apple'?_pick(IPHONE,t):brand==='samsung'?_pick(GALAXY,t):null;const gb=(t.match(/\b(64|128|256|512)\s?gb\b/i)||[])[1]||(/\b1\s?tb\b/i.test(t)?'1024':null);const locked=/\blocked\b/i.test(t)&&!/\bunlocked\b/i.test(t);return{brand,product_line:model,variant:[gb?`${gb}gb`:null,locked?'locked':null].filter(Boolean).join('-')||null,attributes:{storage_gb:gb?+gb:null,locked}};}
+const CONSOLE=[['ps5-pro',/ps5 ?pro/i],['ps5-slim',/ps5 ?slim/i],['ps5',/ps5|playstation ?5/i],['ps4-pro',/ps4 ?pro/i],['ps4',/ps4|playstation ?4/i],['xbox-series-x',/series ?x/i],['xbox-series-s',/series ?s/i],['switch-oled',/switch ?oled/i],['switch-lite',/switch ?lite/i],['switch',/nintendo ?switch|\bswitch\b/i],['steam-deck',/steam ?deck/i],['quest-3',/quest ?3/i],['quest-2',/quest ?2/i]];
+const CONSOLE_BRAND={'ps5':'sony','ps5-pro':'sony','ps5-slim':'sony','ps4':'sony','ps4-pro':'sony','xbox-series-x':'microsoft','xbox-series-s':'microsoft','switch':'nintendo','switch-oled':'nintendo','switch-lite':'nintendo','steam-deck':'valve','quest-3':'meta','quest-2':'meta'};
+function resolveGaming(t){const model=_pick(CONSOLE,t);let edition=null;if(model&&(model.startsWith('ps5')||model==='xbox-series-x')){if(/digital/i.test(t))edition='digital';else if(/disc/i.test(t))edition='disc';}return{brand:model?CONSOLE_BRAND[model]||null:null,product_line:model,variant:edition,attributes:{edition}};}
+const DYSON_MODELS=[['v15',/v15/i],['v12',/v12/i],['v11',/v11/i],['v10',/v10/i],['v8',/v8/i]];
+function resolveVacuum(t){const brand=/dyson/i.test(t)?'dyson':null;return{brand,product_line:brand?_pick(DYSON_MODELS,t):null,variant:null,attributes:{}};}
+const AUDIO_LIST=[['apple','airpods-pro-2',/airpods ?pro ?(2|2nd)/i],['apple','airpods-pro',/airpods ?pro/i],['apple','airpods-max',/airpods ?max/i],['apple','airpods',/airpods/i],['sony','wh-1000xm5',/wh.?1000xm5|\bxm5\b/i],['sony','wh-1000xm4',/wh.?1000xm4|\bxm4\b/i],['bose','quietcomfort',/quietcomfort|\bqc\b/i],['sonos','sonos',/sonos/i]];
+function resolveAudio(t){for(const[brand,line,re]of AUDIO_LIST)if(re.test(t))return{brand,product_line:line,variant:null,attributes:{}};return{};}
+const MAC_MODELS=[['macbook-pro-16',/macbook ?pro ?16/i],['macbook-pro-14',/macbook ?pro ?14/i],['macbook-pro',/macbook ?pro/i],['macbook-air',/macbook ?air/i],['imac',/imac/i]];
+function resolveComputer(t){const brand=/macbook|imac|apple/i.test(t)?'apple':null;const chip=(t.match(/\bm([1234])\b/i)||[])[1];return{brand,product_line:brand?_pick(MAC_MODELS,t):null,variant:chip?`m${chip}`:null,attributes:{chip:chip?`m${chip}`:null}};}
+const NORM_RESOLVERS={power_tool:resolvePowerTool,phone:resolvePhone,gaming:resolveGaming,vacuum:resolveVacuum,audio:resolveAudio,computer:resolveComputer};
+function normalizeGeneralProduct(listing){
+  const text=`${listing.keyword||''} ${listing.title||''}`;
+  const category=detectNormCategory(text);
+  const r=(NORM_RESOLVERS[category]?NORM_RESOLVERS[category](text):{})||{};
+  const brand=r.brand||null;const product_line=r.product_line||null;const variant=r.variant||null;
+  const resolved=!!(brand&&product_line);
+  return{category,brand,product_line,variant,attributes:r.attributes||{},
+    norm_key:resolved?_slug([category,brand,product_line,variant].filter(Boolean).join(' ')):null,
+    display_name:resolved?_tc([brand,product_line,variant].filter(Boolean).join(' ')):null,resolved};
+}
+
+// ── Keyword price anchor (AI ballpark for the real product) ──────────
+const BROAD_KEYWORD_STOPLIST=new Set(['bmw','mercedes','audi','toyota','ford','holden','honda','nissan','mazda','mitsubishi','hyundai','kia','subaru','volkswagen','vw','jeep','lexus','volvo','car','cars','ute','van','truck','phone','laptop','tv','furniture','tools','desk','chair','table','couch','sofa']);
+function isBroadKeyword(kw){return BROAD_KEYWORD_STOPLIST.has(String(kw||'').toLowerCase().trim());}
+async function getKeywordPriceAnchor(keyword,sampleTitles=[]){
+  const cacheKey=`anchor:${_slug(keyword).slice(0,60)}`;
+  const cached=await redisGet(cacheKey);if(cached&&cached.anchor)return cached.anchor;
+  if(!GEMINI_API_KEY&&!ANTHROPIC_API_KEY)return null;
+  const prompt=['You estimate the typical USED resale price in AUD on Australian Facebook Marketplace.',`Product keyword: "${keyword}"`,sampleTitles.length?`Example titles:\n- ${sampleTitles.slice(0,6).join('\n- ')}`:'','Give ONE rough typical price for the MAIN product in good used condition (NOT accessories/parts).','Return ONLY JSON: { "anchor_aud": number }'].filter(Boolean).join('\n');
+  try{
+    let text='';
+    if(GEMINI_API_KEY){const r=await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,{contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},{headers:{'Content-Type':'application/json'},timeout:10000});text=r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';}
+    else{const r=await axios.post('https://api.anthropic.com/v1/messages',{model:'claude-haiku-4-5-20251001',max_tokens:100,messages:[{role:'user',content:prompt}]},{headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},timeout:10000});text=r.data?.content?.[0]?.text||'';}
+    const m=text.match(/\{[\s\S]*\}/);const anchor=m?Math.round(JSON.parse(m[0]).anchor_aud):null;
+    if(anchor&&anchor>0){await redisSet(cacheKey,{anchor},30*24*3600);return anchor;}
+  }catch(e){console.error('[Anchor]',keyword,e.message);}
+  return null;
+}
+async function refreshKeywordAnchors(){
+  try{
+    const{rows}=await pool.query(`SELECT keyword,COUNT(*)::INT AS n,(ARRAY_AGG(title ORDER BY scraped_at DESC))[1:6] AS sample_titles FROM listings WHERE keyword IS NOT NULL AND category!='vehicle' AND price>0 AND is_active=TRUE GROUP BY keyword HAVING COUNT(*)>=8`);
+    for(const r of rows){if(isBroadKeyword(r.keyword))continue;const anchor=await getKeywordPriceAnchor(r.keyword,r.sample_titles||[]);if(anchor){await pool.query(`INSERT INTO keyword_anchors(keyword,anchor_price,updated_at)VALUES($1,$2,NOW())ON CONFLICT(keyword)DO UPDATE SET anchor_price=EXCLUDED.anchor_price,updated_at=NOW()`,[r.keyword,anchor]);}await new Promise(res=>setTimeout(res,200));}
+    console.log(`[Anchor] refreshed ${rows.length} keyword anchors`);
+  }catch(e){console.error('[Anchor] refresh error:',e.message);}
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`FlipRadar backend on port ${PORT}`);
+  console.log(`SociaVault: ${SOCIAVAULT_API_KEY ? 'set' : 'NO TOKEN — add SOCIAVAULT_API_KEY'}`);
+  console.log(`Redis:      ${REDIS_URL           ? 'connected' : 'NOT SET'}`);
+  console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
+  console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
+  await initDB();          // create tables if not exist
+  await loadAllWatches();
+  const dbSummary = await getDBSummary();
+  if (dbSummary) {
+    console.log(`[DB] ${dbSummary.total_listings} listings · ${dbSummary.unique_keywords} keywords · ${dbSummary.unique_makes} vehicle makes`);
+  }
+  console.log('[Ready] Server fully loaded');
+});
++median+' AUD' : 'unknown'}
+- Market p25/p75: ${row.p25_price ? '
+// Analyses each listing photo to:
+//   1. Assess item condition (new/like_new/good/fair/poor/damaged)
+//   2. Verify the photo actually matches the keyword — flags mismatches (e.g. moped listed as electric scooter)
+// Runs nightly, never re-analyses a listing. Costs ~$0.000075 per image.
+
+async function analyseListingImagesNightly() {
+  if (!GEMINI_API_KEY) { console.log('[ImgAnalysis] No Gemini key — skipping'); return; }
+
+  const BATCH = 20;
+  let processed = 0;
+  let flagged = 0;
+
+  while (true) {
+    const { rows } = await pool.query(`
+      SELECT id, listing_id, title, keyword, price, image_url,
+             extracted_product, extracted_category
+      FROM listings
+      WHERE img_analysed_at IS NULL
+        AND image_url IS NOT NULL AND image_url != ''
+        AND price > 0
+        AND is_active = TRUE
+      ORDER BY scraped_at DESC
+      LIMIT $1
+    `, [BATCH]);
+
+    if (!rows.length) break;
+
+    console.log(`[ImgAnalysis] Analysing batch of ${rows.length} images...`);
+
+    for (const row of rows) {
+      try {
+        // Fetch image
+        let imgBase64 = null, imgMime = 'image/jpeg';
+        try {
+          const imgRes = await axios.get(row.image_url, {
+            responseType: 'arraybuffer', timeout: 12000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+          });
+          imgBase64 = Buffer.from(imgRes.data).toString('base64');
+          imgMime = imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg';
+        } catch (_) {
+          await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+          continue;
+        }
+
+        const keyword  = row.keyword || row.extracted_product || row.title || 'unknown';
+        const category = row.extracted_category || 'general';
+
+        const prompt = `Analyse this Facebook Marketplace listing photo.
+
+Listing:
+- Search keyword: "${keyword}"
+- Title: "${(row.title||'').slice(0,120)}"
+- Category: ${category}
+- Price: ${row.price} AUD
+
+Return ONLY valid JSON (no markdown):
+{
+  "condition": "new" | "like_new" | "good" | "fair" | "poor" | "damaged" | "cannot_assess",
+  "matches_keyword": true | false,
+  "mismatch_reason": null | "short reason e.g. photo shows a petrol moped not an electric scooter",
+  "visible_damage": true | false,
+  "is_stock_photo": true | false
+}
+
+Be strict on matches_keyword — only mark false if the item in the photo is clearly a DIFFERENT type of product than the keyword describes. Minor brand/model differences are fine.`;
+
+        const geminiRes = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+          { contents: [{ parts: [
+            { inline_data: { mime_type: imgMime, data: imgBase64 } },
+            { text: prompt }
+          ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+        );
+
+        const raw = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (!match) {
+          await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+          continue;
+        }
+
+        const result = JSON.parse(match[0]);
+
+        // Determine quality penalty
+        let newQuality = null;
+        if (result.matches_keyword === false) {
+          newQuality = 'spam'; // wrong item — exclude from price pool and deals
+          flagged++;
+          console.log(`[ImgAnalysis] ❌ MISMATCH: "${row.title}" (kw: ${keyword}) — ${result.mismatch_reason}`);
+        } else if (result.condition === 'damaged' || result.visible_damage) {
+          newQuality = 'damage'; // still shows in deals but tint is capped
+        }
+
+        await pool.query(`
+          UPDATE listings SET
+            img_condition       = $1,
+            img_matches_keyword = $2,
+            img_mismatch_reason = $3,
+            img_analysed_at     = NOW(),
+            price_quality = CASE
+              WHEN $4::TEXT IS NOT NULL THEN $4
+              ELSE price_quality
+            END
+          WHERE id = $5
+        `, [
+          result.condition || null,
+          result.matches_keyword !== false,
+          result.mismatch_reason || null,
+          newQuality,
+          row.id,
+        ]);
+
+        processed++;
+        await new Promise(r => setTimeout(r, 400));
+
+      } catch (e) {
+        console.error(`[ImgAnalysis] Error on ${row.listing_id}:`, e.message);
+        await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+      }
+    }
+
+    console.log(`[ImgAnalysis] Running total: ${processed} analysed, ${flagged} mismatches flagged`);
+  }
+
+  console.log(`[ImgAnalysis] ✅ Done — ${processed} images analysed, ${flagged} removed as mismatches`);
+}
+
+// ── Product Extraction ────────────────────────────────────
+// Reads unprocessed listing titles in batches of 50, asks Claude to identify
+// the exact product, saves back to DB. Runs nightly — never re-processes a listing.
+
+async function extractProductsNightly() {
+  if (!ANTHROPIC_API_KEY) { console.log('[Extract] No Anthropic key — skipping'); return; }
+
+  const BATCH = 50;
+  let processed = 0;
+
+  while (true) {
+    // Grab next batch of unextracted listings (non-vehicle, has a real price)
+    const { rows } = await pool.query(`
+      SELECT id, listing_id, title, keyword, price
+      FROM listings
+      WHERE extracted_at IS NULL
+        AND category != 'vehicle'
+        AND price > 0
+        AND is_offer_price = FALSE
+        AND price_quality IN ('ok', 'unscored')
+        AND title IS NOT NULL AND title != ''
+      ORDER BY scraped_at DESC
+      LIMIT $1
+    `, [BATCH]);
+
+    if (!rows.length) break;
+
+    console.log(`[Extract] Processing batch of ${rows.length} listings...`);
+
+    // Build prompt — ask Claude to classify all titles in one call
+    const items = rows.map((r, i) => `${i+1}. "${r.title.replace(/"/g, "'").slice(0, 120)}" (keyword: ${r.keyword || 'unknown'}, price: ${r.price})`).join('\n');
+
+    const prompt = `You are extracting structured product data from Australian Facebook Marketplace listing titles.
+
+For each listing, identify the EXACT product being sold. Focus on the specific model/item, not accessories or bundles.
+
+Rules:
+- extracted_product: the clean standardised product name (e.g. "Milwaukee M18 Impact Driver", "iPhone 15 Pro 256GB", "Weber Q2200 BBQ", "Dyson V15 Detect", "Trek Marlin 7 Mountain Bike")
+- brand: the manufacturer/brand (e.g. "Milwaukee", "Apple", "Weber", "Trek")  
+- category: one of: phones | laptops | tablets | gaming | tvs | audio | power_tools | hand_tools | garden | camping | vehicles | bikes | furniture | appliances | fitness | musical_instruments | photography | baby_kids | clothing | watches | collectibles | trade_industrial | general
+- variant: any key differentiator like storage size, colour, voltage, size (e.g. "256GB", "18V", "65 inch", "XL") — null if none
+- confidence: "high" if you are certain of the exact product, "medium" if you made a reasonable guess, "low" if the title is too vague
+
+Listings:
+${items}
+
+Return ONLY a JSON array with ${rows.length} objects in the same order:
+[{"extracted_product":"...","brand":"...","category":"...","variant":"...","confidence":"..."},...]
+
+No explanation. No markdown. Start with [ and end with ].`;
+
+    try {
+      const resp = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 4000,
+        messages: [{ role: 'user', content: prompt }],
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        timeout: 30000,
+      });
+
+      const text = resp.data?.content?.[0]?.text || '';
+      const match = text.match(/\[[\s\S]*\]/);
+      if (!match) { console.error('[Extract] Bad response, skipping batch'); break; }
+
+      const results = JSON.parse(match[0]);
+
+      // Write results back to DB
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const r = results[i] || {};
+        await pool.query(`
+          UPDATE listings SET
+            extracted_product     = $1,
+            extracted_brand       = $2,
+            extracted_category    = $3,
+            extracted_variant     = $4,
+            extraction_confidence = $5,
+            extracted_at          = NOW()
+          WHERE id = $6
+        `, [
+          r.extracted_product || null,
+          r.brand             || null,
+          r.category          || null,
+          r.variant           || null,
+          r.confidence        || 'low',
+          row.id,
+        ]);
+      }
+
+      processed += rows.length;
+      console.log(`[Extract] ${processed} listings extracted so far...`);
+
+      // Small delay between batches — be gentle on API
+      await new Promise(res => setTimeout(res, 1000));
+
+    } catch (e) {
+      console.error('[Extract] Batch failed:', e.message);
+      // Mark these as attempted so we don't retry in an infinite loop
+      const ids = rows.map(r => r.id);
+      await pool.query(`UPDATE listings SET extracted_at = NOW() WHERE id = ANY($1)`, [ids]);
+      break;
+    }
+  }
+
+  console.log(`[Extract] ✅ Done — ${processed} listings extracted`);
+}
+
+// Rebuild product_price_stats from extracted data
+// Groups by extracted_product, runs IQR clean, computes median/p25/p75
+async function rebuildProductPriceStats() {
+  try {
+    await pool.query(`
+      INSERT INTO product_price_stats
+        (product_key, display_name, brand, category, variant,
+         sample_count, median_price, p25_price, p75_price,
+         low_price, high_price, updated_at)
+      WITH base AS (
+        SELECT
+          LOWER(REGEXP_REPLACE(extracted_product, '[^a-z0-9]+', '-', 'gi')) AS product_key,
+          extracted_product  AS display_name,
+          extracted_brand    AS brand,
+          extracted_category AS category,
+          extracted_variant  AS variant,
+          COUNT(*)::INT AS raw_count,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
+        FROM listings
+        WHERE extracted_product IS NOT NULL
+          AND extraction_confidence IN ('high', 'medium')
+          AND price > 0
+          AND is_offer_price = FALSE
+          AND price_quality = 'ok'
+          AND is_active = TRUE
+          AND scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY product_key, display_name, brand, category, variant
+        HAVING COUNT(*) >= 3
+      ),
+      fenced AS (
+        SELECT
+          b.product_key, b.display_name, b.brand, b.category, b.variant,
+          b.raw_count,
+          COUNT(l.id)::INT AS clean_count,
+          PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT AS median,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT AS p25_clean,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT AS p75_clean,
+          MIN(l.price)::INT AS low,
+          MAX(l.price)::INT AS high
+        FROM listings l
+        JOIN base b ON LOWER(REGEXP_REPLACE(l.extracted_product, '[^a-z0-9]+', '-', 'gi')) = b.product_key
+        WHERE l.price BETWEEN GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))
+                          AND (b.p75 + 1.5*(b.p75-b.p25))
+          AND l.is_offer_price = FALSE
+          AND l.price_quality = 'ok'
+          AND l.is_active = TRUE
+          AND l.scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY b.product_key, b.display_name, b.brand, b.category, b.variant, b.raw_count
+        HAVING COUNT(l.id) >= 3
+      )
+      SELECT product_key, display_name, brand, category, variant,
+             clean_count, raw_count, median, p25_clean, p75_clean, low, high, NOW()
+      FROM fenced
+      ON CONFLICT (product_key) DO UPDATE SET
+        display_name  = EXCLUDED.display_name,
+        brand         = EXCLUDED.brand,
+        category      = EXCLUDED.category,
+        variant       = EXCLUDED.variant,
+        sample_count  = EXCLUDED.sample_count,
+        median_price  = EXCLUDED.median_price,
+        p25_price     = EXCLUDED.p25_price,
+        p75_price     = EXCLUDED.p75_price,
+        low_price     = EXCLUDED.low_price,
+        high_price    = EXCLUDED.high_price,
+        updated_at    = NOW()
+    `);
+
+    const { rows } = await pool.query('SELECT COUNT(*)::INT AS cnt FROM product_price_stats');
+    console.log(`[ProductStats] ✅ Rebuilt — ${rows[0].cnt} unique products in stats table`);
+  } catch (e) {
+    console.error('[ProductStats] Rebuild failed:', e.message);
+  }
+}
+
+// ── Boot: load all watches from Redis ─────────────────────
+async function loadAllWatches() {
+  // Resolve owner userId so watcher-level plan checks work
+  const ownerUid = await redisGet(K.emailIdx(OWNER_EMAIL));
+  if (ownerUid) { ownerUserId = ownerUid; console.log(`[Boot] Owner account resolved: ${ownerUid}`); }
+
+  const allIds = await redisGet('fr:all-watch-ids') || [];
+  const watches = await Promise.all(allIds.map(getWatch));
+  watchlist = watches.filter(Boolean);
+  console.log(`[Boot] Loaded ${watchlist.length} watch(es)`);
+  watchlist.forEach(w => { if (!w.paused) startWatchTimer(w); });
+}
+
+async function addToGlobalWatchIndex(watchId) {
+  const ids = await redisGet('fr:all-watch-ids') || [];
+  if (!ids.includes(watchId)) ids.push(watchId);
+  await redisSet('fr:all-watch-ids', ids);
+}
+async function removeFromGlobalWatchIndex(watchId) {
+  const ids = await redisGet('fr:all-watch-ids') || [];
+  await redisSet('fr:all-watch-ids', ids.filter(id => id !== watchId));
+}
+
+// Keep Render awake
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
+if (SELF_URL) {
+  setInterval(() => axios.get(SELF_URL + '/').catch(() => {}), 14 * 60 * 1000);
+}
+
+// ── Routes ────────────────────────────────────────────────
+app.get('/', async (req, res) => {
+  const dbSummary = await getDBSummary().catch(() => null);
+  res.json({
+    status:   'ok',
+    redis:    REDIS_URL ? 'connected' : 'not set',
+    database: DATABASE_URL ? 'connected' : 'not set',
+    db: dbSummary ? {
+      totalListings:    dbSummary.total_listings,
+      activeListings:   dbSummary.active_listings,
+      uniqueKeywords:   dbSummary.unique_keywords,
+      uniqueMakes:      dbSummary.unique_makes,
+      lastScraped:      dbSummary.last_scraped,
+    } : null,
+    watches:  watchlist.length,
+    timers:   Object.keys(watchTimers).length,
+    lastScan: lastScanTime,
+    lastScanNewListings: lastScanCount,
+  });
+});
+
+// GET /db/stats — detailed database statistics (owner-gated)
+app.get('/db/stats', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+
+    const [summary, topKeywords, topMakes, recentActivity] = await Promise.all([
+      getDBSummary(),
+      pool.query(`
+        SELECT keyword, sample_count, median_price, p25_price, p75_price, updated_at
+        FROM keyword_price_stats
+        ORDER BY sample_count DESC LIMIT 20
+      `),
+      pool.query(`
+        SELECT make, COUNT(*)::INT AS count, AVG(price)::INT AS avg_price,
+               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+        FROM listings
+        WHERE make IS NOT NULL AND price > 0 AND is_offer_price = FALSE
+        GROUP BY make ORDER BY count DESC LIMIT 15
+      `),
+      pool.query(`
+        SELECT DATE(scraped_at) AS day, COUNT(*)::INT AS listings_scraped
+        FROM listings
+        WHERE scraped_at > NOW() - INTERVAL '14 days'
+        GROUP BY day ORDER BY day DESC
+      `),
+    ]);
+
+    res.json({
+      summary,
+      topKeywords:    topKeywords.rows,
+      topVehicleMakes: topMakes.rows,
+      dailyActivity:  recentActivity.rows,
+    });
+  } catch (e) {
+    console.error('[DB/stats]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /db/comparables?keyword=ps5&limit=20 — raw comparables for a keyword
+app.get('/db/comparables', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, limit } = req.query;
+    if (!keyword) return res.status(400).json({ error: 'keyword required' });
+    const rows = await getDBComparables(keyword, parseInt(limit) || 20);
+    res.json({ keyword, count: rows.length, comparables: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /db/prices?keyword=hilux — price stats for a keyword
+app.get('/db/prices', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, make, model, year, mileage } = req.query;
+    if (make && year) {
+      const stats = await getDBVehicleStats(make, model, parseInt(year), mileage ? parseInt(mileage) : null);
+      return res.json({ found: !!stats, type: 'vehicle', ...stats });
+    }
+    if (!keyword) return res.status(400).json({ error: 'keyword or make+year required' });
+    const stats = await getDBPriceStats(keyword);
+    res.json({ found: !!stats, type: 'keyword', ...stats });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── Auth routes ───────────────────────────────────────────
+app.post('/auth/signup', async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    const existing = await getUserByEmail(email);
+    if (existing) return res.status(409).json({ error: 'An account already exists for this email' });
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const verifyCode   = String(Math.floor(100000 + Math.random() * 900000));
+    const user = {
+      id: uuidv4(),
+      email: email.toLowerCase().trim(),
+      name:  (name || email.split('@')[0]).trim(),
+      passwordHash,
+      createdAt:     new Date().toISOString(),
+      lastSeen:      new Date().toISOString(),
+      plan:          'basic',
+      emailVerified: false,
+      verifyCode,
+      verifyExpiry:  new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    };
+    await saveUser(user);
+    await redisSet(K.emailIdx(user.email), user.id);
+    const token = makeToken(user.id);
+    console.log(`[Auth] Signup: ${user.email}`);
+    verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Verify failed:', e.message));
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user), emailVerified: false } });
+  } catch (e) { console.error('[Signup]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/verify-email', authMiddleware, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Verification code required' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    if (!user.verifyCode || user.verifyCode !== String(code).trim())
+      return res.status(400).json({ error: 'Incorrect code. Please check your email and try again.' });
+    if (new Date(user.verifyExpiry) < new Date())
+      return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    user.emailVerified = true;
+    delete user.verifyCode;
+    delete user.verifyExpiry;
+    await saveUser(user);
+    console.log(`[Auth] Email verified: ${user.email}`);
+    welcomeEmail(user.name, user.email).catch(e => console.error('[Email] Welcome failed:', e.message));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/resend-verify', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    const verifyCode  = String(Math.floor(100000 + Math.random() * 900000));
+    user.verifyCode   = verifyCode;
+    user.verifyExpiry = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    await saveUser(user);
+    verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Resend verify failed:', e.message));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    const user = await getUserByEmail(email);
+    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) return res.status(401).json({ error: 'Invalid email or password' });
+    user.lastSeen = new Date().toISOString();
+    await saveUser(user);
+    const token = makeToken(user.id);
+    console.log(`[Auth] Login: ${user.email}`);
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user) } });
+  } catch (e) { console.error('[Login]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/ping', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    user.lastSeen = new Date().toISOString();
+    await saveUser(user);
+    let resumed = 0;
+    const userWatches = watchlist.filter(w => w.userId === req.userId && w.paused);
+    for (const w of userWatches) {
+      w.paused = false;
+      await saveWatch(w);
+      startWatchTimer(w);
+      resumed++;
+    }
+    if (resumed > 0) console.log(`[Ping] Resumed ${resumed} watch(es) for ${user.email}`);
+    res.json({ ok: true, lastSeen: user.lastSeen, resumed });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.get('/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user), lastSeen: user.lastSeen });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Watchlist routes ──────────────────────────────────────
+app.get('/watchlist', authMiddleware, async (req, res) => {
+  try {
+    const watches = await getUserWatches(req.userId);
+    res.json(watches);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/watchlist', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, maxPrice, minPrice, pushoverToken, pushoverUser, plan, name, speed } = req.body;
+    if (!keyword || keyword.trim().length < 2)
+      return res.status(400).json({ error: 'Keyword required' });
+    const user = await getUser(req.userId);
+    const planLimit = PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)];
+    const existingWatches = await getUserWatches(req.userId);
+    if (!isOwner(user) && existingWatches.length >= planLimit)
+      return res.status(403).json({ error: 'Watchlist limit reached for your plan', plan: getEffectivePlan(user), limit: planLimit });
+    const watchPlan = plan || (speed === 'premium' ? 'premium' : 'basic');
+    const rawExclude = req.body.excludeWords || [];
+    const excludeWords = Array.isArray(rawExclude)
+      ? rawExclude.map(w => w.toLowerCase().trim()).filter(Boolean)
+      : [];
+
+    const item = {
+      id: uuidv4(),
+      userId:   req.userId,
+      keyword:  keyword.trim().toLowerCase(),
+      name:     name || keyword.trim(),
+      maxPrice: maxPrice ? parseInt(maxPrice) : null,
+      minPrice: minPrice ? parseInt(minPrice) : null,
+      location: req.body.location || null,
+      lat:      req.body.lat    ? parseFloat(req.body.lat)  : null,
+      lng:      req.body.lng    ? parseFloat(req.body.lng)  : null,
+      radius:   req.body.radius ? parseInt(req.body.radius) : 50,
+      plan:     watchPlan,
+      pushoverToken: pushoverToken || null,
+      pushoverUser:  pushoverUser  || null,
+      excludeWords,
+      // Vehicle-specific filters
+      minYear:       req.body.minYear       ? parseInt(req.body.minYear)       : null,
+      maxYear:       req.body.maxYear       ? parseInt(req.body.maxYear)       : null,
+      minKms:        req.body.minKms        ? parseInt(req.body.minKms)        : null,
+      maxKms:        req.body.maxKms        ? parseInt(req.body.maxKms)        : null,
+      transmission:  req.body.transmission  ? req.body.transmission.trim()     : null, // 'auto', 'manual', or null
+      paused:    false,
+      addedAt:   new Date().toISOString(),
+      lastScanned: null,
+    };
+    await saveWatch(item);
+    await addWatchId(req.userId, item.id);
+    await addToGlobalWatchIndex(item.id);
+    watchlist.push(item);
+    startWatchTimer(item);
+    console.log(`[Watch] Added "${item.keyword}" for user ${req.userId}`);
+    res.json(item);
+    // Initial backfill — runs once when watch is added
+    scanWatchItem(item, { initialScan: true })
+      .then(n => console.log(`[InitialScan] "${item.keyword}" → ${n} listing(s)`))
+      .catch(e => console.error(`[InitialScan] Error:`, e.message));
+  } catch (e) { console.error('[AddWatch]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// PATCH /watchlist/:id — update watch filters
+app.patch('/watchlist/:id', authMiddleware, async (req, res) => {
+  try {
+    const watch = await getWatch(req.params.id);
+    if (!watch || watch.userId !== req.userId)
+      return res.status(404).json({ error: 'Not found' });
+
+    const { excludeWords, minYear, maxYear, minKms, maxKms, transmission, minPrice, maxPrice } = req.body;
+
+    if (Array.isArray(excludeWords))
+      watch.excludeWords = excludeWords.map(w => w.toLowerCase().trim()).filter(Boolean);
+    if (minPrice  !== undefined) watch.minPrice  = minPrice  ? parseInt(minPrice)  : null;
+    if (maxPrice  !== undefined) watch.maxPrice  = maxPrice  ? parseInt(maxPrice)  : null;
+    if (minYear   !== undefined) watch.minYear   = minYear   ? parseInt(minYear)   : null;
+    if (maxYear   !== undefined) watch.maxYear   = maxYear   ? parseInt(maxYear)   : null;
+    if (minKms    !== undefined) watch.minKms    = minKms    ? parseInt(minKms)    : null;
+    if (maxKms    !== undefined) watch.maxKms    = maxKms    ? parseInt(maxKms)    : null;
+    if (transmission !== undefined) watch.transmission = transmission ? transmission.trim() : null;
+
+    await saveWatch(watch);
+    const idx = watchlist.findIndex(w => w.id === req.params.id);
+    if (idx !== -1) watchlist[idx] = { ...watchlist[idx], ...watch };
+
+    res.json({ ok: true, watch });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/watchlist/:id', authMiddleware, async (req, res) => {
+  try {
+    const watch = await getWatch(req.params.id);
+    if (!watch || watch.userId !== req.userId)
+      return res.status(404).json({ error: 'Not found' });
+    const keyword = watch.keyword;
+    stopWatchTimer(req.params.id);
+    await deleteWatch(req.params.id);
+    await removeWatchId(req.userId, req.params.id);
+    await removeFromGlobalWatchIndex(req.params.id);
+    watchlist = watchlist.filter(w => w.id !== req.params.id);
+
+    // Clear blocked listings for this keyword so they show fresh if re-added
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    const remaining = blocked.filter(l => l.keyword !== keyword);
+    await redisSet(K.blocked(req.userId), remaining);
+
+    // Clear seen cache entries for this keyword so re-adding starts truly fresh
+    const seen = await getUserSeen(req.userId);
+    const prefix = `${keyword}:`;
+    const prunedSeen = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
+    await saveUserSeen(req.userId, prunedSeen, { merge: false }); // replace — we're removing entries
+    const clearedSeen = Object.keys(seen).length - Object.keys(prunedSeen).length;
+    console.log(`[Watch] Deleted "${keyword}" — cleared ${blocked.length - remaining.length} blocked, ${clearedSeen} seen entries`);
+
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Listings routes ───────────────────────────────────────
+app.get('/listings', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, since } = req.query;
+    let result = await getUserListings(req.userId);
+    if (keyword) result = result.filter(l => l.keyword === keyword);
+    if (since) {
+      const sinceMs = new Date(since).getTime();
+      if (!isNaN(sinceMs)) result = result.filter(l => new Date(l.foundAt).getTime() > sinceMs);
+    }
+    result = [...result].sort((a, b) => {
+        // Push listings with unknown dates to the bottom
+        return new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt);
+      });
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/listings', authMiddleware, async (req, res) => {
+  try {
+    await saveUserListings(req.userId, []);
+    await saveUserSeen(req.userId, {}, { merge: false }); // full reset — replace, don't merge
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /listings/blocked — get listings that were filtered out
+app.get('/listings/blocked', authMiddleware, async (req, res) => {
+  try {
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    res.json(blocked);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /listings/unblock — move a blocked listing back into the feed
+app.post('/listings/unblock', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ error: 'id required' });
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    const listing = blocked.find(l => l.id === id);
+    if (!listing) return res.status(404).json({ error: 'Not found' });
+    // Remove from blocked
+    await redisSet(K.blocked(req.userId), blocked.filter(l => l.id !== id));
+    // Add to user listings
+    const listings = await getUserListings(req.userId);
+    if (!listings.find(l => l.id === id)) {
+      listings.unshift({ ...listing, foundAt: new Date().toISOString() });
+      listings.sort((a, b) => {
+        // Push listings with unknown dates to the bottom
+        return new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt);
+      });
+      await saveUserListings(req.userId, listings);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /listings/remove — remove specific listings by ID (irrelevant ones flagged by AI)
+app.post('/listings/remove', authMiddleware, async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids)) return res.status(400).json({ error: 'ids array required' });
+    const listings = await getUserListings(req.userId);
+    const filtered = listings.filter(l => !ids.includes(l.id));
+    await saveUserListings(req.userId, filtered);
+    // Don't mark as permanently seen — if user re-adds the keyword they should see fresh listings
+    console.log(`[Filter] Removed ${ids.length} irrelevant listing(s) for user ${req.userId}`);
+    res.json({ ok: true, removed: ids.length });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Price cache route — lets frontend check own scan history before triggering AI ──
+app.get('/prices', authMiddleware, async (req, res) => {
+  try {
+    const { keyword } = req.query;
+    if (!keyword) return res.status(400).json({ error: 'keyword required' });
+    const priceData = await getPriceCacheForKeyword(keyword);
+    console.log('[Prices] Result for', keyword, ':', priceData ? 'found (' + priceData.count + ' prices, median $' + priceData.median + ')' : 'not found');
+    if (!priceData) return res.json({ found: false, keyword });
+    res.json({ found: true, keyword, ...priceData });
+  } catch (e) { console.error('[Prices] Error:', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /prices/vehicle?make=Toyota&model=Camry&year=2019&mileage=72000
+// Returns VPX market stats for a specific vehicle cohort
+app.get('/prices/vehicle', authMiddleware, async (req, res) => {
+  try {
+    const { make, model, year, mileage } = req.query;
+    if (!make || !year) return res.status(400).json({ error: 'make and year required' });
+    const resolvedModel = model || null;
+    const stats = await getDBVehicleStats(make, resolvedModel, parseInt(year), mileage ? parseInt(mileage) : null);
+    if (!stats) return res.json({ found: false, make, model, year });
+    res.json({ found: true, ...stats });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Appraisal route — limit check only, always defers to AI ──
+// POST /appraise  { keyword, price }
+app.post('/appraise', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, price } = req.body;
+    if (!keyword || !price) return res.status(400).json({ error: 'keyword and price required' });
+    const user = await _getUserCached(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today = new Date().toISOString().slice(0, 10);
+    if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
+    const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
+    if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
+    res.json({ found: false, usedCache: false });
+  } catch (e) { console.error('[Appraise]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Misc routes ───────────────────────────────────────────
+app.get('/proxy-image', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  try {
+    const response = await axios.get(url, {
+      responseType: 'arraybuffer', timeout: 10000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
+        'Referer': 'https://www.facebook.com/'
+      }
+    });
+    res.json({
+      base64: Buffer.from(response.data).toString('base64'),
+      mediaType: response.headers['content-type'] || 'image/jpeg'
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/scan/now', authMiddleware, async (req, res) => {
+  res.json({ ok: true, message: 'Scan started' });
+  const watches = watchlist.filter(w => w.userId === req.userId && !w.paused);
+  for (const w of watches) {
+    await scanWatchItem(w).catch(e => console.error(`[Scan/now]`, e.message));
+    await sleep(500);
+  }
+});
+
+app.post('/scan/test', async (req, res) => {
+  const { keyword } = req.body;
+  if (!keyword) return res.status(400).json({ error: 'keyword required' });
+  try {
+    const found = await scrapeKeyword(keyword, {});
+    res.json({ keyword, count: found.length, listings: found });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Global Deals ─────────────────────────────────────────
+// Rebuilds every 90 min — no SociaVault credits used.
+// Pulls listings from the DB that have a known median (so we can compute % off),
+// filters to active + real-price, scores by discount depth, adds small jitter.
+
+async function rebuildGlobalDeals() {
+  console.log('[Deals] Rebuilding deals:global cache...');
+  try {
+    // Pull recent listings with a known keyword median so we can compute % off.
+    // Only real prices, active, not spam/damage, scraped within 14 days.
+    // ── Step 1: try to get deals using keyword_price_stats (IQR-cleaned medians) ──
+    // Falls back to a live per-keyword median if stats table isn't populated yet.
+    let rows;
+    const statsCheck = await pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats');
+    const hasStats = statsCheck.rows[0].cnt >= 5;
+
+    if (hasStats) {
+      // Normal path — join against pre-built stats table
+      ({ rows } = await pool.query(`
+        SELECT
+          l.listing_id,
+          l.title,
+          l.price,
+          l.image_url,
+          l.url,
+          l.location,
+          l.state,
+          l.keyword,
+          l.category,
+          l.make,
+          l.model,
+          l.year,
+          l.kms       AS mileage,
+          l.transmission,
+          l.fuel_type AS "fuelType",
+          l.listed_at AS "listedAt",
+          l.img_condition,
+          l.img_matches_keyword,
+          k.median_price AS median
+        FROM listings l
+        JOIN keyword_price_stats k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE
+          AND l.is_offer_price = FALSE
+          AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND k.median_price > 0
+          AND k.sample_count >= 4
+          AND l.price < k.median_price * 0.92
+          AND (k.median_price - l.price) >= 100
+        ORDER BY (k.median_price - l.price)::float / k.median_price DESC
+        LIMIT 500
+      `));
+    } else {
+      // Fallback — compute live medians on the fly per keyword so deals work
+      // immediately after seed scan before nightly cron has run
+      console.log('[Deals] keyword_price_stats not ready — using live medians');
+      ({ rows } = await pool.query(`
+        WITH kmedians AS (
+          SELECT
+            keyword,
+            COUNT(*)::INT AS cnt,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+          FROM listings
+          WHERE price > 0
+            AND is_offer_price = FALSE
+            AND is_active = TRUE
+            AND scraped_at > NOW() - INTERVAL '30 days'
+            AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          GROUP BY keyword
+          HAVING COUNT(*) >= 4
+        )
+        SELECT
+          l.listing_id,
+          l.title,
+          l.price,
+          l.image_url,
+          l.url,
+          l.location,
+          l.state,
+          l.keyword,
+          l.category,
+          l.make,
+          l.model,
+          l.year,
+          l.kms       AS mileage,
+          l.transmission,
+          l.fuel_type AS "fuelType",
+          l.listed_at AS "listedAt",
+          l.img_condition,
+          l.img_matches_keyword,
+          k.median_price AS median
+        FROM listings l
+        JOIN kmedians k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE
+          AND l.is_offer_price = FALSE
+          AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND l.price < k.median_price * 0.92
+          AND (k.median_price - l.price) >= 100
+        ORDER BY (k.median_price - l.price)::float / k.median_price DESC
+        LIMIT 500
+      `));
+    }
+
+    // Compute pctOff and base score
+    const deals = rows.map(r => {
+      const pctOff   = Math.round(((r.median - r.price) / r.median) * 100);
+      // base deal score 0-100 — pure discount depth
+      const baseScore = Math.min(100, pctOff * 1.8);
+      return {
+        id:           r.listing_id,
+        title:        r.title,
+        price:        r.price,
+        median:       r.median,
+        pctOff,
+        image:        r.image_url || null,
+        url:          r.url || null,
+        location:     r.location || null,
+        state:        r.state || null,
+        keyword:      r.keyword || null,
+        category:     r.category || 'general',
+        make:         r.make || null,
+        model:        r.model || null,
+        year:         r.year || null,
+        mileage:      r.mileage || null,
+        transmission: r.transmission || null,
+        fuelType:     r.fuelType || null,
+        listedAt:     r.listedAt ? r.listedAt.toISOString() : null,
+        imgCondition: r.img_condition || null,
+        imgVerified:  r.img_matches_keyword !== false,
+        baseScore,
+        // Tint based on actual dollar saving + image condition.
+        // % off alone is misleading — a $5 item 60% off is worthless.
+        // Damaged items are capped at yellow even if the saving is huge.
+        const saving = r.median - r.price;
+        const isDamaged = r.img_condition === 'damaged' || r.img_condition === 'poor';
+        const tintRaw = saving >= 500 && pctOff >= 20 ? 'rainbow'
+                      : saving >= 200 && pctOff >= 15 ? 'green'
+                      : saving >= 100                 ? 'yellow'
+                      :                                'grey';
+        tint: isDamaged && tintRaw === 'rainbow' ? 'green'
+            : isDamaged && tintRaw === 'green'   ? 'yellow'
+            : tintRaw,
+      };
+    });
+
+    await redisSet('deals:global', { deals, builtAt: new Date().toISOString() }, 6000); // 100 min TTL
+    console.log(`[Deals] Rebuilt deals:global — ${deals.length} deals`);
+  } catch (e) {
+    console.error('[Deals] Rebuild failed:', e.message);
+  }
+}
+
+// Rebuild deals on boot immediately
+setTimeout(() => rebuildGlobalDeals().catch(() => {}), 15000);
+
+// After seed scan completes, run a quick stats pass so deals are populated right away
+// (full nightly cron also runs at 2am — this just ensures first-boot experience works)
+async function quickStatsAndDealsRebuild() {
+  try {
+    console.log('[Boot] Running quick keyword stats pass...');
+    await pool.query(`
+      INSERT INTO keyword_price_stats
+        (keyword, raw_count, sample_count, median_price, p25_price, p75_price,
+         floor_price, ceiling_price, updated_at)
+      WITH base AS (
+        SELECT keyword,
+          COUNT(*)::INT AS raw_count,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25_raw,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75_raw
+        FROM listings
+        WHERE price > 0 AND is_offer_price = FALSE AND is_active = TRUE
+          AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+        GROUP BY keyword HAVING COUNT(*) >= 4
+      )
+      SELECT
+        b.keyword,
+        b.raw_count,
+        COUNT(l.id)::INT,
+        PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT,
+        GREATEST(0, b.p25_raw - 1.5*(b.p75_raw - b.p25_raw))::INT,
+        (b.p75_raw + 1.5*(b.p75_raw - b.p25_raw))::INT,
+        NOW()
+      FROM listings l
+      JOIN base b ON b.keyword = l.keyword
+      WHERE l.price BETWEEN GREATEST(0, b.p25_raw - 1.5*(b.p75_raw-b.p25_raw))
+                        AND (b.p75_raw + 1.5*(b.p75_raw-b.p25_raw))
+        AND l.price > 0 AND l.is_offer_price = FALSE AND l.is_active = TRUE
+        AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+      GROUP BY b.keyword, b.raw_count, b.p25_raw, b.p75_raw
+      HAVING COUNT(l.id) >= 4
+      ON CONFLICT (keyword) DO UPDATE SET
+        raw_count    = EXCLUDED.raw_count,
+        sample_count = EXCLUDED.sample_count,
+        median_price = EXCLUDED.median_price,
+        p25_price    = EXCLUDED.p25_price,
+        p75_price    = EXCLUDED.p75_price,
+        floor_price  = EXCLUDED.floor_price,
+        ceiling_price= EXCLUDED.ceiling_price,
+        updated_at   = NOW()
+    `);
+    const { rows } = await pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats');
+    console.log(`[Boot] Quick stats done — ${rows[0].cnt} keywords in stats table`);
+    await rebuildGlobalDeals();
+  } catch (e) {
+    console.error('[Boot] Quick stats/deals rebuild failed:', e.message);
+  }
+}
+
+// Run quick stats rebuild 5 minutes after boot (gives seed scan time to fill some data)
+setTimeout(() => quickStatsAndDealsRebuild(), 5 * 60 * 1000);
+cron.schedule('0 */2 * * *', () => rebuildGlobalDeals().catch(e => console.error('[Deals Cron]', e.message)));
+
+// ── Seed Keyword Scanner ──────────────────────────────────
+// Scans a broad list of keywords to build the price database independently
+// of user watchlists. 1 credit per keyword per scan. Staggered so we don't
+// hammer all keywords at once — splits into 6 batches across 6 hours.
+// Full rotation = 6 hours. At ~150 keywords that's 150 credits per rotation.
+
+const SEED_KEYWORDS = [
+  // ── Phones ───────────────────────────────────────────────
+  'iphone 16 pro', 'iphone 16', 'iphone 15 pro', 'iphone 15', 'iphone 14 pro',
+  'iphone 14', 'iphone 13', 'iphone 12', 'iphone 11', 'iphone se',
+  'samsung galaxy s25', 'samsung galaxy s24', 'samsung galaxy s23', 'samsung galaxy s22',
+  'samsung galaxy a55', 'samsung galaxy a54', 'google pixel 9', 'google pixel 8',
+  'oneplus 12', 'oppo find x8',
+
+  // ── Laptops & Computers ──────────────────────────────────
+  'macbook pro m3', 'macbook pro m2', 'macbook pro m1', 'macbook air m2', 'macbook air m1',
+  'macbook air m3', 'imac m3', 'imac m1',
+  'dell xps 15', 'dell xps 13', 'hp spectre x360', 'hp envy laptop',
+  'lenovo thinkpad', 'lenovo yoga', 'asus rog laptop', 'asus zenbook',
+  'surface pro', 'surface laptop', 'razer blade laptop', 'acer swift laptop',
+  'gaming pc', 'desktop computer',
+
+  // ── Tablets ──────────────────────────────────────────────
+  'ipad pro', 'ipad air', 'ipad mini', 'samsung galaxy tab s9', 'samsung galaxy tab s8',
+
+  // ── Gaming ───────────────────────────────────────────────
+  'ps5 console', 'ps5 digital', 'ps4 pro', 'ps4 console',
+  'xbox series x', 'xbox series s', 'xbox one x',
+  'nintendo switch oled', 'nintendo switch', 'nintendo switch lite',
+  'steam deck', 'meta quest 3', 'meta quest 2',
+  'gaming chair', 'gaming monitor',
+
+  // ── TVs & Audio ───────────────────────────────────────────
+  'samsung 65 inch tv', 'samsung 55 inch tv', 'lg oled tv', 'sony bravia tv',
+  'lg 65 tv', 'samsung qled tv', 'tcl tv', 'hisense tv',
+  'sonos speaker', 'jbl speaker', 'bose speaker', 'marshall speaker',
+  'sony wh1000xm5', 'airpods pro', 'airpods max', 'bose quietcomfort',
+
+  // ── Power Tools ──────────────────────────────────────────
+  'milwaukee m18 drill', 'milwaukee m18 impact driver', 'milwaukee m18 grinder',
+  'milwaukee m18 circular saw', 'milwaukee m18 multi tool', 'milwaukee m18 jigsaw',
+  'milwaukee m18 reciprocating saw', 'milwaukee m18 kit', 'milwaukee m12',
+  'dewalt 18v drill', 'dewalt 18v impact driver', 'dewalt 18v grinder',
+  'dewalt 18v circular saw', 'dewalt xr kit',
+  'makita 18v drill', 'makita 18v impact driver', 'makita 18v grinder',
+  'makita 18v circular saw', 'makita combo kit',
+  'ryobi 18v drill', 'ryobi 18v kit', 'ryobi one plus',
+  'bosch 18v drill', 'hikoki drill', 'festool sander', 'festool track saw',
+  'air compressor', 'bench grinder', 'angle grinder', 'drop saw',
+  'table saw', 'thicknesser', 'router table', 'laser level',
+
+  // ── Outdoor & Garden ─────────────────────────────────────
+  'husqvarna mower', 'honda mower', 'ride on mower', 'zero turn mower',
+  'ego lawn mower', 'greenworks mower', 'lawn mower petrol',
+  'husqvarna chainsaw', 'stihl chainsaw', 'echo chainsaw',
+  'pressure washer', 'karcher pressure washer', 'leaf blower',
+  'garden trailer', 'wood chipper', 'post hole digger',
+
+  // ── Camping & Outdoors ────────────────────────────────────
+  'engel fridge', 'waeco fridge', 'dometic fridge', 'arb fridge',
+  'camp trailer', 'roof top tent', 'swag', 'camping trailer',
+  'weber bbq', 'traeger bbq', 'bbq grill', 'kamado bbq',
+  'kayak', 'canoe', 'stand up paddle board', 'inflatable kayak',
+  'fishing rod', 'fishing reel', 'fishing kayak',
+  'hiking boots', 'tent', 'sleeping bag',
+
+  // ── Vehicles ─────────────────────────────────────────────
+  'toyota hilux', 'toyota landcruiser 200', 'toyota landcruiser 79',
+  'toyota prado', 'toyota rav4', 'toyota camry', 'toyota corolla',
+  'ford ranger', 'ford everest', 'ford mustang',
+  'holden commodore', 'holden colorado',
+  'nissan patrol', 'nissan navara', 'nissan x trail',
+  'mitsubishi triton', 'mitsubishi pajero', 'mitsubishi outlander',
+  'isuzu dmax', 'isuzu mu x',
+  'mazda cx5', 'mazda bt50', 'mazda 3',
+  'subaru forester', 'subaru outback', 'subaru wrx',
+  'hyundai tucson', 'hyundai i30', 'kia sportage',
+  'jeep wrangler', 'jeep gladiator',
+  'bmw 3 series', 'mercedes c class', 'audi a4',
+  'motorcycle', 'dirt bike', 'trail bike', 'enduro bike',
+  'honda cbr', 'yamaha r1', 'kawasaki ninja', 'suzuki gsxr',
+  'caravan', 'camper trailer', 'pop top caravan',
+
+  // ── Vehicles — Parts & Accessories ───────────────────────
+  'bull bar', 'winch', 'lift kit', 'snorkel', 'roof rack',
+  'drawer system', 'dual battery system',
+
+  // ── Bikes & Scooters ─────────────────────────────────────
+  'mountain bike', 'road bike', 'bmx bike', 'electric bike',
+  'trek bike', 'specialized bike', 'giant bike', 'scott bike',
+  'electric scooter', 'segway ninebot',
+
+  // ── Furniture ─────────────────────────────────────────────
+  'couch lounge', 'sectional sofa', 'leather couch', '3 seater lounge',
+  'dining table', 'dining chairs', 'coffee table', 'tv unit',
+  'queen bed frame', 'king bed frame', 'bedside table',
+  'office desk', 'standing desk', 'ergonomic chair', 'office chair',
+  'wardrobe', 'chest of drawers', 'bookshelf',
+
+  // ── Baby & Kids ───────────────────────────────────────────
+  'pram stroller', 'baby cot', 'baby capsule', 'baby carrier',
+  'kids bike', 'trampoline', 'swing set', 'lego',
+
+  // ── Sports & Fitness ──────────────────────────────────────
+  'treadmill', 'rowing machine', 'spin bike', 'exercise bike',
+  'bowflex', 'home gym', 'barbell set', 'dumbbells',
+  'squat rack', 'bench press', 'weight plates',
+  'golf clubs', 'callaway driver', 'titleist irons',
+  'surfboard', 'skateboard', 'snowboard',
+  'tennis racket', 'basketball hoop',
+
+  // ── Musical Instruments ────────────────────────────────────
+  'electric guitar', 'acoustic guitar', 'fender stratocaster', 'gibson les paul',
+  'fender telecaster', 'marshall amp', 'fender amp',
+  'drum kit', 'electronic drums', 'keyboard piano', 'yamaha keyboard',
+  'bass guitar', 'ukulele',
+
+  // ── Photography ───────────────────────────────────────────
+  'sony a7', 'sony a6', 'canon eos r', 'canon 5d', 'nikon z6', 'nikon d750',
+  'fujifilm xt', 'fujifilm x100', 'drone dji', 'dji mini', 'dji mavic',
+  'camera lens', 'gopro',
+
+  // ── Appliances ─────────────────────────────────────────────
+  'thermomix', 'kitchenaid mixer', 'breville coffee machine',
+  'delonghi coffee machine', 'nespresso machine', 'coffee grinder',
+  'dyson vacuum', 'roomba', 'dyson v11', 'dyson v12', 'dyson v15',
+  'washing machine', 'dryer', 'dishwasher', 'fridge freezer',
+  'air fryer', 'instant pot', 'ninja foodi',
+
+  // ── Tech Accessories ──────────────────────────────────────
+  'monitor 27 inch', 'monitor 32 inch', 'ultrawide monitor',
+  'mechanical keyboard', 'logitech mx keys',
+  'standing desk converter', 'webcam',
+
+  // ── Collectibles & Fashion ────────────────────────────────
+  'vintage levi jeans', 'vintage adidas', 'nike air jordan',
+  'rolex watch', 'omega watch', 'seiko watch',
+  'vintage camera', 'vinyl records', 'trading cards',
+
+  // ── Trade & Industrial ────────────────────────────────────
+  'generator', 'inverter generator', 'honda generator', 'yamaha generator',
+  'welder', 'mig welder', 'tig welder',
+  'scaffolding', 'trailer', 'box trailer', 'car trailer', 'boat trailer',
+  'forklift', 'pallet jack', 'scissor lift',
+];
+
+// How many keywords per batch — spread evenly across 6 hourly slots
+const SEED_BATCH_SIZE = Math.ceil(SEED_KEYWORDS.length / 6);
+let _seedBatchIndex = 0;
+
+async function runSeedBatch() {
+  const start = _seedBatchIndex * SEED_BATCH_SIZE;
+  const batch = SEED_KEYWORDS.slice(start, start + SEED_BATCH_SIZE);
+  _seedBatchIndex = (_seedBatchIndex + 1) % 6;
+
+  console.log(`[SeedScan] Batch ${_seedBatchIndex}/${6} — scanning ${batch.length} keywords (starting at index ${start})`);
+
+  let saved = 0;
+  for (const keyword of batch) {
+    try {
+      // Use shared scan cache — if recently cached, costs 0 credits
+      const cached = await redisGet(K.sharedScan(keyword));
+      if (cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
+        console.log(`[SeedScan] "${keyword}" — cache hit, skipping`);
+        continue;
+      }
+
+      const raw = await scrapeKeyword(keyword, {
+        city: 'Melbourne', lat: -37.8136, lng: 144.9631, radius: 100,
+      });
+
+      if (!Array.isArray(raw) || !raw.length) continue;
+
+      // Cache for shared use by user watchlists
+      await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
+
+      // Save to DB for price stats
+      for (const item of raw) {
+        try { await upsertListingToDB({ ...item, keyword }); } catch (e) { /* skip bad rows */ }
+      }
+
+      saved += raw.length;
+      console.log(`[SeedScan] "${keyword}" → ${raw.length} listings saved`);
+
+      // Small delay between keywords — be gentle on SociaVault
+      await new Promise(r => setTimeout(r, 800));
+    } catch (e) {
+      console.error(`[SeedScan] "${keyword}" failed:`, e.message);
+    }
+  }
+  console.log(`[SeedScan] Batch done — ${saved} total listings saved`);
+}
+
+// One-time full scan on boot — scans all seed keywords once, then stops.
+// Re-deploy to trigger again. No recurring cron.
+async function runFullSeedScanOnce() {
+  console.log(`[SeedScan] Starting one-time full scan of ${SEED_KEYWORDS.length} keywords...`);
+  let totalSaved = 0;
+  for (let i = 0; i < SEED_KEYWORDS.length; i++) {
+    const keyword = SEED_KEYWORDS[i];
+    try {
+      const cached = await redisGet(K.sharedScan(keyword));
+      if (cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
+        console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" — cache hit, skipping`);
+        continue;
+      }
+      const raw = await scrapeKeyword(keyword, {
+        city: 'Melbourne', lat: -37.8136, lng: 144.9631, radius: 100,
+      });
+      if (!Array.isArray(raw) || !raw.length) {
+        console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" — 0 results`);
+        continue;
+      }
+      await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
+      for (const item of raw) {
+        try { await upsertListingToDB({ ...item, keyword }); } catch (e) { /* skip bad rows */ }
+      }
+      totalSaved += raw.length;
+      console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" → ${raw.length} listings`);
+      await new Promise(r => setTimeout(r, 600));
+    } catch (e) {
+      console.error(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" failed:`, e.message);
+    }
+  }
+  console.log(`[SeedScan] ✅ Done — ${totalSaved} listings saved across ${SEED_KEYWORDS.length} keywords`);
+}
+
+setTimeout(() => runFullSeedScanOnce().catch(e => console.error('[SeedScan Boot]', e.message)), 30000);
+
+// Admin endpoint to check seed scan status
+app.get('/admin/seed-status', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    const counts = await Promise.all(SEED_KEYWORDS.map(async kw => {
+      const cached = await redisGet(K.sharedScan(kw));
+      return { keyword: kw, cached: !!cached, cachedAt: cached?.scannedAt || null, count: cached?.listings?.length || 0 };
+    }));
+    const dbCount = await pool.query('SELECT keyword, COUNT(*)::INT as n FROM listings WHERE keyword = ANY($1) GROUP BY keyword ORDER BY n DESC', [SEED_KEYWORDS]);
+    res.json({ total: SEED_KEYWORDS.length, batchSize: SEED_BATCH_SIZE, nextBatch: _seedBatchIndex, cache: counts, db: dbCount.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin endpoint to manually re-trigger the full one-time scan
+app.post('/admin/seed-scan-all', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    res.json({ ok: true, message: `Starting full scan of ${SEED_KEYWORDS.length} keywords in background` });
+    runFullSeedScanOnce().catch(e => console.error('[SeedScan Manual]', e.message));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: full deals pipeline diagnostic
+app.get('/admin/deals-debug', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+
+    const [
+      totalListings,
+      activeListings,
+      inPricePool,
+      withImages,
+      statsCount,
+      dealsCache,
+      qualityBreakdown,
+      sampleDeals,
+    ] = await Promise.all([
+      pool.query('SELECT COUNT(*)::INT AS n FROM listings'),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE is_active = TRUE"),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE in_price_pool = TRUE AND is_active = TRUE"),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE image_url IS NOT NULL AND image_url != ''"),
+      pool.query('SELECT COUNT(*)::INT AS n FROM keyword_price_stats'),
+      redisGet('deals:global'),
+      pool.query("SELECT price_quality, COUNT(*)::INT AS n FROM listings GROUP BY price_quality ORDER BY n DESC"),
+      // Try the exact deals query and return first 5 results
+      pool.query(`
+        WITH kmedians AS (
+          SELECT keyword,
+            COUNT(*)::INT AS cnt,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+          FROM listings
+          WHERE price > 0 AND is_offer_price = FALSE AND is_active = TRUE
+            AND scraped_at > NOW() - INTERVAL '30 days'
+            AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          GROUP BY keyword HAVING COUNT(*) >= 4
+        )
+        SELECT l.title, l.price, l.keyword, k.median_price,
+               (k.median_price - l.price) AS saving,
+               ROUND(((k.median_price - l.price)::float / k.median_price * 100)::numeric, 1) AS pct_off
+        FROM listings l
+        JOIN kmedians k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE AND l.is_offer_price = FALSE AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND l.price < k.median_price * 0.92
+          AND (k.median_price - l.price) >= 100
+        ORDER BY saving DESC LIMIT 5
+      `),
+    ]);
+
+    res.json({
+      db: {
+        total_listings:   totalListings.rows[0].n,
+        active_listings:  activeListings.rows[0].n,
+        in_price_pool:    inPricePool.rows[0].n,
+        with_images:      withImages.rows[0].n,
+        keyword_stats_rows: statsCount.rows[0].n,
+        quality_breakdown: qualityBreakdown.rows,
+      },
+      deals_cache: {
+        exists:    !!(dealsCache?.deals),
+        count:     dealsCache?.deals?.length || 0,
+        built_at:  dealsCache?.builtAt || null,
+      },
+      sample_qualifying_deals: sampleDeals.rows,
+      diagnosis: !totalListings.rows[0].n
+        ? '❌ No listings in DB at all — seed scan hasnt run or failed'
+        : !activeListings.rows[0].n
+        ? '❌ No active listings — check is_active flag on upsert'
+        : !statsCount.rows[0].n
+        ? '⚠️ keyword_price_stats empty — quickStats rebuild hasnt run yet (fires 5min after boot)'
+        : !sampleDeals.rows.length
+        ? '⚠️ No qualifying deals — not enough price spread yet, need more listings per keyword'
+        : dealsCache?.deals?.length
+        ? `✅ ${dealsCache.deals.length} deals in cache — check frontend auth/premium flag`
+        : '⚠️ Deals qualify in DB but cache is empty — trigger /admin/deals-rebuild',
+    });
+  } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+});
+
+// Admin: force rebuild deals cache right now
+app.post('/admin/deals-rebuild', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    await quickStatsAndDealsRebuild();
+    const cache = await redisGet('deals:global');
+    res.json({ ok: true, deals_in_cache: cache?.deals?.length || 0, built_at: cache?.builtAt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /deals — personalised deal feed for premium users
+// Scores deals against the user's watchlist keywords/makes with jitter so order shifts each visit.
+app.get('/deals', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    if (getEffectivePlan(user) !== 'premium') return res.status(403).json({ error: 'premium_required' });
+
+    const cached = await redisGet('deals:global');
+    if (!cached || !cached.deals) return res.json({ deals: [], builtAt: null });
+
+    const watches    = await getUserWatches(req.userId);
+    const watchKeys  = watches.map(w => (w.keyword || '').toLowerCase().trim()).filter(Boolean);
+    const watchMakes = watches.map(w => (w.keyword || '').toLowerCase().trim())
+                              .filter(kw => kw.split(' ').length <= 2); // crude make heuristic
+
+    // Score each deal — watched keywords/makes bubble up; random jitter per request
+    const scored = cached.deals.map(d => {
+      let boost = 0;
+      const kw = (d.keyword || '').toLowerCase();
+      const make = (d.make || '').toLowerCase();
+      // Boost for exact keyword match
+      if (watchKeys.some(wk => kw === wk || kw.includes(wk) || wk.includes(kw))) boost += 40;
+      // Boost for make match
+      if (make && watchMakes.some(wm => make.includes(wm) || wm.includes(make))) boost += 20;
+      // Small random jitter — makes the feed feel alive on refresh
+      const jitter = (Math.random() - 0.5) * 18;
+      return { ...d, _score: d.baseScore + boost + jitter, _watched: boost > 0 };
+    });
+
+    scored.sort((a, b) => b._score - a._score);
+
+    // Remove internal scoring fields before sending
+    const deals = scored.map(({ _score, baseScore, ...d }) => d);
+
+    res.json({ deals, builtAt: cached.builtAt });
+  } catch (e) {
+    console.error('[Deals]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── Stripe routes ─────────────────────────────────────────
+app.post('/stripe/create-checkout', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const { priceId } = req.body;
+    if (!priceId || !Object.values(PRICE_IDS).includes(priceId))
+      return res.status(400).json({ error: 'Invalid price' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: 'https://flip-radar.app?upgraded=1',
+      cancel_url:  'https://flip-radar.app?cancelled=1',
+      customer_email: user.email,
+      metadata: { userId: user.id, priceId },
+      subscription_data: { metadata: { userId: user.id, priceId } },
+    });
+    res.json({ url: session.url });
+  } catch (e) { console.error('[Stripe] Checkout error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/stripe/create-intent', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const { priceId } = req.body;
+    if (!priceId || !Object.values(PRICE_IDS).includes(priceId))
+      return res.status(400).json({ error: 'Invalid price' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    let customerId = user.stripeCustomerId;
+    if (!customerId) {
+      const customer = await stripe.customers.create({ email: user.email, name: user.name, metadata: { userId: user.id } });
+      customerId = customer.id;
+      user.stripeCustomerId = customerId;
+      await saveUser(user);
+    }
+    const subscription = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [{ price: priceId }],
+      payment_behavior: 'default_incomplete',
+      payment_settings: { save_default_payment_method: 'on_subscription' },
+      expand: ['latest_invoice.payment_intent'],
+      metadata: { userId: user.id, priceId },
+    });
+    const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
+    res.json({ clientSecret, subscriptionId: subscription.id });
+  } catch (e) { console.error('[Stripe] Intent error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/stripe/portal', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const user = await getUser(req.userId);
+    if (!user || !user.stripeCustomerId) return res.status(400).json({ error: 'No subscription found' });
+    const session = await stripe.billingPortal.sessions.create({
+      customer: user.stripeCustomerId,
+      return_url: 'https://flip-radar.app',
+    });
+    res.json({ url: session.url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.json({ ok: true });
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (e) { console.error('[Stripe] Webhook sig failed:', e.message); return res.status(400).send('Webhook Error'); }
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const userId  = session.metadata?.userId;
+      const priceId = session.metadata?.priceId;
+      if (userId && priceId) {
+        const user = await getUser(userId);
+        if (user) {
+          user.plan = PRICE_TO_PLAN[priceId] || 'basic';
+          user.stripeCustomerId     = session.customer;
+          user.stripeSubscriptionId = session.subscription;
+          await saveUser(user);
+          console.log(`[Stripe] Upgraded ${user.email} to ${user.plan}`);
+        }
+      }
+    }
+    if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.paused') {
+      const sub    = event.data.object;
+      const userId = sub.metadata?.userId;
+      if (userId) {
+        const user = await getUser(userId);
+        if (user) {
+          user.plan = 'free';
+          user.stripeSubscriptionId = null;
+          await saveUser(user);
+          console.log(`[Stripe] Downgraded ${user.email} to free`);
+        }
+      }
+    }
+  } catch (e) { console.error('[Stripe] Webhook handler error:', e.message); }
+  res.json({ received: true });
+});
+
+app.get('/auth/plan', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today    = new Date().toISOString().slice(0, 10);
+    const appraised = user.appraisalDate === today ? (user.appraisalsToday || 0) : 0;
+    const limit     = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
+    res.json({
+      plan: getEffectivePlan(user),
+      appraisalsUsedToday: appraised,
+      appraisalsLimit:     limit === Infinity ? -1 : limit,
+      watchlistLimit:      PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
+    });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /onboarding — tells the frontend what state the user is in
+// Used to show/hide onboarding screen and tips
+app.get('/onboarding', authMiddleware, async (req, res) => {
+  try {
+    const user    = await getUser(req.userId);
+    const watches = await getUserWatches(req.userId);
+    const listings = await getUserListings(req.userId);
+    res.json({
+      hasWatches:    watches.length > 0,
+      watchCount:    watches.length,
+      hasListings:   listings.length > 0,
+      listingCount:  listings.length,
+      plan:          getEffectivePlan(user),
+      watchLimit:    PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
+      // Steps completed
+      steps: {
+        addedWatch:    watches.length > 0,
+        gotListings:   listings.length > 0,
+        usedAppraisal: (user.appraisalsToday || 0) > 0 || user.appraisalDate != null,
+      },
+    });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /listings/price-drops — listings that have dropped in price recently
+app.get('/listings/price-drops', authMiddleware, async (req, res) => {
+  try {
+    const listings = await getUserListings(req.userId);
+    const drops = listings.filter(l => l.priceDropped && l.previousPrice);
+    res.json(drops);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/appraisal', authMiddleware, async (req, res) => {
+  try {
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+    res.json({ ok: true, used: cr.used, limit: cr.limit });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Web Push notification sender ─────────────────────────
+async function sendWebPush(userId, payload) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  try {
+    const subs = await redisGet(K_push(userId));
+    if (!subs || !subs.length) return;
+    webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    const msg = JSON.stringify(payload);
+    const results = await Promise.allSettled(
+      subs.map(sub => webpush.sendNotification(sub, msg))
+    );
+    // Remove expired/invalid subscriptions
+    const valid = subs.filter((_, i) => results[i].status === 'fulfilled');
+    if (valid.length !== subs.length) await redisSet(K_push(userId), valid);
+  } catch (e) {
+    console.error('[WebPush] Error:', e.message);
+  }
+}
+
+// POST /push/subscribe — save user's push subscription
+app.post('/push/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const { subscription } = req.body;
+    if (!subscription || !subscription.endpoint) return res.status(400).json({ error: 'subscription required' });
+    const subs = await redisGet(K_push(req.userId)) || [];
+    // Avoid duplicates
+    const exists = subs.find(s => s.endpoint === subscription.endpoint);
+    if (!exists) {
+      subs.push(subscription);
+      await redisSet(K_push(req.userId), subs);
+    }
+    console.log(`[WebPush] Subscribed user ${req.userId}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE /push/subscribe — remove subscription
+app.delete('/push/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    const subs = await redisGet(K_push(req.userId)) || [];
+    await redisSet(K_push(req.userId), subs.filter(s => s.endpoint !== endpoint));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /push/vapid-key — gives frontend the public key to subscribe with
+app.get('/push/vapid-key', (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.status(500).json({ error: 'Push not configured' });
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+// ── AI proxy routes — keys live on server, never in browser ──
+const GEMINI_API_KEY    = process.env.GEMINI_API_KEY    || null;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
+
+// ── Web Push (VAPID) ──────────────────────────────────────
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
+const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
+
+
+// Redis key for push subscriptions
+const K_push = userId => `fr:push:${userId}`;
+
+// POST /ai/vehicle — vehicle appraisal grounded in DB data when available
+// DB data is fetched FIRST so AI can reason from real market numbers.
+app.post('/ai/vehicle', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
+
+    const { make, model, year, mileage, transmission, listingPrice, title, description,
+            imageUrl, imageBase64, imageMime, listingId, listingUrl } = req.body;
+    if (!listingPrice) return res.status(400).json({ error: 'listingPrice required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const keyword = req.body.keyword || [make, model, year].filter(Boolean).join(' ');
+    const cached  = await getAppraisalCache(listingId, title, listingPrice, keyword);
+    if (cached) {
+      console.log(`[AI/vehicle] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    // ── Step 1: Fetch DB market data BEFORE building prompt ──
+    // Key change: DB data feeds INTO the prompt so AI reasons from
+    // real AU market numbers rather than training data alone.
+    const dbResult = (make && model && year)
+      ? await fetchBestVehiclePrice(make, model, year, mileage, {
+          series: req.body.series, variant: req.body.variant, transmission
+        }).catch(() => null)
+      : null;
+
+    const dbPreferred = dbResult && !dbResult.belowThreshold;
+    const dbAvailable = !!dbResult;
+
+    // ── Step 2: Fetch full listing details from SociaVault ──
+    let fullDescription = description || '';
+    let condition = null;
+    if (listingId || listingUrl) {
+      const details = await fetchListingDetails(listingId, listingUrl);
+      if (details) {
+        if (details.description && details.description.length > (fullDescription?.length || 0)) {
+          fullDescription = details.description;
+        }
+        condition = details.condition || null;
+        console.log(`[AI/vehicle] Fetched full details — desc: ${fullDescription.length} chars, condition: ${condition}`);
+      }
+    }
+
+    // ── Step 3: Build DB market context block ────────────────
+    // Injected into the prompt — AI uses these real numbers as its anchor.
+    let dbMarketContext = '';
+    if (dbAvailable && dbResult.marketMedian) {
+      const mb        = dbResult.mileageBand || 'unknown mileage range';
+      const yb        = dbResult.yearBand    || String(year);
+      const cohortStr = [make, model, dbResult.series, dbResult.variant].filter(Boolean).join(' ');
+      const listingMileageBand = mileage ? bandMileage(mileage) : null;
+      const mileageMismatch = listingMileageBand && dbResult.mileageBand && listingMileageBand !== dbResult.mileageBand;
+
+      if (dbPreferred) {
+        const consistency = dbResult.iqr && dbResult.marketMedian
+          ? (dbResult.iqr / dbResult.marketMedian < 0.2 ? 'tight, consistent market' : 'moderate spread')
+          : '';
+        const mileageNote = mileageMismatch
+          ? `NOTE: Listing mileage (${Number(mileage).toLocaleString()} km) is outside the ${mb} cohort. ` +
+            `Use the cohort data as a baseline and adjust using the depreciation guide below.`
+          : `Listing mileage matches this cohort — use the market data directly, adjusted for condition signals.`;
+
+        dbMarketContext = [
+          '',
+          'REAL MARKET DATA FROM AU LISTINGS (use as your pricing anchor — actual observed data, not estimates):',
+          `- Vehicle cohort: ${cohortStr} · ${yb} · ${mb}`,
+          `- Market median price for this cohort: $${dbResult.marketMedian.toLocaleString()}`,
+          `- Price range (P25–P75): $${dbResult.marketLow.toLocaleString()} – $${dbResult.marketHigh.toLocaleString()}`,
+          `- Sample size: ${dbResult.samples} comparable AU listings`,
+          dbResult.iqr ? `- Market consistency (IQR): $${dbResult.iqr.toLocaleString()} — ${consistency}` : '',
+          '',
+          mileageNote,
+          'Your estimatedMarketValue MUST be grounded in these numbers.',
+          'Adjust up or down based on condition/extras/description but do not deviate >25% without stating why in whyItsWorth.',
+        ].filter(l => l !== null).join('\n');
+
+      } else {
+        dbMarketContext = [
+          '',
+          'PARTIAL MARKET DATA FROM AU LISTINGS (small sample — directional reference only):',
+          `- Vehicle cohort: ${cohortStr} · ${yb} · ${mb}`,
+          `- Observed median: $${dbResult.marketMedian.toLocaleString()}`,
+          `- Observed range: $${dbResult.marketLow.toLocaleString()} – $${dbResult.marketHigh.toLocaleString()}`,
+          `- Sample size: ${dbResult.samples} listings`,
+          mileageMismatch
+            ? `Listing mileage (${Number(mileage).toLocaleString()} km) differs from ${mb} cohort — interpolate using the depreciation guide.`
+            : '',
+          'Use alongside your own knowledge. If figures conflict with your knowledge, use judgment.',
+        ].filter(l => l !== null).join('\n');
+      }
+    } else {
+      dbMarketContext = '\nNO DATABASE DATA AVAILABLE for this vehicle cohort yet.\nUse your knowledge of the AU used-car market. Be conservative.';
+    }
+
+    // ── Step 4: Build the full prompt ─────────────────────
+    const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
+    const vehicleDetails = [
+      `Make/Model/Year: ${carLabel}`,
+      req.body.series  ? `Series: ${req.body.series}`   : null,
+      req.body.variant ? `Variant: ${req.body.variant}` : null,
+      mileage     ? `Kms: ${Number(mileage).toLocaleString()} km` : null,
+      transmission ? `Transmission: ${transmission}` : null,
+      condition    ? `Condition: ${condition}` : null,
+      `Listing Price: $${Number(listingPrice).toLocaleString()}`,
+    ].filter(Boolean).join('\n');
+
+    const mileageGuide = [
+      '',
+      'KMS DEPRECIATION GUIDE (AU market — use when interpolating from cohort data):',
+      '- Under 80,000 km:    premium — add 10–20% above cohort median',
+      '- 80,000–130,000 km:  normal use — at cohort median',
+      '- 130,000–180,000 km: moderate discount (~10–20% below median)',
+      '- 180,000–250,000 km: significant discount (~25–40% below median)',
+      '- Over 250,000 km:    hard sell — well below median, long time-to-sell',
+    ].join('\n');
+
+    const prompt = [
+      'You are an expert Australian used-vehicle flipper and market analyst. Your goal is accurate, conservative valuation grounded in real market data.',
+      dbMarketContext,
+      '',
+      'VEHICLE DETAILS:',
+      vehicleDetails,
+      mileageGuide,
+      '',
+      `LISTING TITLE: ${title || '(not provided)'}`,
+      'FULL LISTING DESCRIPTION:',
+      '"""',
+      fullDescription || '(not provided)',
+      '"""',
+      '',
+      'EXTRACT AND FACTOR IN FROM DESCRIPTION:',
+      '- Exact variant/trim/series (VE SS, FG XR6, GU TDI, SR5 etc) — significantly affects value',
+      '- Engine (3.6L V6, 6.0L V8, 3.0 diesel etc) — extract if not in title',
+      '- Extras (towbar, lift kit, ARB gear, new tyres, canopy, leather, sunroof) — add value',
+      '- Service history (logbooks, one owner, recently serviced) — adds significant value',
+      '- Defects (rust, oil leaks, engine noise, worn interior, needs RWC, accident history) — reduce value, add red flags',
+      '- Urgency signals (must sell, moving, price reduced) — negotiation leverage',
+      '- Rego status (registered until X, unregistered, interstate) — affects buyer cost',
+      '',
+      'MISSING INFORMATION RULES — absence of info is NOT neutral, treat it as a red flag:',
+      '- No service history mentioned → assume none exists, reduce value 10–15%, add as red flag',
+      '- No condition mentioned → assume average/fair condition, not good',
+      '- No kms mentioned → assume high kms, reduce value accordingly',
+      '- Vague description (one line, no detail) → seller is hiding something, flag it',
+      '',
+      'CRITICAL — WHAT THINGS ACTUALLY SELL FOR IN AU (not asking price):',
+      'The market median shown above is what sellers are ASKING. What things actually SELL for is different.',
+      'In Australian FB Marketplace, most items sell for 10–20% below the asking median.',
+      'Your estimatedResellLow must be what a buyer will realistically pay — not what you hope to get.',
+      'Price it to sell in 1–2 weeks. If it would take longer, the price is too high.',
+      '',
+      'CALCULATE PROFIT STEP BY STEP — show your working in whyItsWorth:',
+      'Step 1 — Realistic sell price: take market median, subtract 12% (AU market discount off asking)',
+      'Step 2 — Detailing/clean: $200 minimum, $400 if condition is average or unknown',
+      'Step 3 — Minor repairs: $0 if genuinely perfect, $300–800 if any issues mentioned or kms are high',
+      'Step 4 — Rego/RWC if unregistered or interstate: add $400–800',
+      'Step 5 — Your time: minimum 2 hours to list, negotiate, show, sell — factor it in',
+      'Step 6 — estimatedProfit = realistic sell price MINUS buy price MINUS steps 2–4',
+      'Step 7 — roiPercent = estimatedProfit divided by buy price, expressed as percentage',
+      '',
+      'estimatedResellLow = Step 1 result (realistic sell, priced to move)',
+      'estimatedResellHigh = market median minus 5% (best case, patient seller)',
+      'estimatedProfit = estimatedResellLow minus listingPrice minus all costs from steps 2–4',
+      '',
+      'VERDICT RULES — apply strictly:',
+      '- roiPercent > 30% after ALL costs → STEAL',
+      '- roiPercent 15–30% after ALL costs → GOOD DEAL',
+      '- roiPercent 5–15% after ALL costs → FAIR',
+      '- roiPercent 0–5% after ALL costs → FAIR (barely worth it)',
+      '- roiPercent < 0% → PASS',
+      '- A $300 profit on a $4000 car is FAIR, not GOOD DEAL. Be honest.',
+      '',
+      'NEGATIVE PROFIT RULE — critical:',
+      'If your calculation produces a negative profit (you would lose money flipping this):',
+      '- DO NOT show a negative estimatedProfit — set it to 0',
+      '- DO NOT show a negative roiPercent — set it to 0',
+      '- Set estimatedResellLow to approximately the listing price (what you paid)',
+      '- Set estimatedResellHigh to listing price plus 3–5% at most',
+      '- The message to the user is: you would need to sell for roughly what you paid just to break even',
+      '- Set verdict to PASS and dealScore to 15 or lower',
+      '- The oneLiner should honestly say something like "You would need to sell for at least $X just to break even after costs"',
+      '- Do not invent profit that does not exist',
+      '',
+      'Broken/project cars: if listing mentions "spares or repairs", "not running", "blown", "needs work", "as-is" — set isBrokenOrProject true, provide repairEstimate, cap verdict at FAIR unless post-repair ROI is exceptional.',
+      '',
+      'Respond ONLY in this exact JSON format (no markdown, no text outside JSON):',
+      '{',
+      '  "verdict": "STEAL|GOOD DEAL|FAIR|PASS",',
+      '  "dealScore": 0-100,',
+      '  "oneLiner": "one punchy sentence",',
+      '  "extractedTitle": "cleaned listing title",',
+      '  "extractedPrice": number,',
+      '  "estimatedMarketValue": number,',
+      '  "estimatedResellLow": number,',
+      '  "estimatedResellHigh": number,',
+      '  "recommendedOffer": number,',
+      '  "walkAwayPrice": number,',
+      '  "estimatedProfit": number,',
+      '  "roiPercent": number,',
+      '  "timeToSell": "1-3 days / 3-7 days / 1-2 weeks / 2-4 weeks",',
+      '  "demandLevel": "🔥 High or 📈 Moderate or 📉 Low",',
+      '  "whyItsWorth": "1-2 sentences referencing the actual price numbers",',
+      '  "greenFlags": ["..."],',
+      '  "redFlags": ["..."],',
+      '  "whatToCheckInPerson": ["..."],',
+      '  "negotiationScript": "what to say to the seller",',
+      '  "isBrokenOrProject": false,',
+      '  "repairEstimate": 0,',
+      '  "repairNotes": "",',
+      '  "aiGenerated": true',
+      '}',
+    ].join('\n');
+
+    // ── Step 5: Call AI ────────────────────────────────────
+    let text = '';
+    const hasImage = !!(imageBase64 || imageUrl);
+
+    if (GEMINI_API_KEY && hasImage) {
+      const parts = [];
+      if (imageBase64 && imageMime) {
+        parts.push({ inline_data: { mime_type: imageMime, data: imageBase64 } });
+      } else if (imageUrl) {
+        try {
+          const imgRes = await axios.get(imageUrl, {
+            responseType: 'arraybuffer', timeout: 10000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+          });
+          parts.push({ inline_data: { mime_type: imgRes.headers['content-type'] || 'image/jpeg', data: Buffer.from(imgRes.data).toString('base64') } });
+        } catch (_) {}
+      }
+      parts.push({ text: prompt });
+      const geminiRes = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+      );
+      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else if (GEMINI_API_KEY) {
+      const geminiRes = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+      );
+      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else {
+      const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1500,
+        messages: [{ role: 'user', content: prompt }],
+      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 60000 });
+      text = claudeRes.data?.content?.[0]?.text || '';
+    }
+
+    // ── Step 6: Parse and apply DB hard-override if trusted ──
+    let parsed = null;
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
+    } catch (_) {}
+
+    if (parsed) {
+      if (dbPreferred) {
+        // DB is fully trusted — lock the price fields
+        // AI still owns: verdict rationale, flags, negotiation script, inspection checklist
+        parsed.estimatedMarketValue = dbResult.marketMedian;
+        parsed.estimatedResellLow   = dbResult.marketLow;
+        parsed.estimatedResellHigh  = dbResult.marketHigh;
+        parsed.low                  = dbResult.marketLow;
+        parsed.median               = dbResult.marketMedian;
+        parsed.high                 = dbResult.marketHigh;
+        // Realistic sell price = 10% below median (priced to actually sell, not sit)
+        const realisticSellPrice = Math.round(dbResult.marketMedian * 0.90);
+        // Realistic costs: detailing + minor prep (conservative estimate)
+        const flipCosts = listingPrice < 5000 ? 300 : listingPrice < 15000 ? 500 : 800;
+        const realisticProfit = realisticSellPrice - listingPrice - flipCosts;
+
+        parsed.estimatedResellLow   = realisticSellPrice;
+        parsed.estimatedResellHigh  = Math.round(dbResult.marketMedian * 0.97); // best case just under median
+        parsed.estimatedMarketValue = dbResult.marketMedian;
+        parsed.low                  = dbResult.marketLow;
+        parsed.median               = dbResult.marketMedian;
+        parsed.high                 = dbResult.marketHigh;
+        if (realisticProfit <= 0) {
+          // Negative flip — set resell to around what was paid, profit to 0
+          parsed.estimatedProfit      = 0;
+          parsed.roiPercent           = 0;
+          parsed.estimatedResellLow   = listingPrice;
+          parsed.estimatedResellHigh  = Math.round(listingPrice * 1.04);
+        } else {
+          parsed.estimatedProfit      = Math.round(realisticProfit);
+          parsed.roiPercent           = Math.round((realisticProfit / listingPrice) * 100);
+        }
+
+        // Verdict anchored to realistic ROI after all costs
+        if      (parsed.roiPercent >= 30) { parsed.verdict = 'STEAL';     parsed.dealScore = Math.min(95, Math.max(parsed.dealScore || 0, 85)); }
+        else if (parsed.roiPercent >= 15) { parsed.verdict = 'GOOD DEAL'; parsed.dealScore = Math.min(84, Math.max(parsed.dealScore || 0, 65)); }
+        else if (parsed.roiPercent >= 5)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(64, Math.max(parsed.dealScore || 0, 45)); }
+        else if (parsed.roiPercent >= 0)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(44, 40); }
+        else                              { parsed.verdict = 'PASS';      parsed.dealScore = Math.min(parsed.dealScore || 25, 25); }
+      }
+
+      // Strip internal fields — never send to user
+      delete parsed.sourceLabel;
+      delete parsed.confidence;
+      delete parsed.dataPoints;
+      delete parsed.dbData;
+      delete parsed._pricingCorrected;
+
+      const finalResult = { ...parsed, text, usedCache: false };
+      await setAppraisalCache(listingId, title, listingPrice, keyword, finalResult).catch(e =>
+        console.error('[AprCache] Write error:', e.message)
+      );
+      res.json(finalResult);
+    } else {
+      res.json({ text, usedCache: false });
+    }
+  } catch (e) {
+    console.error('[AI/vehicle]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/image — image scan via Gemini Flash
+// Body: { parts: [ { inline_data: { mime_type, data } }, { text: prompt } ] }
+app.post('/ai/image', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
+    const { parts } = req.body;
+    if (!parts || !Array.isArray(parts)) return res.status(400).json({ error: 'parts array required' });
+
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 30000,
+    });
+    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    res.json({ text });
+  } catch (e) {
+    console.error('[AI/image]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/text — text-only calls via Claude Haiku
+// Body: { prompt: string }
+app.post('/ai/text', authMiddleware, async (req, res) => {
+  try {
+    if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Anthropic not configured on server' });
+    const { prompt, max_tokens, listingId, title, price, keyword } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    if (cached) {
+      console.log(`[AI/text] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: max_tokens || 1500,
+      messages: [{ role: 'user', content: prompt }],
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      timeout: 60000,
+    });
+    const text = claudeRes.data?.content?.[0]?.text || '';
+    const result = { text, usedCache: false };
+
+    // Store in cache for future users
+    if (listingId || (title && price)) {
+      await setAppraisalCache(listingId, title, price, keyword, result).catch(e =>
+        console.error('[AprCache] Write error (text):', e.message)
+      );
+    }
+
+    res.json(result);
+  } catch (e) {
+    console.error('[AI/text]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/text-image — text scan with an image fetched via URL (listing image)
+// Body: { prompt: string, imageUrl: string }
+app.post('/ai/text-image', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
+    const { prompt, imageUrl, listingId, title, price, keyword } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    if (cached) {
+      console.log(`[AI/text-image] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    var parts = [{ text: prompt }];
+
+    // If there's an image URL, fetch and include it
+    if (imageUrl) {
+      try {
+        const imgRes = await axios.get(imageUrl, {
+          responseType: 'arraybuffer', timeout: 10000,
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' }
+        });
+        const b64 = Buffer.from(imgRes.data).toString('base64');
+        const mime = imgRes.headers['content-type'] || 'image/jpeg';
+        parts = [{ inline_data: { mime_type: mime, data: b64 } }, { text: prompt }];
+      } catch(e) {
+        console.log('[AI/text-image] Could not fetch image, proceeding text-only');
+      }
+    }
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 30000,
+    });
+    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const result = { text, usedCache: false };
+
+    // Store in cache for future users
+    if (listingId || (title && price)) {
+      await setAppraisalCache(listingId, title, price, keyword, result).catch(e =>
+        console.error('[AprCache] Write error (text-image):', e.message)
+      );
+    }
+
+    res.json(result);
+  } catch (e) {
+    console.error('[AI/text-image]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// ── Appraisal cache admin ─────────────────────────────────
+// GET /appraisal-cache?listingId=xxx  — check if a result is cached
+app.get('/appraisal-cache', authMiddleware, async (req, res) => {
+  try {
+    const { listingId, title, price, keyword } = req.query;
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    res.json({ found: !!cached, cached: cached || null });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE /appraisal-cache?listingId=xxx  — bust a specific cache entry (owner only)
+app.delete('/appraisal-cache', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    const { listingId, title, price, keyword } = req.query;
+    if (listingId) await redisDel(K.appraisalById(listingId));
+    if (title && price) {
+      const hash = buildAppraisalHash(title, price, keyword);
+      await redisDel(K.appraisalByHash(hash));
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── DEV: force-set plan (secret-gated, remove before public launch) ──
+// POST /dev/set-plan  { secret: "...", plan: "premium" }
+const DEV_SECRET = process.env.DEV_SECRET || 'flipradar-dev';
+app.post('/dev/set-plan', authMiddleware, async (req, res) => {
+  const { secret, plan } = req.body;
+  if (secret !== DEV_SECRET) return res.status(403).json({ error: 'Forbidden' });
+  const validPlans = ['free', 'basic', 'premium'];
+  if (!validPlans.includes(plan)) return res.status(400).json({ error: 'plan must be free, basic, or premium' });
+  const user = await getUser(req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.plan = plan;
+  await saveUser(user);
+  console.log(`[Dev] Set plan for ${user.email} → ${plan}`);
+  res.json({ ok: true, plan });
+});
+
+// ── Start ─────────────────────────────────────────────────
+
+// ── Vehicle identity helpers ─────────────────────────────
+// Reads make/model/year/km from SociaVault structured fields first,
+// falls back to what the scan already extracted from the title.
+function parseVehicleInfoFields(item) {
+  if (!item) return {};
+  const vi = item.vehicle_info || item.listing_vehicle_data || item.vehicleInfo || {};
+  const attrs = item.attributes ? Object.values(item.attributes) : [];
+  const attr = (name) => {
+    const a = attrs.find(x => String(x.attribute_name || x.name || '').toLowerCase() === name.toLowerCase());
+    return a ? (a.label || a.value || null) : null;
+  };
+  const toInt = (v) => { if (v == null) return null; const n = parseInt(String(v).replace(/[^0-9]/g,''),10); return Number.isFinite(n)?n:null; };
+  const year = toInt(vi.year || vi.model_year || vi.manufacture_year || attr('Year'));
+  return {
+    make:         vi.make || vi.manufacturer || vi.brand || attr('Make') || null,
+    model:        vi.model || vi.model_name || attr('Model') || null,
+    year:         (year >= 1970 && year <= new Date().getFullYear()+1) ? year : null,
+    kms:          toInt(vi.odometer || vi.mileage || vi.kilometres || vi.kilometers || attr('Odometer')),
+    transmission: vi.transmission || vi.gearbox || attr('Transmission') || null,
+    fuel_type:    vi.fuel_type || vi.fuel || attr('Fuel type') || null,
+    body_style:   vi.body_style || vi.body || vi.body_type || attr('Body style') || null,
+  };
+}
+
+// ── Vehicle blend valuation ──────────────────────────────
+// Prices a specific car by sliding comparable listings to its km,
+// weighting closest-km comps most, and blending with AI when data is thin.
+const REF_FALLBACK_PERKM = 0.08;
+const KM_HALF_WEIGHT = 50000;
+const ENOUGH_COMPS = 8;
+
+function slideToKm(price, fromKm, toKm, make) {
+  // VERIFY: DEP_TABLE must be keyed by lowercase make with a perKm field
+  const perKm = (DEP_TABLE?.[String(make||'').toLowerCase()]?.perKm) || REF_FALLBACK_PERKM;
+  const adjusted = price + (fromKm - toKm) * perKm;
+  return Math.max(price * 0.25, adjusted);
+}
+
+async function getVehicleComps(target) {
+  const scopes = [
+    'make=$1 AND model=$2 AND series IS NOT DISTINCT FROM $3 AND variant IS NOT DISTINCT FROM $4',
+    'make=$1 AND model=$2 AND series IS NOT DISTINCT FROM $3',
+    'make=$1 AND model=$2',
+  ];
+  for (const where of scopes) {
+    const { rows } = await pool.query(
+      `SELECT price, kms, year, scraped_at FROM listings WHERE category='vehicle' AND is_active=TRUE AND in_price_pool=TRUE AND price>0 AND kms>0 AND ${where} AND scraped_at > NOW() - INTERVAL '120 days'`,
+      [target.make, target.model, target.series||null, target.variant||null]);
+    if (rows.length >= 3) return rows;
+  }
+  return [];
+}
+
+async function aiEstimateVehicle(target) {
+  const ck = `vest:${[target.make,target.model,target.series,target.year,Math.round((target.kms||0)/20000)].join('|')}`;
+  const cached = await redisGet(ck);
+  if (cached?.est) return cached.est;
+  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
+  const prompt = `Typical USED private-sale price AUD on Australian Facebook Marketplace:\n${target.year||''} ${target.make||''} ${target.model||''} ${target.series||''} ${target.variant||''}, ${target.kms||'?'} km.\nReturn ONLY JSON: { "est_aud": number }`;
+  try {
+    let text = '';
+    if (GEMINI_API_KEY) {
+      const r = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},
+        {headers:{'Content-Type':'application/json'},timeout:10000});
+      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';
+    } else {
+      const r = await axios.post('https://api.anthropic.com/v1/messages',
+        {model:'claude-haiku-4-5-20251001',max_tokens:80,messages:[{role:'user',content:prompt}]},
+        {headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},timeout:10000});
+      text = r.data?.content?.[0]?.text||'';
+    }
+    const m = text.match(/\{[\s\S]*\}/);
+    const est = m ? Math.round(JSON.parse(m[0]).est_aud) : null;
+    if (est > 0) { await redisSet(ck,{est},14*24*3600); return est; }
+  } catch(e) { console.error('[VEst]',e.message); }
+  return null;
+}
+
+async function appraiseVehicleValue(target) {
+  if (!target.kms || target.kms <= 0) {
+    const aiEst = await aiEstimateVehicle(target);
+    return aiEst ? {value:aiEst,confidence:15,source:'ai_only',poolN:0,aiEst} : {value:null,confidence:0,source:'none',poolN:0};
+  }
+  const comps = await getVehicleComps(target);
+  const adj = comps.map(c => {
+    const price = slideToKm(c.price, c.kms, target.kms, target.make);
+    const kmW = 1/(1+Math.abs(c.kms-target.kms)/KM_HALF_WEIGHT);
+    const ageDays = (Date.now()-new Date(c.scraped_at))/86400000;
+    const recW = ageDays<30?1:ageDays<90?0.7:0.4;
+    return {price, w:kmW*recW, kmGap:Math.abs(c.kms-target.kms)};
+  });
+  let poolValue=null, poolN=0;
+  if (adj.length) {
+    const sorted = adj.map(a=>a.price).sort((x,y)=>x-y);
+    const q = p => sorted[Math.floor(p*(sorted.length-1))];
+    const lo=q(0.25)-1.5*(q(0.75)-q(0.25)), hi=q(0.75)+1.5*(q(0.75)-q(0.25));
+    const kept = adj.filter(a=>a.price>=lo&&a.price<=hi);
+    const wsum = kept.reduce((s,a)=>s+a.w,0);
+    poolValue = wsum?Math.round(kept.reduce((s,a)=>s+a.price*a.w,0)/wsum):null;
+    poolN = kept.length;
+  }
+  const aiEst = await aiEstimateVehicle(target);
+  const trust = Math.min(poolN/ENOUGH_COMPS,1);
+  let value, source;
+  if (poolN>0&&aiEst) { value=Math.round(poolValue*trust+aiEst*(1-trust)); source='blend'; }
+  else if (poolN>0) { value=poolValue; source='comps_only'; }
+  else if (aiEst) { value=aiEst; source='ai_only'; }
+  else { return {value:null,confidence:0,source:'none',poolN:0}; }
+  const nearestGap = adj.length?Math.min(...adj.map(a=>a.kmGap)):Infinity;
+  const agr = (a,b)=>{ if(!a||!b)return 0; const d=Math.abs(a-b)/Math.max(a,b); return d<0.07?1:d<0.15?0.6:d<0.25?0.2:0; };
+  let confidence = Math.round(55*trust+20*(poolN>0&&aiEst?agr(poolValue,aiEst):0)+15*(nearestGap<30000?1:nearestGap<80000?0.5:0)+10*(source==='comps_only'?1:source==='blend'?0.6:0));
+  confidence = Math.max(5,Math.min(confidence,100));
+  return {value,confidence,source,poolN,aiEst,poolValue};
+}
+
+// ── General goods normaliser ─────────────────────────────
+// Turns a title into { category, brand, product_line, variant, norm_key }
+// so general items get precise cohorts instead of broad keyword buckets.
+const _slug = s => String(s||'').toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+const _tc   = s => String(s||'').replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+const _pick = (pairs,t) => { for(const [k,re] of pairs) if(re.test(t)) return k; return null; };
+const CATEGORY_SIGNALS=[['gaming',/\b(ps5|ps4|playstation|xbox|series x|series s|nintendo switch|steam deck|quest ?[23]|oculus)\b/i],['phone',/\b(iphone|galaxy s\d|galaxy note|pixel \d|ipad)\b/i],['power_tool',/\b(milwaukee|makita|de ?walt|ryobi|festool|hilti|metabo|hikoki|m18|m12|18v|impact driver|angle grinder|circular saw|hammer drill)\b/i],['computer',/\b(macbook|imac|thinkpad|dell xps|rtx ?\d{3,4}|graphics card)\b/i],['audio',/\b(sonos|airpods|bose|wh.?1000|quietcomfort|soundbar|turntable)\b/i],['vacuum',/\b(dyson|stick vac|cordless vacuum)\b/i]];
+function detectNormCategory(text){for(const[cat,re]of CATEGORY_SIGNALS)if(re.test(text))return cat;return 'general';}
+const PT_BRANDS=[['milwaukee',/\bmilwaukee\b/i],['makita',/\bmakita\b/i],['dewalt',/\bde ?walt\b/i],['ryobi',/\bryobi\b/i],['festool',/\bfestool\b/i],['hilti',/\bhilti\b/i],['metabo',/\b(metabo|hikoki|hitachi)\b/i],['bosch',/\bbosch\b/i],['ego',/\bego\b/i]];
+const PT_LINE={milwaukee:[['m18',/\bm18\b/i],['m12',/\bm12\b/i]],makita:[['xgt-40v',/\bxgt\b|\b40v\b/i],['cxt-12v',/\bcxt\b|\b12v\b/i],['lxt-18v',/\blxt\b|\b18v\b/i]],dewalt:[['xr-18v',/\bxr\b|\b18v\b|\b20v\b/i]],ryobi:[['one-plus-18v',/\bone\+?\b|\b18v\b/i]]};
+const PT_TOOL=[['hammer-drill',/hammer ?drill|combi ?drill/i],['impact-driver',/impact ?driver/i],['impact-wrench',/impact ?wrench|rattle ?gun/i],['drill',/\bdrill( ?driver)?\b/i],['angle-grinder',/angle ?grinder|\bgrinder\b/i],['circular-saw',/circular ?saw/i],['recip-saw',/recip(rocating)? ?saw|sawzall/i],['multi-tool',/multi ?tool|oscillating/i],['blower',/\bblower\b/i],['nailer',/nail ?gun|nailer/i]];
+function resolvePowerTool(t){const brand=_pick(PT_BRANDS,t);const line=brand&&PT_LINE[brand]?_pick(PT_LINE[brand],t):null;const tool=_pick(PT_TOOL,t);const isKit=/\b(kit|combo|set)\b/i.test(t);const isBare=/\b(bare|skin only|tool only|body only)\b/i.test(t);return{brand,product_line:[line,tool].filter(Boolean).join(' ')||null,variant:isBare?'bare':(isKit?'kit':null),attributes:{kit:isKit,bare:isBare}};}
+const IPHONE=[['iphone-16-pro-max',/iphone ?16 ?pro ?max/i],['iphone-16-pro',/iphone ?16 ?pro/i],['iphone-16',/iphone ?16/i],['iphone-15-pro-max',/iphone ?15 ?pro ?max/i],['iphone-15-pro',/iphone ?15 ?pro/i],['iphone-15',/iphone ?15/i],['iphone-14-pro-max',/iphone ?14 ?pro ?max/i],['iphone-14-pro',/iphone ?14 ?pro/i],['iphone-14',/iphone ?14/i],['iphone-13-pro',/iphone ?13 ?pro/i],['iphone-13',/iphone ?13/i],['iphone-12',/iphone ?12/i],['iphone-11',/iphone ?11/i]];
+const GALAXY=[['galaxy-s24-ultra',/s24 ?ultra/i],['galaxy-s24',/galaxy ?s24/i],['galaxy-s23-ultra',/s23 ?ultra/i],['galaxy-s23',/galaxy ?s23/i],['galaxy-s22',/galaxy ?s22/i]];
+function resolvePhone(t){const brand=/\b(iphone|apple)\b/i.test(t)?'apple':/\b(samsung|galaxy)\b/i.test(t)?'samsung':/\b(pixel|google)\b/i.test(t)?'google':null;const model=brand==='apple'?_pick(IPHONE,t):brand==='samsung'?_pick(GALAXY,t):null;const gb=(t.match(/\b(64|128|256|512)\s?gb\b/i)||[])[1]||(/\b1\s?tb\b/i.test(t)?'1024':null);const locked=/\blocked\b/i.test(t)&&!/\bunlocked\b/i.test(t);return{brand,product_line:model,variant:[gb?`${gb}gb`:null,locked?'locked':null].filter(Boolean).join('-')||null,attributes:{storage_gb:gb?+gb:null,locked}};}
+const CONSOLE=[['ps5-pro',/ps5 ?pro/i],['ps5-slim',/ps5 ?slim/i],['ps5',/ps5|playstation ?5/i],['ps4-pro',/ps4 ?pro/i],['ps4',/ps4|playstation ?4/i],['xbox-series-x',/series ?x/i],['xbox-series-s',/series ?s/i],['switch-oled',/switch ?oled/i],['switch-lite',/switch ?lite/i],['switch',/nintendo ?switch|\bswitch\b/i],['steam-deck',/steam ?deck/i],['quest-3',/quest ?3/i],['quest-2',/quest ?2/i]];
+const CONSOLE_BRAND={'ps5':'sony','ps5-pro':'sony','ps5-slim':'sony','ps4':'sony','ps4-pro':'sony','xbox-series-x':'microsoft','xbox-series-s':'microsoft','switch':'nintendo','switch-oled':'nintendo','switch-lite':'nintendo','steam-deck':'valve','quest-3':'meta','quest-2':'meta'};
+function resolveGaming(t){const model=_pick(CONSOLE,t);let edition=null;if(model&&(model.startsWith('ps5')||model==='xbox-series-x')){if(/digital/i.test(t))edition='digital';else if(/disc/i.test(t))edition='disc';}return{brand:model?CONSOLE_BRAND[model]||null:null,product_line:model,variant:edition,attributes:{edition}};}
+const DYSON_MODELS=[['v15',/v15/i],['v12',/v12/i],['v11',/v11/i],['v10',/v10/i],['v8',/v8/i]];
+function resolveVacuum(t){const brand=/dyson/i.test(t)?'dyson':null;return{brand,product_line:brand?_pick(DYSON_MODELS,t):null,variant:null,attributes:{}};}
+const AUDIO_LIST=[['apple','airpods-pro-2',/airpods ?pro ?(2|2nd)/i],['apple','airpods-pro',/airpods ?pro/i],['apple','airpods-max',/airpods ?max/i],['apple','airpods',/airpods/i],['sony','wh-1000xm5',/wh.?1000xm5|\bxm5\b/i],['sony','wh-1000xm4',/wh.?1000xm4|\bxm4\b/i],['bose','quietcomfort',/quietcomfort|\bqc\b/i],['sonos','sonos',/sonos/i]];
+function resolveAudio(t){for(const[brand,line,re]of AUDIO_LIST)if(re.test(t))return{brand,product_line:line,variant:null,attributes:{}};return{};}
+const MAC_MODELS=[['macbook-pro-16',/macbook ?pro ?16/i],['macbook-pro-14',/macbook ?pro ?14/i],['macbook-pro',/macbook ?pro/i],['macbook-air',/macbook ?air/i],['imac',/imac/i]];
+function resolveComputer(t){const brand=/macbook|imac|apple/i.test(t)?'apple':null;const chip=(t.match(/\bm([1234])\b/i)||[])[1];return{brand,product_line:brand?_pick(MAC_MODELS,t):null,variant:chip?`m${chip}`:null,attributes:{chip:chip?`m${chip}`:null}};}
+const NORM_RESOLVERS={power_tool:resolvePowerTool,phone:resolvePhone,gaming:resolveGaming,vacuum:resolveVacuum,audio:resolveAudio,computer:resolveComputer};
+function normalizeGeneralProduct(listing){
+  const text=`${listing.keyword||''} ${listing.title||''}`;
+  const category=detectNormCategory(text);
+  const r=(NORM_RESOLVERS[category]?NORM_RESOLVERS[category](text):{})||{};
+  const brand=r.brand||null;const product_line=r.product_line||null;const variant=r.variant||null;
+  const resolved=!!(brand&&product_line);
+  return{category,brand,product_line,variant,attributes:r.attributes||{},
+    norm_key:resolved?_slug([category,brand,product_line,variant].filter(Boolean).join(' ')):null,
+    display_name:resolved?_tc([brand,product_line,variant].filter(Boolean).join(' ')):null,resolved};
+}
+
+// ── Keyword price anchor (AI ballpark for the real product) ──────────
+const BROAD_KEYWORD_STOPLIST=new Set(['bmw','mercedes','audi','toyota','ford','holden','honda','nissan','mazda','mitsubishi','hyundai','kia','subaru','volkswagen','vw','jeep','lexus','volvo','car','cars','ute','van','truck','phone','laptop','tv','furniture','tools','desk','chair','table','couch','sofa']);
+function isBroadKeyword(kw){return BROAD_KEYWORD_STOPLIST.has(String(kw||'').toLowerCase().trim());}
+async function getKeywordPriceAnchor(keyword,sampleTitles=[]){
+  const cacheKey=`anchor:${_slug(keyword).slice(0,60)}`;
+  const cached=await redisGet(cacheKey);if(cached&&cached.anchor)return cached.anchor;
+  if(!GEMINI_API_KEY&&!ANTHROPIC_API_KEY)return null;
+  const prompt=['You estimate the typical USED resale price in AUD on Australian Facebook Marketplace.',`Product keyword: "${keyword}"`,sampleTitles.length?`Example titles:\n- ${sampleTitles.slice(0,6).join('\n- ')}`:'','Give ONE rough typical price for the MAIN product in good used condition (NOT accessories/parts).','Return ONLY JSON: { "anchor_aud": number }'].filter(Boolean).join('\n');
+  try{
+    let text='';
+    if(GEMINI_API_KEY){const r=await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,{contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},{headers:{'Content-Type':'application/json'},timeout:10000});text=r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';}
+    else{const r=await axios.post('https://api.anthropic.com/v1/messages',{model:'claude-haiku-4-5-20251001',max_tokens:100,messages:[{role:'user',content:prompt}]},{headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},timeout:10000});text=r.data?.content?.[0]?.text||'';}
+    const m=text.match(/\{[\s\S]*\}/);const anchor=m?Math.round(JSON.parse(m[0]).anchor_aud):null;
+    if(anchor&&anchor>0){await redisSet(cacheKey,{anchor},30*24*3600);return anchor;}
+  }catch(e){console.error('[Anchor]',keyword,e.message);}
+  return null;
+}
+async function refreshKeywordAnchors(){
+  try{
+    const{rows}=await pool.query(`SELECT keyword,COUNT(*)::INT AS n,(ARRAY_AGG(title ORDER BY scraped_at DESC))[1:6] AS sample_titles FROM listings WHERE keyword IS NOT NULL AND category!='vehicle' AND price>0 AND is_active=TRUE GROUP BY keyword HAVING COUNT(*)>=8`);
+    for(const r of rows){if(isBroadKeyword(r.keyword))continue;const anchor=await getKeywordPriceAnchor(r.keyword,r.sample_titles||[]);if(anchor){await pool.query(`INSERT INTO keyword_anchors(keyword,anchor_price,updated_at)VALUES($1,$2,NOW())ON CONFLICT(keyword)DO UPDATE SET anchor_price=EXCLUDED.anchor_price,updated_at=NOW()`,[r.keyword,anchor]);}await new Promise(res=>setTimeout(res,200));}
+    console.log(`[Anchor] refreshed ${rows.length} keyword anchors`);
+  }catch(e){console.error('[Anchor] refresh error:',e.message);}
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`FlipRadar backend on port ${PORT}`);
+  console.log(`SociaVault: ${SOCIAVAULT_API_KEY ? 'set' : 'NO TOKEN — add SOCIAVAULT_API_KEY'}`);
+  console.log(`Redis:      ${REDIS_URL           ? 'connected' : 'NOT SET'}`);
+  console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
+  console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
+  await initDB();          // create tables if not exist
+  await loadAllWatches();
+  const dbSummary = await getDBSummary();
+  if (dbSummary) {
+    console.log(`[DB] ${dbSummary.total_listings} listings · ${dbSummary.unique_keywords} keywords · ${dbSummary.unique_makes} vehicle makes`);
+  }
+  console.log('[Ready] Server fully loaded');
+});
++row.p25_price : '?'} / ${row.p75_price ? '
+// Analyses each listing photo to:
+//   1. Assess item condition (new/like_new/good/fair/poor/damaged)
+//   2. Verify the photo actually matches the keyword — flags mismatches (e.g. moped listed as electric scooter)
+// Runs nightly, never re-analyses a listing. Costs ~$0.000075 per image.
+
+async function analyseListingImagesNightly() {
+  if (!GEMINI_API_KEY) { console.log('[ImgAnalysis] No Gemini key — skipping'); return; }
+
+  const BATCH = 20;
+  let processed = 0;
+  let flagged = 0;
+
+  while (true) {
+    const { rows } = await pool.query(`
+      SELECT id, listing_id, title, keyword, price, image_url,
+             extracted_product, extracted_category
+      FROM listings
+      WHERE img_analysed_at IS NULL
+        AND image_url IS NOT NULL AND image_url != ''
+        AND price > 0
+        AND is_active = TRUE
+      ORDER BY scraped_at DESC
+      LIMIT $1
+    `, [BATCH]);
+
+    if (!rows.length) break;
+
+    console.log(`[ImgAnalysis] Analysing batch of ${rows.length} images...`);
+
+    for (const row of rows) {
+      try {
+        // Fetch image
+        let imgBase64 = null, imgMime = 'image/jpeg';
+        try {
+          const imgRes = await axios.get(row.image_url, {
+            responseType: 'arraybuffer', timeout: 12000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+          });
+          imgBase64 = Buffer.from(imgRes.data).toString('base64');
+          imgMime = imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg';
+        } catch (_) {
+          await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+          continue;
+        }
+
+        const keyword  = row.keyword || row.extracted_product || row.title || 'unknown';
+        const category = row.extracted_category || 'general';
+
+        const prompt = `Analyse this Facebook Marketplace listing photo.
+
+Listing:
+- Search keyword: "${keyword}"
+- Title: "${(row.title||'').slice(0,120)}"
+- Category: ${category}
+- Price: ${row.price} AUD
+
+Return ONLY valid JSON (no markdown):
+{
+  "condition": "new" | "like_new" | "good" | "fair" | "poor" | "damaged" | "cannot_assess",
+  "matches_keyword": true | false,
+  "mismatch_reason": null | "short reason e.g. photo shows a petrol moped not an electric scooter",
+  "visible_damage": true | false,
+  "is_stock_photo": true | false
+}
+
+Be strict on matches_keyword — only mark false if the item in the photo is clearly a DIFFERENT type of product than the keyword describes. Minor brand/model differences are fine.`;
+
+        const geminiRes = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+          { contents: [{ parts: [
+            { inline_data: { mime_type: imgMime, data: imgBase64 } },
+            { text: prompt }
+          ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+        );
+
+        const raw = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (!match) {
+          await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+          continue;
+        }
+
+        const result = JSON.parse(match[0]);
+
+        // Determine quality penalty
+        let newQuality = null;
+        if (result.matches_keyword === false) {
+          newQuality = 'spam'; // wrong item — exclude from price pool and deals
+          flagged++;
+          console.log(`[ImgAnalysis] ❌ MISMATCH: "${row.title}" (kw: ${keyword}) — ${result.mismatch_reason}`);
+        } else if (result.condition === 'damaged' || result.visible_damage) {
+          newQuality = 'damage'; // still shows in deals but tint is capped
+        }
+
+        await pool.query(`
+          UPDATE listings SET
+            img_condition       = $1,
+            img_matches_keyword = $2,
+            img_mismatch_reason = $3,
+            img_analysed_at     = NOW(),
+            price_quality = CASE
+              WHEN $4::TEXT IS NOT NULL THEN $4
+              ELSE price_quality
+            END
+          WHERE id = $5
+        `, [
+          result.condition || null,
+          result.matches_keyword !== false,
+          result.mismatch_reason || null,
+          newQuality,
+          row.id,
+        ]);
+
+        processed++;
+        await new Promise(r => setTimeout(r, 400));
+
+      } catch (e) {
+        console.error(`[ImgAnalysis] Error on ${row.listing_id}:`, e.message);
+        await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+      }
+    }
+
+    console.log(`[ImgAnalysis] Running total: ${processed} analysed, ${flagged} mismatches flagged`);
+  }
+
+  console.log(`[ImgAnalysis] ✅ Done — ${processed} images analysed, ${flagged} removed as mismatches`);
+}
+
+// ── Product Extraction ────────────────────────────────────
+// Reads unprocessed listing titles in batches of 50, asks Claude to identify
+// the exact product, saves back to DB. Runs nightly — never re-processes a listing.
+
+async function extractProductsNightly() {
+  if (!ANTHROPIC_API_KEY) { console.log('[Extract] No Anthropic key — skipping'); return; }
+
+  const BATCH = 50;
+  let processed = 0;
+
+  while (true) {
+    // Grab next batch of unextracted listings (non-vehicle, has a real price)
+    const { rows } = await pool.query(`
+      SELECT id, listing_id, title, keyword, price
+      FROM listings
+      WHERE extracted_at IS NULL
+        AND category != 'vehicle'
+        AND price > 0
+        AND is_offer_price = FALSE
+        AND price_quality IN ('ok', 'unscored')
+        AND title IS NOT NULL AND title != ''
+      ORDER BY scraped_at DESC
+      LIMIT $1
+    `, [BATCH]);
+
+    if (!rows.length) break;
+
+    console.log(`[Extract] Processing batch of ${rows.length} listings...`);
+
+    // Build prompt — ask Claude to classify all titles in one call
+    const items = rows.map((r, i) => `${i+1}. "${r.title.replace(/"/g, "'").slice(0, 120)}" (keyword: ${r.keyword || 'unknown'}, price: ${r.price})`).join('\n');
+
+    const prompt = `You are extracting structured product data from Australian Facebook Marketplace listing titles.
+
+For each listing, identify the EXACT product being sold. Focus on the specific model/item, not accessories or bundles.
+
+Rules:
+- extracted_product: the clean standardised product name (e.g. "Milwaukee M18 Impact Driver", "iPhone 15 Pro 256GB", "Weber Q2200 BBQ", "Dyson V15 Detect", "Trek Marlin 7 Mountain Bike")
+- brand: the manufacturer/brand (e.g. "Milwaukee", "Apple", "Weber", "Trek")  
+- category: one of: phones | laptops | tablets | gaming | tvs | audio | power_tools | hand_tools | garden | camping | vehicles | bikes | furniture | appliances | fitness | musical_instruments | photography | baby_kids | clothing | watches | collectibles | trade_industrial | general
+- variant: any key differentiator like storage size, colour, voltage, size (e.g. "256GB", "18V", "65 inch", "XL") — null if none
+- confidence: "high" if you are certain of the exact product, "medium" if you made a reasonable guess, "low" if the title is too vague
+
+Listings:
+${items}
+
+Return ONLY a JSON array with ${rows.length} objects in the same order:
+[{"extracted_product":"...","brand":"...","category":"...","variant":"...","confidence":"..."},...]
+
+No explanation. No markdown. Start with [ and end with ].`;
+
+    try {
+      const resp = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 4000,
+        messages: [{ role: 'user', content: prompt }],
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        timeout: 30000,
+      });
+
+      const text = resp.data?.content?.[0]?.text || '';
+      const match = text.match(/\[[\s\S]*\]/);
+      if (!match) { console.error('[Extract] Bad response, skipping batch'); break; }
+
+      const results = JSON.parse(match[0]);
+
+      // Write results back to DB
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const r = results[i] || {};
+        await pool.query(`
+          UPDATE listings SET
+            extracted_product     = $1,
+            extracted_brand       = $2,
+            extracted_category    = $3,
+            extracted_variant     = $4,
+            extraction_confidence = $5,
+            extracted_at          = NOW()
+          WHERE id = $6
+        `, [
+          r.extracted_product || null,
+          r.brand             || null,
+          r.category          || null,
+          r.variant           || null,
+          r.confidence        || 'low',
+          row.id,
+        ]);
+      }
+
+      processed += rows.length;
+      console.log(`[Extract] ${processed} listings extracted so far...`);
+
+      // Small delay between batches — be gentle on API
+      await new Promise(res => setTimeout(res, 1000));
+
+    } catch (e) {
+      console.error('[Extract] Batch failed:', e.message);
+      // Mark these as attempted so we don't retry in an infinite loop
+      const ids = rows.map(r => r.id);
+      await pool.query(`UPDATE listings SET extracted_at = NOW() WHERE id = ANY($1)`, [ids]);
+      break;
+    }
+  }
+
+  console.log(`[Extract] ✅ Done — ${processed} listings extracted`);
+}
+
+// Rebuild product_price_stats from extracted data
+// Groups by extracted_product, runs IQR clean, computes median/p25/p75
+async function rebuildProductPriceStats() {
+  try {
+    await pool.query(`
+      INSERT INTO product_price_stats
+        (product_key, display_name, brand, category, variant,
+         sample_count, median_price, p25_price, p75_price,
+         low_price, high_price, updated_at)
+      WITH base AS (
+        SELECT
+          LOWER(REGEXP_REPLACE(extracted_product, '[^a-z0-9]+', '-', 'gi')) AS product_key,
+          extracted_product  AS display_name,
+          extracted_brand    AS brand,
+          extracted_category AS category,
+          extracted_variant  AS variant,
+          COUNT(*)::INT AS raw_count,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
+        FROM listings
+        WHERE extracted_product IS NOT NULL
+          AND extraction_confidence IN ('high', 'medium')
+          AND price > 0
+          AND is_offer_price = FALSE
+          AND price_quality = 'ok'
+          AND is_active = TRUE
+          AND scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY product_key, display_name, brand, category, variant
+        HAVING COUNT(*) >= 3
+      ),
+      fenced AS (
+        SELECT
+          b.product_key, b.display_name, b.brand, b.category, b.variant,
+          b.raw_count,
+          COUNT(l.id)::INT AS clean_count,
+          PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT AS median,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT AS p25_clean,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT AS p75_clean,
+          MIN(l.price)::INT AS low,
+          MAX(l.price)::INT AS high
+        FROM listings l
+        JOIN base b ON LOWER(REGEXP_REPLACE(l.extracted_product, '[^a-z0-9]+', '-', 'gi')) = b.product_key
+        WHERE l.price BETWEEN GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))
+                          AND (b.p75 + 1.5*(b.p75-b.p25))
+          AND l.is_offer_price = FALSE
+          AND l.price_quality = 'ok'
+          AND l.is_active = TRUE
+          AND l.scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY b.product_key, b.display_name, b.brand, b.category, b.variant, b.raw_count
+        HAVING COUNT(l.id) >= 3
+      )
+      SELECT product_key, display_name, brand, category, variant,
+             clean_count, raw_count, median, p25_clean, p75_clean, low, high, NOW()
+      FROM fenced
+      ON CONFLICT (product_key) DO UPDATE SET
+        display_name  = EXCLUDED.display_name,
+        brand         = EXCLUDED.brand,
+        category      = EXCLUDED.category,
+        variant       = EXCLUDED.variant,
+        sample_count  = EXCLUDED.sample_count,
+        median_price  = EXCLUDED.median_price,
+        p25_price     = EXCLUDED.p25_price,
+        p75_price     = EXCLUDED.p75_price,
+        low_price     = EXCLUDED.low_price,
+        high_price    = EXCLUDED.high_price,
+        updated_at    = NOW()
+    `);
+
+    const { rows } = await pool.query('SELECT COUNT(*)::INT AS cnt FROM product_price_stats');
+    console.log(`[ProductStats] ✅ Rebuilt — ${rows[0].cnt} unique products in stats table`);
+  } catch (e) {
+    console.error('[ProductStats] Rebuild failed:', e.message);
+  }
+}
+
+// ── Boot: load all watches from Redis ─────────────────────
+async function loadAllWatches() {
+  // Resolve owner userId so watcher-level plan checks work
+  const ownerUid = await redisGet(K.emailIdx(OWNER_EMAIL));
+  if (ownerUid) { ownerUserId = ownerUid; console.log(`[Boot] Owner account resolved: ${ownerUid}`); }
+
+  const allIds = await redisGet('fr:all-watch-ids') || [];
+  const watches = await Promise.all(allIds.map(getWatch));
+  watchlist = watches.filter(Boolean);
+  console.log(`[Boot] Loaded ${watchlist.length} watch(es)`);
+  watchlist.forEach(w => { if (!w.paused) startWatchTimer(w); });
+}
+
+async function addToGlobalWatchIndex(watchId) {
+  const ids = await redisGet('fr:all-watch-ids') || [];
+  if (!ids.includes(watchId)) ids.push(watchId);
+  await redisSet('fr:all-watch-ids', ids);
+}
+async function removeFromGlobalWatchIndex(watchId) {
+  const ids = await redisGet('fr:all-watch-ids') || [];
+  await redisSet('fr:all-watch-ids', ids.filter(id => id !== watchId));
+}
+
+// Keep Render awake
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
+if (SELF_URL) {
+  setInterval(() => axios.get(SELF_URL + '/').catch(() => {}), 14 * 60 * 1000);
+}
+
+// ── Routes ────────────────────────────────────────────────
+app.get('/', async (req, res) => {
+  const dbSummary = await getDBSummary().catch(() => null);
+  res.json({
+    status:   'ok',
+    redis:    REDIS_URL ? 'connected' : 'not set',
+    database: DATABASE_URL ? 'connected' : 'not set',
+    db: dbSummary ? {
+      totalListings:    dbSummary.total_listings,
+      activeListings:   dbSummary.active_listings,
+      uniqueKeywords:   dbSummary.unique_keywords,
+      uniqueMakes:      dbSummary.unique_makes,
+      lastScraped:      dbSummary.last_scraped,
+    } : null,
+    watches:  watchlist.length,
+    timers:   Object.keys(watchTimers).length,
+    lastScan: lastScanTime,
+    lastScanNewListings: lastScanCount,
+  });
+});
+
+// GET /db/stats — detailed database statistics (owner-gated)
+app.get('/db/stats', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+
+    const [summary, topKeywords, topMakes, recentActivity] = await Promise.all([
+      getDBSummary(),
+      pool.query(`
+        SELECT keyword, sample_count, median_price, p25_price, p75_price, updated_at
+        FROM keyword_price_stats
+        ORDER BY sample_count DESC LIMIT 20
+      `),
+      pool.query(`
+        SELECT make, COUNT(*)::INT AS count, AVG(price)::INT AS avg_price,
+               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+        FROM listings
+        WHERE make IS NOT NULL AND price > 0 AND is_offer_price = FALSE
+        GROUP BY make ORDER BY count DESC LIMIT 15
+      `),
+      pool.query(`
+        SELECT DATE(scraped_at) AS day, COUNT(*)::INT AS listings_scraped
+        FROM listings
+        WHERE scraped_at > NOW() - INTERVAL '14 days'
+        GROUP BY day ORDER BY day DESC
+      `),
+    ]);
+
+    res.json({
+      summary,
+      topKeywords:    topKeywords.rows,
+      topVehicleMakes: topMakes.rows,
+      dailyActivity:  recentActivity.rows,
+    });
+  } catch (e) {
+    console.error('[DB/stats]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /db/comparables?keyword=ps5&limit=20 — raw comparables for a keyword
+app.get('/db/comparables', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, limit } = req.query;
+    if (!keyword) return res.status(400).json({ error: 'keyword required' });
+    const rows = await getDBComparables(keyword, parseInt(limit) || 20);
+    res.json({ keyword, count: rows.length, comparables: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /db/prices?keyword=hilux — price stats for a keyword
+app.get('/db/prices', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, make, model, year, mileage } = req.query;
+    if (make && year) {
+      const stats = await getDBVehicleStats(make, model, parseInt(year), mileage ? parseInt(mileage) : null);
+      return res.json({ found: !!stats, type: 'vehicle', ...stats });
+    }
+    if (!keyword) return res.status(400).json({ error: 'keyword or make+year required' });
+    const stats = await getDBPriceStats(keyword);
+    res.json({ found: !!stats, type: 'keyword', ...stats });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── Auth routes ───────────────────────────────────────────
+app.post('/auth/signup', async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    const existing = await getUserByEmail(email);
+    if (existing) return res.status(409).json({ error: 'An account already exists for this email' });
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const verifyCode   = String(Math.floor(100000 + Math.random() * 900000));
+    const user = {
+      id: uuidv4(),
+      email: email.toLowerCase().trim(),
+      name:  (name || email.split('@')[0]).trim(),
+      passwordHash,
+      createdAt:     new Date().toISOString(),
+      lastSeen:      new Date().toISOString(),
+      plan:          'basic',
+      emailVerified: false,
+      verifyCode,
+      verifyExpiry:  new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    };
+    await saveUser(user);
+    await redisSet(K.emailIdx(user.email), user.id);
+    const token = makeToken(user.id);
+    console.log(`[Auth] Signup: ${user.email}`);
+    verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Verify failed:', e.message));
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user), emailVerified: false } });
+  } catch (e) { console.error('[Signup]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/verify-email', authMiddleware, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Verification code required' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    if (!user.verifyCode || user.verifyCode !== String(code).trim())
+      return res.status(400).json({ error: 'Incorrect code. Please check your email and try again.' });
+    if (new Date(user.verifyExpiry) < new Date())
+      return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    user.emailVerified = true;
+    delete user.verifyCode;
+    delete user.verifyExpiry;
+    await saveUser(user);
+    console.log(`[Auth] Email verified: ${user.email}`);
+    welcomeEmail(user.name, user.email).catch(e => console.error('[Email] Welcome failed:', e.message));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/resend-verify', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    const verifyCode  = String(Math.floor(100000 + Math.random() * 900000));
+    user.verifyCode   = verifyCode;
+    user.verifyExpiry = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    await saveUser(user);
+    verificationEmail(user.name, user.email, verifyCode).catch(e => console.error('[Email] Resend verify failed:', e.message));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    const user = await getUserByEmail(email);
+    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) return res.status(401).json({ error: 'Invalid email or password' });
+    user.lastSeen = new Date().toISOString();
+    await saveUser(user);
+    const token = makeToken(user.id);
+    console.log(`[Auth] Login: ${user.email}`);
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user) } });
+  } catch (e) { console.error('[Login]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/ping', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    user.lastSeen = new Date().toISOString();
+    await saveUser(user);
+    let resumed = 0;
+    const userWatches = watchlist.filter(w => w.userId === req.userId && w.paused);
+    for (const w of userWatches) {
+      w.paused = false;
+      await saveWatch(w);
+      startWatchTimer(w);
+      resumed++;
+    }
+    if (resumed > 0) console.log(`[Ping] Resumed ${resumed} watch(es) for ${user.email}`);
+    res.json({ ok: true, lastSeen: user.lastSeen, resumed });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.get('/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ id: user.id, email: user.email, name: user.name, plan: getEffectivePlan(user), lastSeen: user.lastSeen });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Watchlist routes ──────────────────────────────────────
+app.get('/watchlist', authMiddleware, async (req, res) => {
+  try {
+    const watches = await getUserWatches(req.userId);
+    res.json(watches);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/watchlist', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, maxPrice, minPrice, pushoverToken, pushoverUser, plan, name, speed } = req.body;
+    if (!keyword || keyword.trim().length < 2)
+      return res.status(400).json({ error: 'Keyword required' });
+    const user = await getUser(req.userId);
+    const planLimit = PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)];
+    const existingWatches = await getUserWatches(req.userId);
+    if (!isOwner(user) && existingWatches.length >= planLimit)
+      return res.status(403).json({ error: 'Watchlist limit reached for your plan', plan: getEffectivePlan(user), limit: planLimit });
+    const watchPlan = plan || (speed === 'premium' ? 'premium' : 'basic');
+    const rawExclude = req.body.excludeWords || [];
+    const excludeWords = Array.isArray(rawExclude)
+      ? rawExclude.map(w => w.toLowerCase().trim()).filter(Boolean)
+      : [];
+
+    const item = {
+      id: uuidv4(),
+      userId:   req.userId,
+      keyword:  keyword.trim().toLowerCase(),
+      name:     name || keyword.trim(),
+      maxPrice: maxPrice ? parseInt(maxPrice) : null,
+      minPrice: minPrice ? parseInt(minPrice) : null,
+      location: req.body.location || null,
+      lat:      req.body.lat    ? parseFloat(req.body.lat)  : null,
+      lng:      req.body.lng    ? parseFloat(req.body.lng)  : null,
+      radius:   req.body.radius ? parseInt(req.body.radius) : 50,
+      plan:     watchPlan,
+      pushoverToken: pushoverToken || null,
+      pushoverUser:  pushoverUser  || null,
+      excludeWords,
+      // Vehicle-specific filters
+      minYear:       req.body.minYear       ? parseInt(req.body.minYear)       : null,
+      maxYear:       req.body.maxYear       ? parseInt(req.body.maxYear)       : null,
+      minKms:        req.body.minKms        ? parseInt(req.body.minKms)        : null,
+      maxKms:        req.body.maxKms        ? parseInt(req.body.maxKms)        : null,
+      transmission:  req.body.transmission  ? req.body.transmission.trim()     : null, // 'auto', 'manual', or null
+      paused:    false,
+      addedAt:   new Date().toISOString(),
+      lastScanned: null,
+    };
+    await saveWatch(item);
+    await addWatchId(req.userId, item.id);
+    await addToGlobalWatchIndex(item.id);
+    watchlist.push(item);
+    startWatchTimer(item);
+    console.log(`[Watch] Added "${item.keyword}" for user ${req.userId}`);
+    res.json(item);
+    // Initial backfill — runs once when watch is added
+    scanWatchItem(item, { initialScan: true })
+      .then(n => console.log(`[InitialScan] "${item.keyword}" → ${n} listing(s)`))
+      .catch(e => console.error(`[InitialScan] Error:`, e.message));
+  } catch (e) { console.error('[AddWatch]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// PATCH /watchlist/:id — update watch filters
+app.patch('/watchlist/:id', authMiddleware, async (req, res) => {
+  try {
+    const watch = await getWatch(req.params.id);
+    if (!watch || watch.userId !== req.userId)
+      return res.status(404).json({ error: 'Not found' });
+
+    const { excludeWords, minYear, maxYear, minKms, maxKms, transmission, minPrice, maxPrice } = req.body;
+
+    if (Array.isArray(excludeWords))
+      watch.excludeWords = excludeWords.map(w => w.toLowerCase().trim()).filter(Boolean);
+    if (minPrice  !== undefined) watch.minPrice  = minPrice  ? parseInt(minPrice)  : null;
+    if (maxPrice  !== undefined) watch.maxPrice  = maxPrice  ? parseInt(maxPrice)  : null;
+    if (minYear   !== undefined) watch.minYear   = minYear   ? parseInt(minYear)   : null;
+    if (maxYear   !== undefined) watch.maxYear   = maxYear   ? parseInt(maxYear)   : null;
+    if (minKms    !== undefined) watch.minKms    = minKms    ? parseInt(minKms)    : null;
+    if (maxKms    !== undefined) watch.maxKms    = maxKms    ? parseInt(maxKms)    : null;
+    if (transmission !== undefined) watch.transmission = transmission ? transmission.trim() : null;
+
+    await saveWatch(watch);
+    const idx = watchlist.findIndex(w => w.id === req.params.id);
+    if (idx !== -1) watchlist[idx] = { ...watchlist[idx], ...watch };
+
+    res.json({ ok: true, watch });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/watchlist/:id', authMiddleware, async (req, res) => {
+  try {
+    const watch = await getWatch(req.params.id);
+    if (!watch || watch.userId !== req.userId)
+      return res.status(404).json({ error: 'Not found' });
+    const keyword = watch.keyword;
+    stopWatchTimer(req.params.id);
+    await deleteWatch(req.params.id);
+    await removeWatchId(req.userId, req.params.id);
+    await removeFromGlobalWatchIndex(req.params.id);
+    watchlist = watchlist.filter(w => w.id !== req.params.id);
+
+    // Clear blocked listings for this keyword so they show fresh if re-added
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    const remaining = blocked.filter(l => l.keyword !== keyword);
+    await redisSet(K.blocked(req.userId), remaining);
+
+    // Clear seen cache entries for this keyword so re-adding starts truly fresh
+    const seen = await getUserSeen(req.userId);
+    const prefix = `${keyword}:`;
+    const prunedSeen = Object.fromEntries(Object.entries(seen).filter(([k]) => !k.startsWith(prefix)));
+    await saveUserSeen(req.userId, prunedSeen, { merge: false }); // replace — we're removing entries
+    const clearedSeen = Object.keys(seen).length - Object.keys(prunedSeen).length;
+    console.log(`[Watch] Deleted "${keyword}" — cleared ${blocked.length - remaining.length} blocked, ${clearedSeen} seen entries`);
+
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Listings routes ───────────────────────────────────────
+app.get('/listings', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, since } = req.query;
+    let result = await getUserListings(req.userId);
+    if (keyword) result = result.filter(l => l.keyword === keyword);
+    if (since) {
+      const sinceMs = new Date(since).getTime();
+      if (!isNaN(sinceMs)) result = result.filter(l => new Date(l.foundAt).getTime() > sinceMs);
+    }
+    result = [...result].sort((a, b) => {
+        // Push listings with unknown dates to the bottom
+        return new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt);
+      });
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/listings', authMiddleware, async (req, res) => {
+  try {
+    await saveUserListings(req.userId, []);
+    await saveUserSeen(req.userId, {}, { merge: false }); // full reset — replace, don't merge
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /listings/blocked — get listings that were filtered out
+app.get('/listings/blocked', authMiddleware, async (req, res) => {
+  try {
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    res.json(blocked);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /listings/unblock — move a blocked listing back into the feed
+app.post('/listings/unblock', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ error: 'id required' });
+    const blocked = await redisGet(K.blocked(req.userId)) || [];
+    const listing = blocked.find(l => l.id === id);
+    if (!listing) return res.status(404).json({ error: 'Not found' });
+    // Remove from blocked
+    await redisSet(K.blocked(req.userId), blocked.filter(l => l.id !== id));
+    // Add to user listings
+    const listings = await getUserListings(req.userId);
+    if (!listings.find(l => l.id === id)) {
+      listings.unshift({ ...listing, foundAt: new Date().toISOString() });
+      listings.sort((a, b) => {
+        // Push listings with unknown dates to the bottom
+        return new Date(b.foundAt || b.listedAt) - new Date(a.foundAt || a.listedAt);
+      });
+      await saveUserListings(req.userId, listings);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /listings/remove — remove specific listings by ID (irrelevant ones flagged by AI)
+app.post('/listings/remove', authMiddleware, async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids)) return res.status(400).json({ error: 'ids array required' });
+    const listings = await getUserListings(req.userId);
+    const filtered = listings.filter(l => !ids.includes(l.id));
+    await saveUserListings(req.userId, filtered);
+    // Don't mark as permanently seen — if user re-adds the keyword they should see fresh listings
+    console.log(`[Filter] Removed ${ids.length} irrelevant listing(s) for user ${req.userId}`);
+    res.json({ ok: true, removed: ids.length });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Price cache route — lets frontend check own scan history before triggering AI ──
+app.get('/prices', authMiddleware, async (req, res) => {
+  try {
+    const { keyword } = req.query;
+    if (!keyword) return res.status(400).json({ error: 'keyword required' });
+    const priceData = await getPriceCacheForKeyword(keyword);
+    console.log('[Prices] Result for', keyword, ':', priceData ? 'found (' + priceData.count + ' prices, median $' + priceData.median + ')' : 'not found');
+    if (!priceData) return res.json({ found: false, keyword });
+    res.json({ found: true, keyword, ...priceData });
+  } catch (e) { console.error('[Prices] Error:', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /prices/vehicle?make=Toyota&model=Camry&year=2019&mileage=72000
+// Returns VPX market stats for a specific vehicle cohort
+app.get('/prices/vehicle', authMiddleware, async (req, res) => {
+  try {
+    const { make, model, year, mileage } = req.query;
+    if (!make || !year) return res.status(400).json({ error: 'make and year required' });
+    const resolvedModel = model || null;
+    const stats = await getDBVehicleStats(make, resolvedModel, parseInt(year), mileage ? parseInt(mileage) : null);
+    if (!stats) return res.json({ found: false, make, model, year });
+    res.json({ found: true, ...stats });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Appraisal route — limit check only, always defers to AI ──
+// POST /appraise  { keyword, price }
+app.post('/appraise', authMiddleware, async (req, res) => {
+  try {
+    const { keyword, price } = req.body;
+    if (!keyword || !price) return res.status(400).json({ error: 'keyword and price required' });
+    const user = await _getUserCached(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today = new Date().toISOString().slice(0, 10);
+    if (user.appraisalDate !== today) { user.appraisalsToday = 0; user.appraisalDate = today; }
+    const limit = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
+    if (limit !== Infinity && limit < 999 && user.appraisalsToday >= limit)
+      return res.status(429).json({ error: 'Daily appraisal limit reached', limit, plan: getEffectivePlan(user) });
+    res.json({ found: false, usedCache: false });
+  } catch (e) { console.error('[Appraise]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Misc routes ───────────────────────────────────────────
+app.get('/proxy-image', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  try {
+    const response = await axios.get(url, {
+      responseType: 'arraybuffer', timeout: 10000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
+        'Referer': 'https://www.facebook.com/'
+      }
+    });
+    res.json({
+      base64: Buffer.from(response.data).toString('base64'),
+      mediaType: response.headers['content-type'] || 'image/jpeg'
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/scan/now', authMiddleware, async (req, res) => {
+  res.json({ ok: true, message: 'Scan started' });
+  const watches = watchlist.filter(w => w.userId === req.userId && !w.paused);
+  for (const w of watches) {
+    await scanWatchItem(w).catch(e => console.error(`[Scan/now]`, e.message));
+    await sleep(500);
+  }
+});
+
+app.post('/scan/test', async (req, res) => {
+  const { keyword } = req.body;
+  if (!keyword) return res.status(400).json({ error: 'keyword required' });
+  try {
+    const found = await scrapeKeyword(keyword, {});
+    res.json({ keyword, count: found.length, listings: found });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Global Deals ─────────────────────────────────────────
+// Rebuilds every 90 min — no SociaVault credits used.
+// Pulls listings from the DB that have a known median (so we can compute % off),
+// filters to active + real-price, scores by discount depth, adds small jitter.
+
+async function rebuildGlobalDeals() {
+  console.log('[Deals] Rebuilding deals:global cache...');
+  try {
+    // Pull recent listings with a known keyword median so we can compute % off.
+    // Only real prices, active, not spam/damage, scraped within 14 days.
+    // ── Step 1: try to get deals using keyword_price_stats (IQR-cleaned medians) ──
+    // Falls back to a live per-keyword median if stats table isn't populated yet.
+    let rows;
+    const statsCheck = await pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats');
+    const hasStats = statsCheck.rows[0].cnt >= 5;
+
+    if (hasStats) {
+      // Normal path — join against pre-built stats table
+      ({ rows } = await pool.query(`
+        SELECT
+          l.listing_id,
+          l.title,
+          l.price,
+          l.image_url,
+          l.url,
+          l.location,
+          l.state,
+          l.keyword,
+          l.category,
+          l.make,
+          l.model,
+          l.year,
+          l.kms       AS mileage,
+          l.transmission,
+          l.fuel_type AS "fuelType",
+          l.listed_at AS "listedAt",
+          l.img_condition,
+          l.img_matches_keyword,
+          k.median_price AS median
+        FROM listings l
+        JOIN keyword_price_stats k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE
+          AND l.is_offer_price = FALSE
+          AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND k.median_price > 0
+          AND k.sample_count >= 4
+          AND l.price < k.median_price * 0.92
+          AND (k.median_price - l.price) >= 100
+        ORDER BY (k.median_price - l.price)::float / k.median_price DESC
+        LIMIT 500
+      `));
+    } else {
+      // Fallback — compute live medians on the fly per keyword so deals work
+      // immediately after seed scan before nightly cron has run
+      console.log('[Deals] keyword_price_stats not ready — using live medians');
+      ({ rows } = await pool.query(`
+        WITH kmedians AS (
+          SELECT
+            keyword,
+            COUNT(*)::INT AS cnt,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+          FROM listings
+          WHERE price > 0
+            AND is_offer_price = FALSE
+            AND is_active = TRUE
+            AND scraped_at > NOW() - INTERVAL '30 days'
+            AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          GROUP BY keyword
+          HAVING COUNT(*) >= 4
+        )
+        SELECT
+          l.listing_id,
+          l.title,
+          l.price,
+          l.image_url,
+          l.url,
+          l.location,
+          l.state,
+          l.keyword,
+          l.category,
+          l.make,
+          l.model,
+          l.year,
+          l.kms       AS mileage,
+          l.transmission,
+          l.fuel_type AS "fuelType",
+          l.listed_at AS "listedAt",
+          l.img_condition,
+          l.img_matches_keyword,
+          k.median_price AS median
+        FROM listings l
+        JOIN kmedians k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE
+          AND l.is_offer_price = FALSE
+          AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND l.price < k.median_price * 0.92
+          AND (k.median_price - l.price) >= 100
+        ORDER BY (k.median_price - l.price)::float / k.median_price DESC
+        LIMIT 500
+      `));
+    }
+
+    // Compute pctOff and base score
+    const deals = rows.map(r => {
+      const pctOff   = Math.round(((r.median - r.price) / r.median) * 100);
+      // base deal score 0-100 — pure discount depth
+      const baseScore = Math.min(100, pctOff * 1.8);
+      return {
+        id:           r.listing_id,
+        title:        r.title,
+        price:        r.price,
+        median:       r.median,
+        pctOff,
+        image:        r.image_url || null,
+        url:          r.url || null,
+        location:     r.location || null,
+        state:        r.state || null,
+        keyword:      r.keyword || null,
+        category:     r.category || 'general',
+        make:         r.make || null,
+        model:        r.model || null,
+        year:         r.year || null,
+        mileage:      r.mileage || null,
+        transmission: r.transmission || null,
+        fuelType:     r.fuelType || null,
+        listedAt:     r.listedAt ? r.listedAt.toISOString() : null,
+        imgCondition: r.img_condition || null,
+        imgVerified:  r.img_matches_keyword !== false,
+        baseScore,
+        // Tint based on actual dollar saving + image condition.
+        // % off alone is misleading — a $5 item 60% off is worthless.
+        // Damaged items are capped at yellow even if the saving is huge.
+        const saving = r.median - r.price;
+        const isDamaged = r.img_condition === 'damaged' || r.img_condition === 'poor';
+        const tintRaw = saving >= 500 && pctOff >= 20 ? 'rainbow'
+                      : saving >= 200 && pctOff >= 15 ? 'green'
+                      : saving >= 100                 ? 'yellow'
+                      :                                'grey';
+        tint: isDamaged && tintRaw === 'rainbow' ? 'green'
+            : isDamaged && tintRaw === 'green'   ? 'yellow'
+            : tintRaw,
+      };
+    });
+
+    await redisSet('deals:global', { deals, builtAt: new Date().toISOString() }, 6000); // 100 min TTL
+    console.log(`[Deals] Rebuilt deals:global — ${deals.length} deals`);
+  } catch (e) {
+    console.error('[Deals] Rebuild failed:', e.message);
+  }
+}
+
+// Rebuild deals on boot immediately
+setTimeout(() => rebuildGlobalDeals().catch(() => {}), 15000);
+
+// After seed scan completes, run a quick stats pass so deals are populated right away
+// (full nightly cron also runs at 2am — this just ensures first-boot experience works)
+async function quickStatsAndDealsRebuild() {
+  try {
+    console.log('[Boot] Running quick keyword stats pass...');
+    await pool.query(`
+      INSERT INTO keyword_price_stats
+        (keyword, raw_count, sample_count, median_price, p25_price, p75_price,
+         floor_price, ceiling_price, updated_at)
+      WITH base AS (
+        SELECT keyword,
+          COUNT(*)::INT AS raw_count,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25_raw,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75_raw
+        FROM listings
+        WHERE price > 0 AND is_offer_price = FALSE AND is_active = TRUE
+          AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+        GROUP BY keyword HAVING COUNT(*) >= 4
+      )
+      SELECT
+        b.keyword,
+        b.raw_count,
+        COUNT(l.id)::INT,
+        PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT,
+        GREATEST(0, b.p25_raw - 1.5*(b.p75_raw - b.p25_raw))::INT,
+        (b.p75_raw + 1.5*(b.p75_raw - b.p25_raw))::INT,
+        NOW()
+      FROM listings l
+      JOIN base b ON b.keyword = l.keyword
+      WHERE l.price BETWEEN GREATEST(0, b.p25_raw - 1.5*(b.p75_raw-b.p25_raw))
+                        AND (b.p75_raw + 1.5*(b.p75_raw-b.p25_raw))
+        AND l.price > 0 AND l.is_offer_price = FALSE AND l.is_active = TRUE
+        AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+      GROUP BY b.keyword, b.raw_count, b.p25_raw, b.p75_raw
+      HAVING COUNT(l.id) >= 4
+      ON CONFLICT (keyword) DO UPDATE SET
+        raw_count    = EXCLUDED.raw_count,
+        sample_count = EXCLUDED.sample_count,
+        median_price = EXCLUDED.median_price,
+        p25_price    = EXCLUDED.p25_price,
+        p75_price    = EXCLUDED.p75_price,
+        floor_price  = EXCLUDED.floor_price,
+        ceiling_price= EXCLUDED.ceiling_price,
+        updated_at   = NOW()
+    `);
+    const { rows } = await pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats');
+    console.log(`[Boot] Quick stats done — ${rows[0].cnt} keywords in stats table`);
+    await rebuildGlobalDeals();
+  } catch (e) {
+    console.error('[Boot] Quick stats/deals rebuild failed:', e.message);
+  }
+}
+
+// Run quick stats rebuild 5 minutes after boot (gives seed scan time to fill some data)
+setTimeout(() => quickStatsAndDealsRebuild(), 5 * 60 * 1000);
+cron.schedule('0 */2 * * *', () => rebuildGlobalDeals().catch(e => console.error('[Deals Cron]', e.message)));
+
+// ── Seed Keyword Scanner ──────────────────────────────────
+// Scans a broad list of keywords to build the price database independently
+// of user watchlists. 1 credit per keyword per scan. Staggered so we don't
+// hammer all keywords at once — splits into 6 batches across 6 hours.
+// Full rotation = 6 hours. At ~150 keywords that's 150 credits per rotation.
+
+const SEED_KEYWORDS = [
+  // ── Phones ───────────────────────────────────────────────
+  'iphone 16 pro', 'iphone 16', 'iphone 15 pro', 'iphone 15', 'iphone 14 pro',
+  'iphone 14', 'iphone 13', 'iphone 12', 'iphone 11', 'iphone se',
+  'samsung galaxy s25', 'samsung galaxy s24', 'samsung galaxy s23', 'samsung galaxy s22',
+  'samsung galaxy a55', 'samsung galaxy a54', 'google pixel 9', 'google pixel 8',
+  'oneplus 12', 'oppo find x8',
+
+  // ── Laptops & Computers ──────────────────────────────────
+  'macbook pro m3', 'macbook pro m2', 'macbook pro m1', 'macbook air m2', 'macbook air m1',
+  'macbook air m3', 'imac m3', 'imac m1',
+  'dell xps 15', 'dell xps 13', 'hp spectre x360', 'hp envy laptop',
+  'lenovo thinkpad', 'lenovo yoga', 'asus rog laptop', 'asus zenbook',
+  'surface pro', 'surface laptop', 'razer blade laptop', 'acer swift laptop',
+  'gaming pc', 'desktop computer',
+
+  // ── Tablets ──────────────────────────────────────────────
+  'ipad pro', 'ipad air', 'ipad mini', 'samsung galaxy tab s9', 'samsung galaxy tab s8',
+
+  // ── Gaming ───────────────────────────────────────────────
+  'ps5 console', 'ps5 digital', 'ps4 pro', 'ps4 console',
+  'xbox series x', 'xbox series s', 'xbox one x',
+  'nintendo switch oled', 'nintendo switch', 'nintendo switch lite',
+  'steam deck', 'meta quest 3', 'meta quest 2',
+  'gaming chair', 'gaming monitor',
+
+  // ── TVs & Audio ───────────────────────────────────────────
+  'samsung 65 inch tv', 'samsung 55 inch tv', 'lg oled tv', 'sony bravia tv',
+  'lg 65 tv', 'samsung qled tv', 'tcl tv', 'hisense tv',
+  'sonos speaker', 'jbl speaker', 'bose speaker', 'marshall speaker',
+  'sony wh1000xm5', 'airpods pro', 'airpods max', 'bose quietcomfort',
+
+  // ── Power Tools ──────────────────────────────────────────
+  'milwaukee m18 drill', 'milwaukee m18 impact driver', 'milwaukee m18 grinder',
+  'milwaukee m18 circular saw', 'milwaukee m18 multi tool', 'milwaukee m18 jigsaw',
+  'milwaukee m18 reciprocating saw', 'milwaukee m18 kit', 'milwaukee m12',
+  'dewalt 18v drill', 'dewalt 18v impact driver', 'dewalt 18v grinder',
+  'dewalt 18v circular saw', 'dewalt xr kit',
+  'makita 18v drill', 'makita 18v impact driver', 'makita 18v grinder',
+  'makita 18v circular saw', 'makita combo kit',
+  'ryobi 18v drill', 'ryobi 18v kit', 'ryobi one plus',
+  'bosch 18v drill', 'hikoki drill', 'festool sander', 'festool track saw',
+  'air compressor', 'bench grinder', 'angle grinder', 'drop saw',
+  'table saw', 'thicknesser', 'router table', 'laser level',
+
+  // ── Outdoor & Garden ─────────────────────────────────────
+  'husqvarna mower', 'honda mower', 'ride on mower', 'zero turn mower',
+  'ego lawn mower', 'greenworks mower', 'lawn mower petrol',
+  'husqvarna chainsaw', 'stihl chainsaw', 'echo chainsaw',
+  'pressure washer', 'karcher pressure washer', 'leaf blower',
+  'garden trailer', 'wood chipper', 'post hole digger',
+
+  // ── Camping & Outdoors ────────────────────────────────────
+  'engel fridge', 'waeco fridge', 'dometic fridge', 'arb fridge',
+  'camp trailer', 'roof top tent', 'swag', 'camping trailer',
+  'weber bbq', 'traeger bbq', 'bbq grill', 'kamado bbq',
+  'kayak', 'canoe', 'stand up paddle board', 'inflatable kayak',
+  'fishing rod', 'fishing reel', 'fishing kayak',
+  'hiking boots', 'tent', 'sleeping bag',
+
+  // ── Vehicles ─────────────────────────────────────────────
+  'toyota hilux', 'toyota landcruiser 200', 'toyota landcruiser 79',
+  'toyota prado', 'toyota rav4', 'toyota camry', 'toyota corolla',
+  'ford ranger', 'ford everest', 'ford mustang',
+  'holden commodore', 'holden colorado',
+  'nissan patrol', 'nissan navara', 'nissan x trail',
+  'mitsubishi triton', 'mitsubishi pajero', 'mitsubishi outlander',
+  'isuzu dmax', 'isuzu mu x',
+  'mazda cx5', 'mazda bt50', 'mazda 3',
+  'subaru forester', 'subaru outback', 'subaru wrx',
+  'hyundai tucson', 'hyundai i30', 'kia sportage',
+  'jeep wrangler', 'jeep gladiator',
+  'bmw 3 series', 'mercedes c class', 'audi a4',
+  'motorcycle', 'dirt bike', 'trail bike', 'enduro bike',
+  'honda cbr', 'yamaha r1', 'kawasaki ninja', 'suzuki gsxr',
+  'caravan', 'camper trailer', 'pop top caravan',
+
+  // ── Vehicles — Parts & Accessories ───────────────────────
+  'bull bar', 'winch', 'lift kit', 'snorkel', 'roof rack',
+  'drawer system', 'dual battery system',
+
+  // ── Bikes & Scooters ─────────────────────────────────────
+  'mountain bike', 'road bike', 'bmx bike', 'electric bike',
+  'trek bike', 'specialized bike', 'giant bike', 'scott bike',
+  'electric scooter', 'segway ninebot',
+
+  // ── Furniture ─────────────────────────────────────────────
+  'couch lounge', 'sectional sofa', 'leather couch', '3 seater lounge',
+  'dining table', 'dining chairs', 'coffee table', 'tv unit',
+  'queen bed frame', 'king bed frame', 'bedside table',
+  'office desk', 'standing desk', 'ergonomic chair', 'office chair',
+  'wardrobe', 'chest of drawers', 'bookshelf',
+
+  // ── Baby & Kids ───────────────────────────────────────────
+  'pram stroller', 'baby cot', 'baby capsule', 'baby carrier',
+  'kids bike', 'trampoline', 'swing set', 'lego',
+
+  // ── Sports & Fitness ──────────────────────────────────────
+  'treadmill', 'rowing machine', 'spin bike', 'exercise bike',
+  'bowflex', 'home gym', 'barbell set', 'dumbbells',
+  'squat rack', 'bench press', 'weight plates',
+  'golf clubs', 'callaway driver', 'titleist irons',
+  'surfboard', 'skateboard', 'snowboard',
+  'tennis racket', 'basketball hoop',
+
+  // ── Musical Instruments ────────────────────────────────────
+  'electric guitar', 'acoustic guitar', 'fender stratocaster', 'gibson les paul',
+  'fender telecaster', 'marshall amp', 'fender amp',
+  'drum kit', 'electronic drums', 'keyboard piano', 'yamaha keyboard',
+  'bass guitar', 'ukulele',
+
+  // ── Photography ───────────────────────────────────────────
+  'sony a7', 'sony a6', 'canon eos r', 'canon 5d', 'nikon z6', 'nikon d750',
+  'fujifilm xt', 'fujifilm x100', 'drone dji', 'dji mini', 'dji mavic',
+  'camera lens', 'gopro',
+
+  // ── Appliances ─────────────────────────────────────────────
+  'thermomix', 'kitchenaid mixer', 'breville coffee machine',
+  'delonghi coffee machine', 'nespresso machine', 'coffee grinder',
+  'dyson vacuum', 'roomba', 'dyson v11', 'dyson v12', 'dyson v15',
+  'washing machine', 'dryer', 'dishwasher', 'fridge freezer',
+  'air fryer', 'instant pot', 'ninja foodi',
+
+  // ── Tech Accessories ──────────────────────────────────────
+  'monitor 27 inch', 'monitor 32 inch', 'ultrawide monitor',
+  'mechanical keyboard', 'logitech mx keys',
+  'standing desk converter', 'webcam',
+
+  // ── Collectibles & Fashion ────────────────────────────────
+  'vintage levi jeans', 'vintage adidas', 'nike air jordan',
+  'rolex watch', 'omega watch', 'seiko watch',
+  'vintage camera', 'vinyl records', 'trading cards',
+
+  // ── Trade & Industrial ────────────────────────────────────
+  'generator', 'inverter generator', 'honda generator', 'yamaha generator',
+  'welder', 'mig welder', 'tig welder',
+  'scaffolding', 'trailer', 'box trailer', 'car trailer', 'boat trailer',
+  'forklift', 'pallet jack', 'scissor lift',
+];
+
+// How many keywords per batch — spread evenly across 6 hourly slots
+const SEED_BATCH_SIZE = Math.ceil(SEED_KEYWORDS.length / 6);
+let _seedBatchIndex = 0;
+
+async function runSeedBatch() {
+  const start = _seedBatchIndex * SEED_BATCH_SIZE;
+  const batch = SEED_KEYWORDS.slice(start, start + SEED_BATCH_SIZE);
+  _seedBatchIndex = (_seedBatchIndex + 1) % 6;
+
+  console.log(`[SeedScan] Batch ${_seedBatchIndex}/${6} — scanning ${batch.length} keywords (starting at index ${start})`);
+
+  let saved = 0;
+  for (const keyword of batch) {
+    try {
+      // Use shared scan cache — if recently cached, costs 0 credits
+      const cached = await redisGet(K.sharedScan(keyword));
+      if (cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
+        console.log(`[SeedScan] "${keyword}" — cache hit, skipping`);
+        continue;
+      }
+
+      const raw = await scrapeKeyword(keyword, {
+        city: 'Melbourne', lat: -37.8136, lng: 144.9631, radius: 100,
+      });
+
+      if (!Array.isArray(raw) || !raw.length) continue;
+
+      // Cache for shared use by user watchlists
+      await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
+
+      // Save to DB for price stats
+      for (const item of raw) {
+        try { await upsertListingToDB({ ...item, keyword }); } catch (e) { /* skip bad rows */ }
+      }
+
+      saved += raw.length;
+      console.log(`[SeedScan] "${keyword}" → ${raw.length} listings saved`);
+
+      // Small delay between keywords — be gentle on SociaVault
+      await new Promise(r => setTimeout(r, 800));
+    } catch (e) {
+      console.error(`[SeedScan] "${keyword}" failed:`, e.message);
+    }
+  }
+  console.log(`[SeedScan] Batch done — ${saved} total listings saved`);
+}
+
+// One-time full scan on boot — scans all seed keywords once, then stops.
+// Re-deploy to trigger again. No recurring cron.
+async function runFullSeedScanOnce() {
+  console.log(`[SeedScan] Starting one-time full scan of ${SEED_KEYWORDS.length} keywords...`);
+  let totalSaved = 0;
+  for (let i = 0; i < SEED_KEYWORDS.length; i++) {
+    const keyword = SEED_KEYWORDS[i];
+    try {
+      const cached = await redisGet(K.sharedScan(keyword));
+      if (cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
+        console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" — cache hit, skipping`);
+        continue;
+      }
+      const raw = await scrapeKeyword(keyword, {
+        city: 'Melbourne', lat: -37.8136, lng: 144.9631, radius: 100,
+      });
+      if (!Array.isArray(raw) || !raw.length) {
+        console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" — 0 results`);
+        continue;
+      }
+      await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
+      for (const item of raw) {
+        try { await upsertListingToDB({ ...item, keyword }); } catch (e) { /* skip bad rows */ }
+      }
+      totalSaved += raw.length;
+      console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" → ${raw.length} listings`);
+      await new Promise(r => setTimeout(r, 600));
+    } catch (e) {
+      console.error(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" failed:`, e.message);
+    }
+  }
+  console.log(`[SeedScan] ✅ Done — ${totalSaved} listings saved across ${SEED_KEYWORDS.length} keywords`);
+}
+
+setTimeout(() => runFullSeedScanOnce().catch(e => console.error('[SeedScan Boot]', e.message)), 30000);
+
+// Admin endpoint to check seed scan status
+app.get('/admin/seed-status', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    const counts = await Promise.all(SEED_KEYWORDS.map(async kw => {
+      const cached = await redisGet(K.sharedScan(kw));
+      return { keyword: kw, cached: !!cached, cachedAt: cached?.scannedAt || null, count: cached?.listings?.length || 0 };
+    }));
+    const dbCount = await pool.query('SELECT keyword, COUNT(*)::INT as n FROM listings WHERE keyword = ANY($1) GROUP BY keyword ORDER BY n DESC', [SEED_KEYWORDS]);
+    res.json({ total: SEED_KEYWORDS.length, batchSize: SEED_BATCH_SIZE, nextBatch: _seedBatchIndex, cache: counts, db: dbCount.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin endpoint to manually re-trigger the full one-time scan
+app.post('/admin/seed-scan-all', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    res.json({ ok: true, message: `Starting full scan of ${SEED_KEYWORDS.length} keywords in background` });
+    runFullSeedScanOnce().catch(e => console.error('[SeedScan Manual]', e.message));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: full deals pipeline diagnostic
+app.get('/admin/deals-debug', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+
+    const [
+      totalListings,
+      activeListings,
+      inPricePool,
+      withImages,
+      statsCount,
+      dealsCache,
+      qualityBreakdown,
+      sampleDeals,
+    ] = await Promise.all([
+      pool.query('SELECT COUNT(*)::INT AS n FROM listings'),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE is_active = TRUE"),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE in_price_pool = TRUE AND is_active = TRUE"),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE image_url IS NOT NULL AND image_url != ''"),
+      pool.query('SELECT COUNT(*)::INT AS n FROM keyword_price_stats'),
+      redisGet('deals:global'),
+      pool.query("SELECT price_quality, COUNT(*)::INT AS n FROM listings GROUP BY price_quality ORDER BY n DESC"),
+      // Try the exact deals query and return first 5 results
+      pool.query(`
+        WITH kmedians AS (
+          SELECT keyword,
+            COUNT(*)::INT AS cnt,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+          FROM listings
+          WHERE price > 0 AND is_offer_price = FALSE AND is_active = TRUE
+            AND scraped_at > NOW() - INTERVAL '30 days'
+            AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          GROUP BY keyword HAVING COUNT(*) >= 4
+        )
+        SELECT l.title, l.price, l.keyword, k.median_price,
+               (k.median_price - l.price) AS saving,
+               ROUND(((k.median_price - l.price)::float / k.median_price * 100)::numeric, 1) AS pct_off
+        FROM listings l
+        JOIN kmedians k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE AND l.is_offer_price = FALSE AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND l.price < k.median_price * 0.92
+          AND (k.median_price - l.price) >= 100
+        ORDER BY saving DESC LIMIT 5
+      `),
+    ]);
+
+    res.json({
+      db: {
+        total_listings:   totalListings.rows[0].n,
+        active_listings:  activeListings.rows[0].n,
+        in_price_pool:    inPricePool.rows[0].n,
+        with_images:      withImages.rows[0].n,
+        keyword_stats_rows: statsCount.rows[0].n,
+        quality_breakdown: qualityBreakdown.rows,
+      },
+      deals_cache: {
+        exists:    !!(dealsCache?.deals),
+        count:     dealsCache?.deals?.length || 0,
+        built_at:  dealsCache?.builtAt || null,
+      },
+      sample_qualifying_deals: sampleDeals.rows,
+      diagnosis: !totalListings.rows[0].n
+        ? '❌ No listings in DB at all — seed scan hasnt run or failed'
+        : !activeListings.rows[0].n
+        ? '❌ No active listings — check is_active flag on upsert'
+        : !statsCount.rows[0].n
+        ? '⚠️ keyword_price_stats empty — quickStats rebuild hasnt run yet (fires 5min after boot)'
+        : !sampleDeals.rows.length
+        ? '⚠️ No qualifying deals — not enough price spread yet, need more listings per keyword'
+        : dealsCache?.deals?.length
+        ? `✅ ${dealsCache.deals.length} deals in cache — check frontend auth/premium flag`
+        : '⚠️ Deals qualify in DB but cache is empty — trigger /admin/deals-rebuild',
+    });
+  } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+});
+
+// Admin: force rebuild deals cache right now
+app.post('/admin/deals-rebuild', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    await quickStatsAndDealsRebuild();
+    const cache = await redisGet('deals:global');
+    res.json({ ok: true, deals_in_cache: cache?.deals?.length || 0, built_at: cache?.builtAt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /deals — personalised deal feed for premium users
+// Scores deals against the user's watchlist keywords/makes with jitter so order shifts each visit.
+app.get('/deals', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    if (getEffectivePlan(user) !== 'premium') return res.status(403).json({ error: 'premium_required' });
+
+    const cached = await redisGet('deals:global');
+    if (!cached || !cached.deals) return res.json({ deals: [], builtAt: null });
+
+    const watches    = await getUserWatches(req.userId);
+    const watchKeys  = watches.map(w => (w.keyword || '').toLowerCase().trim()).filter(Boolean);
+    const watchMakes = watches.map(w => (w.keyword || '').toLowerCase().trim())
+                              .filter(kw => kw.split(' ').length <= 2); // crude make heuristic
+
+    // Score each deal — watched keywords/makes bubble up; random jitter per request
+    const scored = cached.deals.map(d => {
+      let boost = 0;
+      const kw = (d.keyword || '').toLowerCase();
+      const make = (d.make || '').toLowerCase();
+      // Boost for exact keyword match
+      if (watchKeys.some(wk => kw === wk || kw.includes(wk) || wk.includes(kw))) boost += 40;
+      // Boost for make match
+      if (make && watchMakes.some(wm => make.includes(wm) || wm.includes(make))) boost += 20;
+      // Small random jitter — makes the feed feel alive on refresh
+      const jitter = (Math.random() - 0.5) * 18;
+      return { ...d, _score: d.baseScore + boost + jitter, _watched: boost > 0 };
+    });
+
+    scored.sort((a, b) => b._score - a._score);
+
+    // Remove internal scoring fields before sending
+    const deals = scored.map(({ _score, baseScore, ...d }) => d);
+
+    res.json({ deals, builtAt: cached.builtAt });
+  } catch (e) {
+    console.error('[Deals]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── Stripe routes ─────────────────────────────────────────
+app.post('/stripe/create-checkout', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const { priceId } = req.body;
+    if (!priceId || !Object.values(PRICE_IDS).includes(priceId))
+      return res.status(400).json({ error: 'Invalid price' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: 'https://flip-radar.app?upgraded=1',
+      cancel_url:  'https://flip-radar.app?cancelled=1',
+      customer_email: user.email,
+      metadata: { userId: user.id, priceId },
+      subscription_data: { metadata: { userId: user.id, priceId } },
+    });
+    res.json({ url: session.url });
+  } catch (e) { console.error('[Stripe] Checkout error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/stripe/create-intent', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const { priceId } = req.body;
+    if (!priceId || !Object.values(PRICE_IDS).includes(priceId))
+      return res.status(400).json({ error: 'Invalid price' });
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    let customerId = user.stripeCustomerId;
+    if (!customerId) {
+      const customer = await stripe.customers.create({ email: user.email, name: user.name, metadata: { userId: user.id } });
+      customerId = customer.id;
+      user.stripeCustomerId = customerId;
+      await saveUser(user);
+    }
+    const subscription = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [{ price: priceId }],
+      payment_behavior: 'default_incomplete',
+      payment_settings: { save_default_payment_method: 'on_subscription' },
+      expand: ['latest_invoice.payment_intent'],
+      metadata: { userId: user.id, priceId },
+    });
+    const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
+    res.json({ clientSecret, subscriptionId: subscription.id });
+  } catch (e) { console.error('[Stripe] Intent error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/stripe/portal', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    const user = await getUser(req.userId);
+    if (!user || !user.stripeCustomerId) return res.status(400).json({ error: 'No subscription found' });
+    const session = await stripe.billingPortal.sessions.create({
+      customer: user.stripeCustomerId,
+      return_url: 'https://flip-radar.app',
+    });
+    res.json({ url: session.url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.json({ ok: true });
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (e) { console.error('[Stripe] Webhook sig failed:', e.message); return res.status(400).send('Webhook Error'); }
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const userId  = session.metadata?.userId;
+      const priceId = session.metadata?.priceId;
+      if (userId && priceId) {
+        const user = await getUser(userId);
+        if (user) {
+          user.plan = PRICE_TO_PLAN[priceId] || 'basic';
+          user.stripeCustomerId     = session.customer;
+          user.stripeSubscriptionId = session.subscription;
+          await saveUser(user);
+          console.log(`[Stripe] Upgraded ${user.email} to ${user.plan}`);
+        }
+      }
+    }
+    if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.paused') {
+      const sub    = event.data.object;
+      const userId = sub.metadata?.userId;
+      if (userId) {
+        const user = await getUser(userId);
+        if (user) {
+          user.plan = 'free';
+          user.stripeSubscriptionId = null;
+          await saveUser(user);
+          console.log(`[Stripe] Downgraded ${user.email} to free`);
+        }
+      }
+    }
+  } catch (e) { console.error('[Stripe] Webhook handler error:', e.message); }
+  res.json({ received: true });
+});
+
+app.get('/auth/plan', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const today    = new Date().toISOString().slice(0, 10);
+    const appraised = user.appraisalDate === today ? (user.appraisalsToday || 0) : 0;
+    const limit     = PLAN_APPRAISAL_LIMITS[getEffectivePlan(user)];
+    res.json({
+      plan: getEffectivePlan(user),
+      appraisalsUsedToday: appraised,
+      appraisalsLimit:     limit === Infinity ? -1 : limit,
+      watchlistLimit:      PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
+    });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /onboarding — tells the frontend what state the user is in
+// Used to show/hide onboarding screen and tips
+app.get('/onboarding', authMiddleware, async (req, res) => {
+  try {
+    const user    = await getUser(req.userId);
+    const watches = await getUserWatches(req.userId);
+    const listings = await getUserListings(req.userId);
+    res.json({
+      hasWatches:    watches.length > 0,
+      watchCount:    watches.length,
+      hasListings:   listings.length > 0,
+      listingCount:  listings.length,
+      plan:          getEffectivePlan(user),
+      watchLimit:    PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)],
+      // Steps completed
+      steps: {
+        addedWatch:    watches.length > 0,
+        gotListings:   listings.length > 0,
+        usedAppraisal: (user.appraisalsToday || 0) > 0 || user.appraisalDate != null,
+      },
+    });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /listings/price-drops — listings that have dropped in price recently
+app.get('/listings/price-drops', authMiddleware, async (req, res) => {
+  try {
+    const listings = await getUserListings(req.userId);
+    const drops = listings.filter(l => l.priceDropped && l.previousPrice);
+    res.json(drops);
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/auth/appraisal', authMiddleware, async (req, res) => {
+  try {
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+    res.json({ ok: true, used: cr.used, limit: cr.limit });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Web Push notification sender ─────────────────────────
+async function sendWebPush(userId, payload) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  try {
+    const subs = await redisGet(K_push(userId));
+    if (!subs || !subs.length) return;
+    webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    const msg = JSON.stringify(payload);
+    const results = await Promise.allSettled(
+      subs.map(sub => webpush.sendNotification(sub, msg))
+    );
+    // Remove expired/invalid subscriptions
+    const valid = subs.filter((_, i) => results[i].status === 'fulfilled');
+    if (valid.length !== subs.length) await redisSet(K_push(userId), valid);
+  } catch (e) {
+    console.error('[WebPush] Error:', e.message);
+  }
+}
+
+// POST /push/subscribe — save user's push subscription
+app.post('/push/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const { subscription } = req.body;
+    if (!subscription || !subscription.endpoint) return res.status(400).json({ error: 'subscription required' });
+    const subs = await redisGet(K_push(req.userId)) || [];
+    // Avoid duplicates
+    const exists = subs.find(s => s.endpoint === subscription.endpoint);
+    if (!exists) {
+      subs.push(subscription);
+      await redisSet(K_push(req.userId), subs);
+    }
+    console.log(`[WebPush] Subscribed user ${req.userId}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE /push/subscribe — remove subscription
+app.delete('/push/subscribe', authMiddleware, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    const subs = await redisGet(K_push(req.userId)) || [];
+    await redisSet(K_push(req.userId), subs.filter(s => s.endpoint !== endpoint));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /push/vapid-key — gives frontend the public key to subscribe with
+app.get('/push/vapid-key', (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.status(500).json({ error: 'Push not configured' });
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+// ── AI proxy routes — keys live on server, never in browser ──
+const GEMINI_API_KEY    = process.env.GEMINI_API_KEY    || null;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
+
+// ── Web Push (VAPID) ──────────────────────────────────────
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
+const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@flip-radar.app';
+
+
+// Redis key for push subscriptions
+const K_push = userId => `fr:push:${userId}`;
+
+// POST /ai/vehicle — vehicle appraisal grounded in DB data when available
+// DB data is fetched FIRST so AI can reason from real market numbers.
+app.post('/ai/vehicle', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
+
+    const { make, model, year, mileage, transmission, listingPrice, title, description,
+            imageUrl, imageBase64, imageMime, listingId, listingUrl } = req.body;
+    if (!listingPrice) return res.status(400).json({ error: 'listingPrice required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const keyword = req.body.keyword || [make, model, year].filter(Boolean).join(' ');
+    const cached  = await getAppraisalCache(listingId, title, listingPrice, keyword);
+    if (cached) {
+      console.log(`[AI/vehicle] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    // ── Step 1: Fetch DB market data BEFORE building prompt ──
+    // Key change: DB data feeds INTO the prompt so AI reasons from
+    // real AU market numbers rather than training data alone.
+    const dbResult = (make && model && year)
+      ? await fetchBestVehiclePrice(make, model, year, mileage, {
+          series: req.body.series, variant: req.body.variant, transmission
+        }).catch(() => null)
+      : null;
+
+    const dbPreferred = dbResult && !dbResult.belowThreshold;
+    const dbAvailable = !!dbResult;
+
+    // ── Step 2: Fetch full listing details from SociaVault ──
+    let fullDescription = description || '';
+    let condition = null;
+    if (listingId || listingUrl) {
+      const details = await fetchListingDetails(listingId, listingUrl);
+      if (details) {
+        if (details.description && details.description.length > (fullDescription?.length || 0)) {
+          fullDescription = details.description;
+        }
+        condition = details.condition || null;
+        console.log(`[AI/vehicle] Fetched full details — desc: ${fullDescription.length} chars, condition: ${condition}`);
+      }
+    }
+
+    // ── Step 3: Build DB market context block ────────────────
+    // Injected into the prompt — AI uses these real numbers as its anchor.
+    let dbMarketContext = '';
+    if (dbAvailable && dbResult.marketMedian) {
+      const mb        = dbResult.mileageBand || 'unknown mileage range';
+      const yb        = dbResult.yearBand    || String(year);
+      const cohortStr = [make, model, dbResult.series, dbResult.variant].filter(Boolean).join(' ');
+      const listingMileageBand = mileage ? bandMileage(mileage) : null;
+      const mileageMismatch = listingMileageBand && dbResult.mileageBand && listingMileageBand !== dbResult.mileageBand;
+
+      if (dbPreferred) {
+        const consistency = dbResult.iqr && dbResult.marketMedian
+          ? (dbResult.iqr / dbResult.marketMedian < 0.2 ? 'tight, consistent market' : 'moderate spread')
+          : '';
+        const mileageNote = mileageMismatch
+          ? `NOTE: Listing mileage (${Number(mileage).toLocaleString()} km) is outside the ${mb} cohort. ` +
+            `Use the cohort data as a baseline and adjust using the depreciation guide below.`
+          : `Listing mileage matches this cohort — use the market data directly, adjusted for condition signals.`;
+
+        dbMarketContext = [
+          '',
+          'REAL MARKET DATA FROM AU LISTINGS (use as your pricing anchor — actual observed data, not estimates):',
+          `- Vehicle cohort: ${cohortStr} · ${yb} · ${mb}`,
+          `- Market median price for this cohort: $${dbResult.marketMedian.toLocaleString()}`,
+          `- Price range (P25–P75): $${dbResult.marketLow.toLocaleString()} – $${dbResult.marketHigh.toLocaleString()}`,
+          `- Sample size: ${dbResult.samples} comparable AU listings`,
+          dbResult.iqr ? `- Market consistency (IQR): $${dbResult.iqr.toLocaleString()} — ${consistency}` : '',
+          '',
+          mileageNote,
+          'Your estimatedMarketValue MUST be grounded in these numbers.',
+          'Adjust up or down based on condition/extras/description but do not deviate >25% without stating why in whyItsWorth.',
+        ].filter(l => l !== null).join('\n');
+
+      } else {
+        dbMarketContext = [
+          '',
+          'PARTIAL MARKET DATA FROM AU LISTINGS (small sample — directional reference only):',
+          `- Vehicle cohort: ${cohortStr} · ${yb} · ${mb}`,
+          `- Observed median: $${dbResult.marketMedian.toLocaleString()}`,
+          `- Observed range: $${dbResult.marketLow.toLocaleString()} – $${dbResult.marketHigh.toLocaleString()}`,
+          `- Sample size: ${dbResult.samples} listings`,
+          mileageMismatch
+            ? `Listing mileage (${Number(mileage).toLocaleString()} km) differs from ${mb} cohort — interpolate using the depreciation guide.`
+            : '',
+          'Use alongside your own knowledge. If figures conflict with your knowledge, use judgment.',
+        ].filter(l => l !== null).join('\n');
+      }
+    } else {
+      dbMarketContext = '\nNO DATABASE DATA AVAILABLE for this vehicle cohort yet.\nUse your knowledge of the AU used-car market. Be conservative.';
+    }
+
+    // ── Step 4: Build the full prompt ─────────────────────
+    const carLabel = [year, make, model].filter(Boolean).join(' ') || 'this vehicle';
+    const vehicleDetails = [
+      `Make/Model/Year: ${carLabel}`,
+      req.body.series  ? `Series: ${req.body.series}`   : null,
+      req.body.variant ? `Variant: ${req.body.variant}` : null,
+      mileage     ? `Kms: ${Number(mileage).toLocaleString()} km` : null,
+      transmission ? `Transmission: ${transmission}` : null,
+      condition    ? `Condition: ${condition}` : null,
+      `Listing Price: $${Number(listingPrice).toLocaleString()}`,
+    ].filter(Boolean).join('\n');
+
+    const mileageGuide = [
+      '',
+      'KMS DEPRECIATION GUIDE (AU market — use when interpolating from cohort data):',
+      '- Under 80,000 km:    premium — add 10–20% above cohort median',
+      '- 80,000–130,000 km:  normal use — at cohort median',
+      '- 130,000–180,000 km: moderate discount (~10–20% below median)',
+      '- 180,000–250,000 km: significant discount (~25–40% below median)',
+      '- Over 250,000 km:    hard sell — well below median, long time-to-sell',
+    ].join('\n');
+
+    const prompt = [
+      'You are an expert Australian used-vehicle flipper and market analyst. Your goal is accurate, conservative valuation grounded in real market data.',
+      dbMarketContext,
+      '',
+      'VEHICLE DETAILS:',
+      vehicleDetails,
+      mileageGuide,
+      '',
+      `LISTING TITLE: ${title || '(not provided)'}`,
+      'FULL LISTING DESCRIPTION:',
+      '"""',
+      fullDescription || '(not provided)',
+      '"""',
+      '',
+      'EXTRACT AND FACTOR IN FROM DESCRIPTION:',
+      '- Exact variant/trim/series (VE SS, FG XR6, GU TDI, SR5 etc) — significantly affects value',
+      '- Engine (3.6L V6, 6.0L V8, 3.0 diesel etc) — extract if not in title',
+      '- Extras (towbar, lift kit, ARB gear, new tyres, canopy, leather, sunroof) — add value',
+      '- Service history (logbooks, one owner, recently serviced) — adds significant value',
+      '- Defects (rust, oil leaks, engine noise, worn interior, needs RWC, accident history) — reduce value, add red flags',
+      '- Urgency signals (must sell, moving, price reduced) — negotiation leverage',
+      '- Rego status (registered until X, unregistered, interstate) — affects buyer cost',
+      '',
+      'MISSING INFORMATION RULES — absence of info is NOT neutral, treat it as a red flag:',
+      '- No service history mentioned → assume none exists, reduce value 10–15%, add as red flag',
+      '- No condition mentioned → assume average/fair condition, not good',
+      '- No kms mentioned → assume high kms, reduce value accordingly',
+      '- Vague description (one line, no detail) → seller is hiding something, flag it',
+      '',
+      'CRITICAL — WHAT THINGS ACTUALLY SELL FOR IN AU (not asking price):',
+      'The market median shown above is what sellers are ASKING. What things actually SELL for is different.',
+      'In Australian FB Marketplace, most items sell for 10–20% below the asking median.',
+      'Your estimatedResellLow must be what a buyer will realistically pay — not what you hope to get.',
+      'Price it to sell in 1–2 weeks. If it would take longer, the price is too high.',
+      '',
+      'CALCULATE PROFIT STEP BY STEP — show your working in whyItsWorth:',
+      'Step 1 — Realistic sell price: take market median, subtract 12% (AU market discount off asking)',
+      'Step 2 — Detailing/clean: $200 minimum, $400 if condition is average or unknown',
+      'Step 3 — Minor repairs: $0 if genuinely perfect, $300–800 if any issues mentioned or kms are high',
+      'Step 4 — Rego/RWC if unregistered or interstate: add $400–800',
+      'Step 5 — Your time: minimum 2 hours to list, negotiate, show, sell — factor it in',
+      'Step 6 — estimatedProfit = realistic sell price MINUS buy price MINUS steps 2–4',
+      'Step 7 — roiPercent = estimatedProfit divided by buy price, expressed as percentage',
+      '',
+      'estimatedResellLow = Step 1 result (realistic sell, priced to move)',
+      'estimatedResellHigh = market median minus 5% (best case, patient seller)',
+      'estimatedProfit = estimatedResellLow minus listingPrice minus all costs from steps 2–4',
+      '',
+      'VERDICT RULES — apply strictly:',
+      '- roiPercent > 30% after ALL costs → STEAL',
+      '- roiPercent 15–30% after ALL costs → GOOD DEAL',
+      '- roiPercent 5–15% after ALL costs → FAIR',
+      '- roiPercent 0–5% after ALL costs → FAIR (barely worth it)',
+      '- roiPercent < 0% → PASS',
+      '- A $300 profit on a $4000 car is FAIR, not GOOD DEAL. Be honest.',
+      '',
+      'NEGATIVE PROFIT RULE — critical:',
+      'If your calculation produces a negative profit (you would lose money flipping this):',
+      '- DO NOT show a negative estimatedProfit — set it to 0',
+      '- DO NOT show a negative roiPercent — set it to 0',
+      '- Set estimatedResellLow to approximately the listing price (what you paid)',
+      '- Set estimatedResellHigh to listing price plus 3–5% at most',
+      '- The message to the user is: you would need to sell for roughly what you paid just to break even',
+      '- Set verdict to PASS and dealScore to 15 or lower',
+      '- The oneLiner should honestly say something like "You would need to sell for at least $X just to break even after costs"',
+      '- Do not invent profit that does not exist',
+      '',
+      'Broken/project cars: if listing mentions "spares or repairs", "not running", "blown", "needs work", "as-is" — set isBrokenOrProject true, provide repairEstimate, cap verdict at FAIR unless post-repair ROI is exceptional.',
+      '',
+      'Respond ONLY in this exact JSON format (no markdown, no text outside JSON):',
+      '{',
+      '  "verdict": "STEAL|GOOD DEAL|FAIR|PASS",',
+      '  "dealScore": 0-100,',
+      '  "oneLiner": "one punchy sentence",',
+      '  "extractedTitle": "cleaned listing title",',
+      '  "extractedPrice": number,',
+      '  "estimatedMarketValue": number,',
+      '  "estimatedResellLow": number,',
+      '  "estimatedResellHigh": number,',
+      '  "recommendedOffer": number,',
+      '  "walkAwayPrice": number,',
+      '  "estimatedProfit": number,',
+      '  "roiPercent": number,',
+      '  "timeToSell": "1-3 days / 3-7 days / 1-2 weeks / 2-4 weeks",',
+      '  "demandLevel": "🔥 High or 📈 Moderate or 📉 Low",',
+      '  "whyItsWorth": "1-2 sentences referencing the actual price numbers",',
+      '  "greenFlags": ["..."],',
+      '  "redFlags": ["..."],',
+      '  "whatToCheckInPerson": ["..."],',
+      '  "negotiationScript": "what to say to the seller",',
+      '  "isBrokenOrProject": false,',
+      '  "repairEstimate": 0,',
+      '  "repairNotes": "",',
+      '  "aiGenerated": true',
+      '}',
+    ].join('\n');
+
+    // ── Step 5: Call AI ────────────────────────────────────
+    let text = '';
+    const hasImage = !!(imageBase64 || imageUrl);
+
+    if (GEMINI_API_KEY && hasImage) {
+      const parts = [];
+      if (imageBase64 && imageMime) {
+        parts.push({ inline_data: { mime_type: imageMime, data: imageBase64 } });
+      } else if (imageUrl) {
+        try {
+          const imgRes = await axios.get(imageUrl, {
+            responseType: 'arraybuffer', timeout: 10000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+          });
+          parts.push({ inline_data: { mime_type: imgRes.headers['content-type'] || 'image/jpeg', data: Buffer.from(imgRes.data).toString('base64') } });
+        } catch (_) {}
+      }
+      parts.push({ text: prompt });
+      const geminiRes = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+      );
+      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else if (GEMINI_API_KEY) {
+      const geminiRes = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+      );
+      text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else {
+      const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1500,
+        messages: [{ role: 'user', content: prompt }],
+      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 60000 });
+      text = claudeRes.data?.content?.[0]?.text || '';
+    }
+
+    // ── Step 6: Parse and apply DB hard-override if trusted ──
+    let parsed = null;
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
+    } catch (_) {}
+
+    if (parsed) {
+      if (dbPreferred) {
+        // DB is fully trusted — lock the price fields
+        // AI still owns: verdict rationale, flags, negotiation script, inspection checklist
+        parsed.estimatedMarketValue = dbResult.marketMedian;
+        parsed.estimatedResellLow   = dbResult.marketLow;
+        parsed.estimatedResellHigh  = dbResult.marketHigh;
+        parsed.low                  = dbResult.marketLow;
+        parsed.median               = dbResult.marketMedian;
+        parsed.high                 = dbResult.marketHigh;
+        // Realistic sell price = 10% below median (priced to actually sell, not sit)
+        const realisticSellPrice = Math.round(dbResult.marketMedian * 0.90);
+        // Realistic costs: detailing + minor prep (conservative estimate)
+        const flipCosts = listingPrice < 5000 ? 300 : listingPrice < 15000 ? 500 : 800;
+        const realisticProfit = realisticSellPrice - listingPrice - flipCosts;
+
+        parsed.estimatedResellLow   = realisticSellPrice;
+        parsed.estimatedResellHigh  = Math.round(dbResult.marketMedian * 0.97); // best case just under median
+        parsed.estimatedMarketValue = dbResult.marketMedian;
+        parsed.low                  = dbResult.marketLow;
+        parsed.median               = dbResult.marketMedian;
+        parsed.high                 = dbResult.marketHigh;
+        if (realisticProfit <= 0) {
+          // Negative flip — set resell to around what was paid, profit to 0
+          parsed.estimatedProfit      = 0;
+          parsed.roiPercent           = 0;
+          parsed.estimatedResellLow   = listingPrice;
+          parsed.estimatedResellHigh  = Math.round(listingPrice * 1.04);
+        } else {
+          parsed.estimatedProfit      = Math.round(realisticProfit);
+          parsed.roiPercent           = Math.round((realisticProfit / listingPrice) * 100);
+        }
+
+        // Verdict anchored to realistic ROI after all costs
+        if      (parsed.roiPercent >= 30) { parsed.verdict = 'STEAL';     parsed.dealScore = Math.min(95, Math.max(parsed.dealScore || 0, 85)); }
+        else if (parsed.roiPercent >= 15) { parsed.verdict = 'GOOD DEAL'; parsed.dealScore = Math.min(84, Math.max(parsed.dealScore || 0, 65)); }
+        else if (parsed.roiPercent >= 5)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(64, Math.max(parsed.dealScore || 0, 45)); }
+        else if (parsed.roiPercent >= 0)  { parsed.verdict = 'FAIR';      parsed.dealScore = Math.min(44, 40); }
+        else                              { parsed.verdict = 'PASS';      parsed.dealScore = Math.min(parsed.dealScore || 25, 25); }
+      }
+
+      // Strip internal fields — never send to user
+      delete parsed.sourceLabel;
+      delete parsed.confidence;
+      delete parsed.dataPoints;
+      delete parsed.dbData;
+      delete parsed._pricingCorrected;
+
+      const finalResult = { ...parsed, text, usedCache: false };
+      await setAppraisalCache(listingId, title, listingPrice, keyword, finalResult).catch(e =>
+        console.error('[AprCache] Write error:', e.message)
+      );
+      res.json(finalResult);
+    } else {
+      res.json({ text, usedCache: false });
+    }
+  } catch (e) {
+    console.error('[AI/vehicle]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/image — image scan via Gemini Flash
+// Body: { parts: [ { inline_data: { mime_type, data } }, { text: prompt } ] }
+app.post('/ai/image', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
+    const { parts } = req.body;
+    if (!parts || !Array.isArray(parts)) return res.status(400).json({ error: 'parts array required' });
+
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 30000,
+    });
+    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    res.json({ text });
+  } catch (e) {
+    console.error('[AI/image]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/text — text-only calls via Claude Haiku
+// Body: { prompt: string }
+app.post('/ai/text', authMiddleware, async (req, res) => {
+  try {
+    if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Anthropic not configured on server' });
+    const { prompt, max_tokens, listingId, title, price, keyword } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    if (cached) {
+      console.log(`[AI/text] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    const claudeRes = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: max_tokens || 1500,
+      messages: [{ role: 'user', content: prompt }],
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      timeout: 60000,
+    });
+    const text = claudeRes.data?.content?.[0]?.text || '';
+    const result = { text, usedCache: false };
+
+    // Store in cache for future users
+    if (listingId || (title && price)) {
+      await setAppraisalCache(listingId, title, price, keyword, result).catch(e =>
+        console.error('[AprCache] Write error (text):', e.message)
+      );
+    }
+
+    res.json(result);
+  } catch (e) {
+    console.error('[AI/text]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// POST /ai/text-image — text scan with an image fetched via URL (listing image)
+// Body: { prompt: string, imageUrl: string }
+app.post('/ai/text-image', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
+    const { prompt, imageUrl, listingId, title, price, keyword } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // ── Appraisal cache check — free hit, no point consumed ──
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    if (cached) {
+      console.log(`[AI/text-image] Cache hit — skipping AI + appraisal deduction`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    var parts = [{ text: prompt }];
+
+    // If there's an image URL, fetch and include it
+    if (imageUrl) {
+      try {
+        const imgRes = await axios.get(imageUrl, {
+          responseType: 'arraybuffer', timeout: 10000,
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' }
+        });
+        const b64 = Buffer.from(imgRes.data).toString('base64');
+        const mime = imgRes.headers['content-type'] || 'image/jpeg';
+        parts = [{ inline_data: { mime_type: mime, data: b64 } }, { text: prompt }];
+      } catch(e) {
+        console.log('[AI/text-image] Could not fetch image, proceeding text-only');
+      }
+    }
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 30000,
+    });
+    const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const result = { text, usedCache: false };
+
+    // Store in cache for future users
+    if (listingId || (title && price)) {
+      await setAppraisalCache(listingId, title, price, keyword, result).catch(e =>
+        console.error('[AprCache] Write error (text-image):', e.message)
+      );
+    }
+
+    res.json(result);
+  } catch (e) {
+    console.error('[AI/text-image]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// ── Appraisal cache admin ─────────────────────────────────
+// GET /appraisal-cache?listingId=xxx  — check if a result is cached
+app.get('/appraisal-cache', authMiddleware, async (req, res) => {
+  try {
+    const { listingId, title, price, keyword } = req.query;
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    res.json({ found: !!cached, cached: cached || null });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE /appraisal-cache?listingId=xxx  — bust a specific cache entry (owner only)
+app.delete('/appraisal-cache', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    const { listingId, title, price, keyword } = req.query;
+    if (listingId) await redisDel(K.appraisalById(listingId));
+    if (title && price) {
+      const hash = buildAppraisalHash(title, price, keyword);
+      await redisDel(K.appraisalByHash(hash));
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── DEV: force-set plan (secret-gated, remove before public launch) ──
+// POST /dev/set-plan  { secret: "...", plan: "premium" }
+const DEV_SECRET = process.env.DEV_SECRET || 'flipradar-dev';
+app.post('/dev/set-plan', authMiddleware, async (req, res) => {
+  const { secret, plan } = req.body;
+  if (secret !== DEV_SECRET) return res.status(403).json({ error: 'Forbidden' });
+  const validPlans = ['free', 'basic', 'premium'];
+  if (!validPlans.includes(plan)) return res.status(400).json({ error: 'plan must be free, basic, or premium' });
+  const user = await getUser(req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.plan = plan;
+  await saveUser(user);
+  console.log(`[Dev] Set plan for ${user.email} → ${plan}`);
+  res.json({ ok: true, plan });
+});
+
+// ── Start ─────────────────────────────────────────────────
+
+// ── Vehicle identity helpers ─────────────────────────────
+// Reads make/model/year/km from SociaVault structured fields first,
+// falls back to what the scan already extracted from the title.
+function parseVehicleInfoFields(item) {
+  if (!item) return {};
+  const vi = item.vehicle_info || item.listing_vehicle_data || item.vehicleInfo || {};
+  const attrs = item.attributes ? Object.values(item.attributes) : [];
+  const attr = (name) => {
+    const a = attrs.find(x => String(x.attribute_name || x.name || '').toLowerCase() === name.toLowerCase());
+    return a ? (a.label || a.value || null) : null;
+  };
+  const toInt = (v) => { if (v == null) return null; const n = parseInt(String(v).replace(/[^0-9]/g,''),10); return Number.isFinite(n)?n:null; };
+  const year = toInt(vi.year || vi.model_year || vi.manufacture_year || attr('Year'));
+  return {
+    make:         vi.make || vi.manufacturer || vi.brand || attr('Make') || null,
+    model:        vi.model || vi.model_name || attr('Model') || null,
+    year:         (year >= 1970 && year <= new Date().getFullYear()+1) ? year : null,
+    kms:          toInt(vi.odometer || vi.mileage || vi.kilometres || vi.kilometers || attr('Odometer')),
+    transmission: vi.transmission || vi.gearbox || attr('Transmission') || null,
+    fuel_type:    vi.fuel_type || vi.fuel || attr('Fuel type') || null,
+    body_style:   vi.body_style || vi.body || vi.body_type || attr('Body style') || null,
+  };
+}
+
+// ── Vehicle blend valuation ──────────────────────────────
+// Prices a specific car by sliding comparable listings to its km,
+// weighting closest-km comps most, and blending with AI when data is thin.
+const REF_FALLBACK_PERKM = 0.08;
+const KM_HALF_WEIGHT = 50000;
+const ENOUGH_COMPS = 8;
+
+function slideToKm(price, fromKm, toKm, make) {
+  // VERIFY: DEP_TABLE must be keyed by lowercase make with a perKm field
+  const perKm = (DEP_TABLE?.[String(make||'').toLowerCase()]?.perKm) || REF_FALLBACK_PERKM;
+  const adjusted = price + (fromKm - toKm) * perKm;
+  return Math.max(price * 0.25, adjusted);
+}
+
+async function getVehicleComps(target) {
+  const scopes = [
+    'make=$1 AND model=$2 AND series IS NOT DISTINCT FROM $3 AND variant IS NOT DISTINCT FROM $4',
+    'make=$1 AND model=$2 AND series IS NOT DISTINCT FROM $3',
+    'make=$1 AND model=$2',
+  ];
+  for (const where of scopes) {
+    const { rows } = await pool.query(
+      `SELECT price, kms, year, scraped_at FROM listings WHERE category='vehicle' AND is_active=TRUE AND in_price_pool=TRUE AND price>0 AND kms>0 AND ${where} AND scraped_at > NOW() - INTERVAL '120 days'`,
+      [target.make, target.model, target.series||null, target.variant||null]);
+    if (rows.length >= 3) return rows;
+  }
+  return [];
+}
+
+async function aiEstimateVehicle(target) {
+  const ck = `vest:${[target.make,target.model,target.series,target.year,Math.round((target.kms||0)/20000)].join('|')}`;
+  const cached = await redisGet(ck);
+  if (cached?.est) return cached.est;
+  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
+  const prompt = `Typical USED private-sale price AUD on Australian Facebook Marketplace:\n${target.year||''} ${target.make||''} ${target.model||''} ${target.series||''} ${target.variant||''}, ${target.kms||'?'} km.\nReturn ONLY JSON: { "est_aud": number }`;
+  try {
+    let text = '';
+    if (GEMINI_API_KEY) {
+      const r = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},
+        {headers:{'Content-Type':'application/json'},timeout:10000});
+      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';
+    } else {
+      const r = await axios.post('https://api.anthropic.com/v1/messages',
+        {model:'claude-haiku-4-5-20251001',max_tokens:80,messages:[{role:'user',content:prompt}]},
+        {headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},timeout:10000});
+      text = r.data?.content?.[0]?.text||'';
+    }
+    const m = text.match(/\{[\s\S]*\}/);
+    const est = m ? Math.round(JSON.parse(m[0]).est_aud) : null;
+    if (est > 0) { await redisSet(ck,{est},14*24*3600); return est; }
+  } catch(e) { console.error('[VEst]',e.message); }
+  return null;
+}
+
+async function appraiseVehicleValue(target) {
+  if (!target.kms || target.kms <= 0) {
+    const aiEst = await aiEstimateVehicle(target);
+    return aiEst ? {value:aiEst,confidence:15,source:'ai_only',poolN:0,aiEst} : {value:null,confidence:0,source:'none',poolN:0};
+  }
+  const comps = await getVehicleComps(target);
+  const adj = comps.map(c => {
+    const price = slideToKm(c.price, c.kms, target.kms, target.make);
+    const kmW = 1/(1+Math.abs(c.kms-target.kms)/KM_HALF_WEIGHT);
+    const ageDays = (Date.now()-new Date(c.scraped_at))/86400000;
+    const recW = ageDays<30?1:ageDays<90?0.7:0.4;
+    return {price, w:kmW*recW, kmGap:Math.abs(c.kms-target.kms)};
+  });
+  let poolValue=null, poolN=0;
+  if (adj.length) {
+    const sorted = adj.map(a=>a.price).sort((x,y)=>x-y);
+    const q = p => sorted[Math.floor(p*(sorted.length-1))];
+    const lo=q(0.25)-1.5*(q(0.75)-q(0.25)), hi=q(0.75)+1.5*(q(0.75)-q(0.25));
+    const kept = adj.filter(a=>a.price>=lo&&a.price<=hi);
+    const wsum = kept.reduce((s,a)=>s+a.w,0);
+    poolValue = wsum?Math.round(kept.reduce((s,a)=>s+a.price*a.w,0)/wsum):null;
+    poolN = kept.length;
+  }
+  const aiEst = await aiEstimateVehicle(target);
+  const trust = Math.min(poolN/ENOUGH_COMPS,1);
+  let value, source;
+  if (poolN>0&&aiEst) { value=Math.round(poolValue*trust+aiEst*(1-trust)); source='blend'; }
+  else if (poolN>0) { value=poolValue; source='comps_only'; }
+  else if (aiEst) { value=aiEst; source='ai_only'; }
+  else { return {value:null,confidence:0,source:'none',poolN:0}; }
+  const nearestGap = adj.length?Math.min(...adj.map(a=>a.kmGap)):Infinity;
+  const agr = (a,b)=>{ if(!a||!b)return 0; const d=Math.abs(a-b)/Math.max(a,b); return d<0.07?1:d<0.15?0.6:d<0.25?0.2:0; };
+  let confidence = Math.round(55*trust+20*(poolN>0&&aiEst?agr(poolValue,aiEst):0)+15*(nearestGap<30000?1:nearestGap<80000?0.5:0)+10*(source==='comps_only'?1:source==='blend'?0.6:0));
+  confidence = Math.max(5,Math.min(confidence,100));
+  return {value,confidence,source,poolN,aiEst,poolValue};
+}
+
+// ── General goods normaliser ─────────────────────────────
+// Turns a title into { category, brand, product_line, variant, norm_key }
+// so general items get precise cohorts instead of broad keyword buckets.
+const _slug = s => String(s||'').toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+const _tc   = s => String(s||'').replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+const _pick = (pairs,t) => { for(const [k,re] of pairs) if(re.test(t)) return k; return null; };
+const CATEGORY_SIGNALS=[['gaming',/\b(ps5|ps4|playstation|xbox|series x|series s|nintendo switch|steam deck|quest ?[23]|oculus)\b/i],['phone',/\b(iphone|galaxy s\d|galaxy note|pixel \d|ipad)\b/i],['power_tool',/\b(milwaukee|makita|de ?walt|ryobi|festool|hilti|metabo|hikoki|m18|m12|18v|impact driver|angle grinder|circular saw|hammer drill)\b/i],['computer',/\b(macbook|imac|thinkpad|dell xps|rtx ?\d{3,4}|graphics card)\b/i],['audio',/\b(sonos|airpods|bose|wh.?1000|quietcomfort|soundbar|turntable)\b/i],['vacuum',/\b(dyson|stick vac|cordless vacuum)\b/i]];
+function detectNormCategory(text){for(const[cat,re]of CATEGORY_SIGNALS)if(re.test(text))return cat;return 'general';}
+const PT_BRANDS=[['milwaukee',/\bmilwaukee\b/i],['makita',/\bmakita\b/i],['dewalt',/\bde ?walt\b/i],['ryobi',/\bryobi\b/i],['festool',/\bfestool\b/i],['hilti',/\bhilti\b/i],['metabo',/\b(metabo|hikoki|hitachi)\b/i],['bosch',/\bbosch\b/i],['ego',/\bego\b/i]];
+const PT_LINE={milwaukee:[['m18',/\bm18\b/i],['m12',/\bm12\b/i]],makita:[['xgt-40v',/\bxgt\b|\b40v\b/i],['cxt-12v',/\bcxt\b|\b12v\b/i],['lxt-18v',/\blxt\b|\b18v\b/i]],dewalt:[['xr-18v',/\bxr\b|\b18v\b|\b20v\b/i]],ryobi:[['one-plus-18v',/\bone\+?\b|\b18v\b/i]]};
+const PT_TOOL=[['hammer-drill',/hammer ?drill|combi ?drill/i],['impact-driver',/impact ?driver/i],['impact-wrench',/impact ?wrench|rattle ?gun/i],['drill',/\bdrill( ?driver)?\b/i],['angle-grinder',/angle ?grinder|\bgrinder\b/i],['circular-saw',/circular ?saw/i],['recip-saw',/recip(rocating)? ?saw|sawzall/i],['multi-tool',/multi ?tool|oscillating/i],['blower',/\bblower\b/i],['nailer',/nail ?gun|nailer/i]];
+function resolvePowerTool(t){const brand=_pick(PT_BRANDS,t);const line=brand&&PT_LINE[brand]?_pick(PT_LINE[brand],t):null;const tool=_pick(PT_TOOL,t);const isKit=/\b(kit|combo|set)\b/i.test(t);const isBare=/\b(bare|skin only|tool only|body only)\b/i.test(t);return{brand,product_line:[line,tool].filter(Boolean).join(' ')||null,variant:isBare?'bare':(isKit?'kit':null),attributes:{kit:isKit,bare:isBare}};}
+const IPHONE=[['iphone-16-pro-max',/iphone ?16 ?pro ?max/i],['iphone-16-pro',/iphone ?16 ?pro/i],['iphone-16',/iphone ?16/i],['iphone-15-pro-max',/iphone ?15 ?pro ?max/i],['iphone-15-pro',/iphone ?15 ?pro/i],['iphone-15',/iphone ?15/i],['iphone-14-pro-max',/iphone ?14 ?pro ?max/i],['iphone-14-pro',/iphone ?14 ?pro/i],['iphone-14',/iphone ?14/i],['iphone-13-pro',/iphone ?13 ?pro/i],['iphone-13',/iphone ?13/i],['iphone-12',/iphone ?12/i],['iphone-11',/iphone ?11/i]];
+const GALAXY=[['galaxy-s24-ultra',/s24 ?ultra/i],['galaxy-s24',/galaxy ?s24/i],['galaxy-s23-ultra',/s23 ?ultra/i],['galaxy-s23',/galaxy ?s23/i],['galaxy-s22',/galaxy ?s22/i]];
+function resolvePhone(t){const brand=/\b(iphone|apple)\b/i.test(t)?'apple':/\b(samsung|galaxy)\b/i.test(t)?'samsung':/\b(pixel|google)\b/i.test(t)?'google':null;const model=brand==='apple'?_pick(IPHONE,t):brand==='samsung'?_pick(GALAXY,t):null;const gb=(t.match(/\b(64|128|256|512)\s?gb\b/i)||[])[1]||(/\b1\s?tb\b/i.test(t)?'1024':null);const locked=/\blocked\b/i.test(t)&&!/\bunlocked\b/i.test(t);return{brand,product_line:model,variant:[gb?`${gb}gb`:null,locked?'locked':null].filter(Boolean).join('-')||null,attributes:{storage_gb:gb?+gb:null,locked}};}
+const CONSOLE=[['ps5-pro',/ps5 ?pro/i],['ps5-slim',/ps5 ?slim/i],['ps5',/ps5|playstation ?5/i],['ps4-pro',/ps4 ?pro/i],['ps4',/ps4|playstation ?4/i],['xbox-series-x',/series ?x/i],['xbox-series-s',/series ?s/i],['switch-oled',/switch ?oled/i],['switch-lite',/switch ?lite/i],['switch',/nintendo ?switch|\bswitch\b/i],['steam-deck',/steam ?deck/i],['quest-3',/quest ?3/i],['quest-2',/quest ?2/i]];
+const CONSOLE_BRAND={'ps5':'sony','ps5-pro':'sony','ps5-slim':'sony','ps4':'sony','ps4-pro':'sony','xbox-series-x':'microsoft','xbox-series-s':'microsoft','switch':'nintendo','switch-oled':'nintendo','switch-lite':'nintendo','steam-deck':'valve','quest-3':'meta','quest-2':'meta'};
+function resolveGaming(t){const model=_pick(CONSOLE,t);let edition=null;if(model&&(model.startsWith('ps5')||model==='xbox-series-x')){if(/digital/i.test(t))edition='digital';else if(/disc/i.test(t))edition='disc';}return{brand:model?CONSOLE_BRAND[model]||null:null,product_line:model,variant:edition,attributes:{edition}};}
+const DYSON_MODELS=[['v15',/v15/i],['v12',/v12/i],['v11',/v11/i],['v10',/v10/i],['v8',/v8/i]];
+function resolveVacuum(t){const brand=/dyson/i.test(t)?'dyson':null;return{brand,product_line:brand?_pick(DYSON_MODELS,t):null,variant:null,attributes:{}};}
+const AUDIO_LIST=[['apple','airpods-pro-2',/airpods ?pro ?(2|2nd)/i],['apple','airpods-pro',/airpods ?pro/i],['apple','airpods-max',/airpods ?max/i],['apple','airpods',/airpods/i],['sony','wh-1000xm5',/wh.?1000xm5|\bxm5\b/i],['sony','wh-1000xm4',/wh.?1000xm4|\bxm4\b/i],['bose','quietcomfort',/quietcomfort|\bqc\b/i],['sonos','sonos',/sonos/i]];
+function resolveAudio(t){for(const[brand,line,re]of AUDIO_LIST)if(re.test(t))return{brand,product_line:line,variant:null,attributes:{}};return{};}
+const MAC_MODELS=[['macbook-pro-16',/macbook ?pro ?16/i],['macbook-pro-14',/macbook ?pro ?14/i],['macbook-pro',/macbook ?pro/i],['macbook-air',/macbook ?air/i],['imac',/imac/i]];
+function resolveComputer(t){const brand=/macbook|imac|apple/i.test(t)?'apple':null;const chip=(t.match(/\bm([1234])\b/i)||[])[1];return{brand,product_line:brand?_pick(MAC_MODELS,t):null,variant:chip?`m${chip}`:null,attributes:{chip:chip?`m${chip}`:null}};}
+const NORM_RESOLVERS={power_tool:resolvePowerTool,phone:resolvePhone,gaming:resolveGaming,vacuum:resolveVacuum,audio:resolveAudio,computer:resolveComputer};
+function normalizeGeneralProduct(listing){
+  const text=`${listing.keyword||''} ${listing.title||''}`;
+  const category=detectNormCategory(text);
+  const r=(NORM_RESOLVERS[category]?NORM_RESOLVERS[category](text):{})||{};
+  const brand=r.brand||null;const product_line=r.product_line||null;const variant=r.variant||null;
+  const resolved=!!(brand&&product_line);
+  return{category,brand,product_line,variant,attributes:r.attributes||{},
+    norm_key:resolved?_slug([category,brand,product_line,variant].filter(Boolean).join(' ')):null,
+    display_name:resolved?_tc([brand,product_line,variant].filter(Boolean).join(' ')):null,resolved};
+}
+
+// ── Keyword price anchor (AI ballpark for the real product) ──────────
+const BROAD_KEYWORD_STOPLIST=new Set(['bmw','mercedes','audi','toyota','ford','holden','honda','nissan','mazda','mitsubishi','hyundai','kia','subaru','volkswagen','vw','jeep','lexus','volvo','car','cars','ute','van','truck','phone','laptop','tv','furniture','tools','desk','chair','table','couch','sofa']);
+function isBroadKeyword(kw){return BROAD_KEYWORD_STOPLIST.has(String(kw||'').toLowerCase().trim());}
+async function getKeywordPriceAnchor(keyword,sampleTitles=[]){
+  const cacheKey=`anchor:${_slug(keyword).slice(0,60)}`;
+  const cached=await redisGet(cacheKey);if(cached&&cached.anchor)return cached.anchor;
+  if(!GEMINI_API_KEY&&!ANTHROPIC_API_KEY)return null;
+  const prompt=['You estimate the typical USED resale price in AUD on Australian Facebook Marketplace.',`Product keyword: "${keyword}"`,sampleTitles.length?`Example titles:\n- ${sampleTitles.slice(0,6).join('\n- ')}`:'','Give ONE rough typical price for the MAIN product in good used condition (NOT accessories/parts).','Return ONLY JSON: { "anchor_aud": number }'].filter(Boolean).join('\n');
+  try{
+    let text='';
+    if(GEMINI_API_KEY){const r=await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,{contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},{headers:{'Content-Type':'application/json'},timeout:10000});text=r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';}
+    else{const r=await axios.post('https://api.anthropic.com/v1/messages',{model:'claude-haiku-4-5-20251001',max_tokens:100,messages:[{role:'user',content:prompt}]},{headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},timeout:10000});text=r.data?.content?.[0]?.text||'';}
+    const m=text.match(/\{[\s\S]*\}/);const anchor=m?Math.round(JSON.parse(m[0]).anchor_aud):null;
+    if(anchor&&anchor>0){await redisSet(cacheKey,{anchor},30*24*3600);return anchor;}
+  }catch(e){console.error('[Anchor]',keyword,e.message);}
+  return null;
+}
+async function refreshKeywordAnchors(){
+  try{
+    const{rows}=await pool.query(`SELECT keyword,COUNT(*)::INT AS n,(ARRAY_AGG(title ORDER BY scraped_at DESC))[1:6] AS sample_titles FROM listings WHERE keyword IS NOT NULL AND category!='vehicle' AND price>0 AND is_active=TRUE GROUP BY keyword HAVING COUNT(*)>=8`);
+    for(const r of rows){if(isBroadKeyword(r.keyword))continue;const anchor=await getKeywordPriceAnchor(r.keyword,r.sample_titles||[]);if(anchor){await pool.query(`INSERT INTO keyword_anchors(keyword,anchor_price,updated_at)VALUES($1,$2,NOW())ON CONFLICT(keyword)DO UPDATE SET anchor_price=EXCLUDED.anchor_price,updated_at=NOW()`,[r.keyword,anchor]);}await new Promise(res=>setTimeout(res,200));}
+    console.log(`[Anchor] refreshed ${rows.length} keyword anchors`);
+  }catch(e){console.error('[Anchor] refresh error:',e.message);}
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`FlipRadar backend on port ${PORT}`);
+  console.log(`SociaVault: ${SOCIAVAULT_API_KEY ? 'set' : 'NO TOKEN — add SOCIAVAULT_API_KEY'}`);
+  console.log(`Redis:      ${REDIS_URL           ? 'connected' : 'NOT SET'}`);
+  console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
+  console.log(`Anthropic:  ${ANTHROPIC_API_KEY? 'connected' : 'NOT SET — add ANTHROPIC_API_KEY'}`);;
+  await initDB();          // create tables if not exist
+  await loadAllWatches();
+  const dbSummary = await getDBSummary();
+  if (dbSummary) {
+    console.log(`[DB] ${dbSummary.total_listings} listings · ${dbSummary.unique_keywords} keywords · ${dbSummary.unique_makes} vehicle makes`);
+  }
+  console.log('[Ready] Server fully loaded');
+});
++row.p75_price : '?'}
+- Appears broken/faulty: ${isBroken}
+
+Score this as a FLIP OPPORTUNITY for someone who buys cheap and resells for profit in Australia.
+Consider: actual resale value, condition, demand, how fast it sells, fix cost if broken.
+
+Return ONLY valid JSON (no markdown, no explanation):
+{
+  "flip_score": <0-100 integer. 0=waste of time, 100=exceptional flip>,
+  "deal_type": "underpriced" | "broken_fixable" | "rare_find" | "bulk_lot" | "not_a_deal",
+  "demand": "high" | "medium" | "low",
+  "estimated_resale": <realistic AUD resale price as integer, or null>,
+  "estimated_margin": <estimated profit after buy + fix costs, or null>,
+  "fix_cost_estimate": <estimated repair cost in AUD if broken, else null>,
+  "reasoning": "<one concise sentence explaining the score, max 80 chars>"
+}
+
+Scoring guide:
+- 85-100: Exceptional — clear undervalue, high demand, easy flip, great margin
+- 65-84: Solid — good margin, reasonable demand, low risk  
+- 45-64: Worth a look — some upside but competition or condition concerns
+- 20-44: Marginal — thin margin, slow seller, or condition risk
+- 0-19: Not worth it — overpriced, no demand, or too risky
+- broken_fixable: only if fixable by a competent hobbyist for <30% of resale value
+- rare_find: limited supply, collector interest, or hard to find locally`;
+
+        let text = '';
+        if (GEMINI_API_KEY) {
+          const parts = [{ text: prompt }];
+          // Add image if available
+          if (row.image_url) {
+            try {
+              const imgRes = await axios.get(row.image_url, {
+                responseType: 'arraybuffer', timeout: 10000,
+                headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+              });
+              parts.unshift({ inline_data: {
+                mime_type: imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg',
+                data: Buffer.from(imgRes.data).toString('base64'),
+              }});
+            } catch (_) {}
+          }
+          const res = await axios.post(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+            { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+            { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+          );
+          text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        } else {
+          const res = await axios.post('https://api.anthropic.com/v1/messages', {
+            model: 'claude-haiku-4-5-20251001', max_tokens: 300,
+            messages: [{ role: 'user', content: prompt }],
+          }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 20000 });
+          text = res.data?.content?.[0]?.text || '';
+        }
+
+        const match = text.match(/\{[\s\S]*\}/);
+        if (!match) {
+          await pool.query('UPDATE listings SET flip_scored_at = NOW() WHERE id = $1', [row.id]);
+          continue;
+        }
+
+        const r = JSON.parse(match[0]);
+        const flipScore = Math.max(0, Math.min(100, parseInt(r.flip_score) || 0));
+
+        await pool.query(`
+          UPDATE listings SET
+            flip_score            = $1,
+            flip_deal_type        = $2,
+            flip_demand           = $3,
+            flip_estimated_resale = $4,
+            flip_estimated_margin = $5,
+            flip_fix_cost         = $6,
+            flip_reasoning        = $7,
+            flip_scored_at        = NOW()
+          WHERE id = $8
+        `, [
+          flipScore,
+          r.deal_type            || 'not_a_deal',
+          r.demand               || 'medium',
+          r.estimated_resale     ? parseInt(r.estimated_resale)  : null,
+          r.estimated_margin     ? parseInt(r.estimated_margin)  : null,
+          r.fix_cost_estimate    ? parseInt(r.fix_cost_estimate) : null,
+          (r.reasoning || '').slice(0, 120),
+          row.id,
+        ]);
+
+        processed++;
+        await new Promise(res => setTimeout(res, 500));
+
+      } catch (e) {
+        console.error(`[FlipScore] Error on ${row.listing_id}:`, e.message);
+        await pool.query('UPDATE listings SET flip_scored_at = NOW() WHERE id = $1', [row.id]);
+      }
+    }
+
+    console.log(`[FlipScore] ${processed} listings scored so far...`);
+  }
+
+  console.log(`[FlipScore] ✅ Done — ${processed} listings AI-scored`);
+}
 
 // ── Gemini Image Analysis ───────────────────────────────────────────────────
 // Analyses each listing photo to:
@@ -3956,6 +11152,96 @@ app.post('/admin/seed-scan-all', authMiddleware, async (req, res) => {
     if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
     res.json({ ok: true, message: `Starting full scan of ${SEED_KEYWORDS.length} keywords in background` });
     runFullSeedScanOnce().catch(e => console.error('[SeedScan Manual]', e.message));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: full deals pipeline diagnostic
+app.get('/admin/deals-debug', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+
+    const [
+      totalListings,
+      activeListings,
+      inPricePool,
+      withImages,
+      statsCount,
+      dealsCache,
+      qualityBreakdown,
+      sampleDeals,
+    ] = await Promise.all([
+      pool.query('SELECT COUNT(*)::INT AS n FROM listings'),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE is_active = TRUE"),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE in_price_pool = TRUE AND is_active = TRUE"),
+      pool.query("SELECT COUNT(*)::INT AS n FROM listings WHERE image_url IS NOT NULL AND image_url != ''"),
+      pool.query('SELECT COUNT(*)::INT AS n FROM keyword_price_stats'),
+      redisGet('deals:global'),
+      pool.query("SELECT price_quality, COUNT(*)::INT AS n FROM listings GROUP BY price_quality ORDER BY n DESC"),
+      // Try the exact deals query and return first 5 results
+      pool.query(`
+        WITH kmedians AS (
+          SELECT keyword,
+            COUNT(*)::INT AS cnt,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
+          FROM listings
+          WHERE price > 0 AND is_offer_price = FALSE AND is_active = TRUE
+            AND scraped_at > NOW() - INTERVAL '30 days'
+            AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          GROUP BY keyword HAVING COUNT(*) >= 4
+        )
+        SELECT l.title, l.price, l.keyword, k.median_price,
+               (k.median_price - l.price) AS saving,
+               ROUND(((k.median_price - l.price)::float / k.median_price * 100)::numeric, 1) AS pct_off
+        FROM listings l
+        JOIN kmedians k ON k.keyword = l.keyword
+        WHERE l.is_active = TRUE AND l.is_offer_price = FALSE AND l.price > 0
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND l.scraped_at > NOW() - INTERVAL '30 days'
+          AND l.price < k.median_price * 0.92
+          AND (k.median_price - l.price) >= 100
+        ORDER BY saving DESC LIMIT 5
+      `),
+    ]);
+
+    res.json({
+      db: {
+        total_listings:   totalListings.rows[0].n,
+        active_listings:  activeListings.rows[0].n,
+        in_price_pool:    inPricePool.rows[0].n,
+        with_images:      withImages.rows[0].n,
+        keyword_stats_rows: statsCount.rows[0].n,
+        quality_breakdown: qualityBreakdown.rows,
+      },
+      deals_cache: {
+        exists:    !!(dealsCache?.deals),
+        count:     dealsCache?.deals?.length || 0,
+        built_at:  dealsCache?.builtAt || null,
+      },
+      sample_qualifying_deals: sampleDeals.rows,
+      diagnosis: !totalListings.rows[0].n
+        ? '❌ No listings in DB at all — seed scan hasnt run or failed'
+        : !activeListings.rows[0].n
+        ? '❌ No active listings — check is_active flag on upsert'
+        : !statsCount.rows[0].n
+        ? '⚠️ keyword_price_stats empty — quickStats rebuild hasnt run yet (fires 5min after boot)'
+        : !sampleDeals.rows.length
+        ? '⚠️ No qualifying deals — not enough price spread yet, need more listings per keyword'
+        : dealsCache?.deals?.length
+        ? `✅ ${dealsCache.deals.length} deals in cache — check frontend auth/premium flag`
+        : '⚠️ Deals qualify in DB but cache is empty — trigger /admin/deals-rebuild',
+    });
+  } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+});
+
+// Admin: force rebuild deals cache right now
+app.post('/admin/deals-rebuild', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    await quickStatsAndDealsRebuild();
+    const cache = await redisGet('deals:global');
+    res.json({ ok: true, deals_in_cache: cache?.deals?.length || 0, built_at: cache?.builtAt });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
