@@ -4273,6 +4273,12 @@ async function runSeedBatch() {
 // One-time full scan on boot — scans all seed keywords once, then stops.
 // Re-deploy to trigger again. No recurring cron.
 async function runFullSeedScanOnce() {
+  const SEED_FLAG = 'fr:seed-scan-done-v1';
+  const alreadyDone = await redisGet(SEED_FLAG);
+  if (alreadyDone) {
+    console.log('[SeedScan] Already completed — skipping. Delete fr:seed-scan-done-v1 in Redis to re-run.');
+    return;
+  }
   console.log(`[SeedScan] Starting one-time full scan of ${SEED_KEYWORDS.length} keywords...`);
 
   // Pre-load DB counts for all seed keywords in one query — avoids N queries in the loop
@@ -4323,6 +4329,7 @@ async function runFullSeedScanOnce() {
     }
   }
   console.log(`[SeedScan] ✅ Done — ${totalSaved} new listings saved, ${skippedDb} keywords skipped (already in DB)`);
+  await redisSet(SEED_FLAG, { doneAt: new Date().toISOString() });
 }
 
 // Seed scan triggered by runFullBootSequence()
