@@ -5468,35 +5468,43 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
         }
       }
 
-      const priceStr = l.price ? `AUD ${l.price}` : 'price not listed';
+      const priceStr = l.price ? `AUD $${l.price}` : 'price not listed';
       const dbStr = dbMedian
-        ? ` [DB median: ${dbMedian}, p25: ${dbP25}, p75: ${dbP75}, ${dbSamples} sales]`
+        ? ` [DB avg: $${dbMedian}, p25: $${dbP25}, p75: $${dbP75}, ${dbSamples} AU FB sales]`
         : ` [No DB data — use AU FB Marketplace second-hand knowledge]`;
+      // Include year/mileage so AI prices the specific vehicle, not just the keyword average
+      const specParts = [
+        l.year    ? `${l.year}`                                       : null,
+        l.mileage ? `${Number(l.mileage||0).toLocaleString()}km`      : null,
+        l.make    ? l.make                                            : null,
+      ].filter(Boolean);
+      const specStr = specParts.length ? ` (${specParts.join(', ')})` : '';
 
-      return { idx: i, line: `${i}. "${(l.title||'').slice(0,100)}" listed ${priceStr}${dbStr}` };
+      return { idx: i, line: `${i}. "${(l.title||'').slice(0,100)}"${specStr} listed ${priceStr}${dbStr}` };
     }));
 
     const lines = enriched.map(e => e.line).join(' | ');
 
     const prompt = `You are an Australian Facebook Marketplace second-hand pricing expert rating listings for a flipper searching: "${keyword || 'unknown'}".
 
-CRITICAL: All ratings must be based on USED second-hand Australian Facebook Marketplace prices only — NOT RRP, NOT retail, NOT eBay.
-When DB median data is provided, use it as your primary price anchor.
-When no DB data exists, use your knowledge of current AU Facebook Marketplace second-hand prices.
+CRITICAL RULES:
+- All ratings must be based on USED second-hand Australian Facebook Marketplace prices only — NOT RRP, NOT retail, NOT eBay
+- When DB avg data is provided, use it as your primary anchor — but adjust for year/km if provided
+- VEHICLES: year and mileage are critical. A 2005 BMW X3 with 210,000km is worth $2,500-3,500 even if newer X3s average $15,000. Always price based on the SPECIFIC year and km shown — never compare against an all-years average
+- High mileage (150,000km+) significantly reduces value
+- Old age (15+ years) significantly reduces value  
+- A listing is only a deal if there is REAL profit margin after all costs — purchase price, selling fees (~8%), time
+- rainbow = exceptional flip, 40%+ below real value for that specific year/condition/km
+- green = good deal, 20-40% below real value for that year/km
+- yellow = fair price for what it is
+- red = overpriced, or marginal — not worth the effort even if slightly below avg (e.g. old high-km vehicle where avg is skewed by newer models)
+- relevant:false = wrong item, spam, or genuinely no realistic profit margin after costs
 
-For each listing decide:
-1. Is it relevant to the search keyword? (filter out wrong items, accessories, parts if searching for whole item)
-2. Rate the price vs AU FB Marketplace second-hand market:
-   - rainbow = exceptional deal, 50%+ below real FB Marketplace value
-   - green = good deal, 25-50% below FB Marketplace value  
-   - yellow = fair, roughly at FB Marketplace market price
-   - red = overpriced vs FB Marketplace
-
-Listings:
+Listings (year, km, make shown in brackets where available):
 ${lines}
 
-Reply ONLY as JSON array: [{"idx":0,"rating":"yellow","reason":"Fair FB price","relevant":true}]
-Max 6 words per reason. Be specific — mention the actual value if you know it.`;
+Reply ONLY as JSON array: [{"idx":0,"rating":"yellow","reason":"Fair for 210k km 2005","relevant":true}]
+Max 8 words per reason. Be specific about year/km impact on value.`;
 
     const useGemini = !!GEMINI_API_KEY;
     let text = '';
