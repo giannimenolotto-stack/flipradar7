@@ -16,8 +16,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // ── PostgreSQL (Neon) ─────────────────────────────────────
-const DATABASE_URL = process.env.DATABASE_URL ||
-  'postgresql://neondb_owner:npg_XVfnxmq2HCU1@ep-spring-hall-appvfgub-pooler.c-7.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+const DATABASE_URL = process.env.DATABASE_URL || null;
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -3928,15 +3927,21 @@ async function quickStatsAndDealsRebuild() {
       INSERT INTO keyword_price_stats
         (keyword, raw_count, sample_count, median_price, p25_price, p75_price,
          floor_price, ceiling_price, updated_at)
-      WITH base AS (
-        SELECT keyword,
+      WITH anchors AS (
+        SELECT keyword, anchor_price FROM keyword_anchors
+      ),
+      base AS (
+        SELECT l.keyword,
           COUNT(*)::INT AS raw_count,
-          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25_raw,
-          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75_raw
-        FROM listings
-        WHERE price > 0 AND is_offer_price = FALSE AND is_active = TRUE
-          AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
-        GROUP BY keyword HAVING COUNT(*) >= 4
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT AS p25_raw,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT AS p75_raw
+        FROM listings l
+        LEFT JOIN anchors a ON a.keyword = l.keyword
+        WHERE l.price > 0 AND l.is_offer_price = FALSE AND l.is_active = TRUE
+          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+          AND (a.anchor_price IS NULL
+            OR l.price BETWEEN a.anchor_price * 0.30 AND a.anchor_price * 2.20)
+        GROUP BY l.keyword HAVING COUNT(*) >= 4
       )
       SELECT
         b.keyword,
@@ -3950,8 +3955,11 @@ async function quickStatsAndDealsRebuild() {
         NOW()
       FROM listings l
       JOIN base b ON b.keyword = l.keyword
+      LEFT JOIN anchors a ON a.keyword = l.keyword
       WHERE l.price BETWEEN GREATEST(0, b.p25_raw - 1.5*(b.p75_raw-b.p25_raw))
                         AND (b.p75_raw + 1.5*(b.p75_raw-b.p25_raw))
+        AND (a.anchor_price IS NULL
+          OR l.price BETWEEN a.anchor_price * 0.30 AND a.anchor_price * 2.20)
         AND l.price > 0 AND l.is_offer_price = FALSE AND l.is_active = TRUE
         AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
       GROUP BY b.keyword, b.raw_count, b.p25_raw, b.p75_raw
@@ -4175,13 +4183,34 @@ async function runSeedBatch() {
 // Re-deploy to trigger again. No recurring cron.
 async function runFullSeedScanOnce() {
   console.log(`[SeedScan] Starting one-time full scan of ${SEED_KEYWORDS.length} keywords...`);
+
+  // Pre-load DB counts for all seed keywords in one query — avoids N queries in the loop
+  const dbCountRes = await pool.query(`
+    SELECT keyword, COUNT(*)::INT as n
+    FROM listings
+    WHERE keyword = ANY($1)
+      AND is_active = TRUE
+      AND scraped_at > NOW() - INTERVAL '14 days'
+    GROUP BY keyword
+  `, [SEED_KEYWORDS]);
+  const dbCounts = {};
+  for (const r of dbCountRes.rows) dbCounts[r.keyword] = r.n;
+
   let totalSaved = 0;
+  let skippedDb = 0;
   for (let i = 0; i < SEED_KEYWORDS.length; i++) {
     const keyword = SEED_KEYWORDS[i];
     try {
+      // Skip if Redis cache is still fresh
       const cached = await redisGet(K.sharedScan(keyword));
       if (cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
         console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" — cache hit, skipping`);
+        continue;
+      }
+      // Skip if DB already has 15+ recent listings for this keyword — no point re-scanning
+      if ((dbCounts[keyword] || 0) >= 15) {
+        console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" — ${dbCounts[keyword]} in DB, skipping`);
+        skippedDb++;
         continue;
       }
       const raw = await scrapeKeyword(keyword, {
@@ -4202,7 +4231,7 @@ async function runFullSeedScanOnce() {
       console.error(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" failed:`, e.message);
     }
   }
-  console.log(`[SeedScan] ✅ Done — ${totalSaved} listings saved across ${SEED_KEYWORDS.length} keywords`);
+  console.log(`[SeedScan] ✅ Done — ${totalSaved} new listings saved, ${skippedDb} keywords skipped (already in DB)`);
 }
 
 setTimeout(() => runFullSeedScanOnce().catch(e => console.error('[SeedScan Boot]', e.message)), 30000);
@@ -5114,6 +5143,278 @@ app.post('/ai/text', authMiddleware, async (req, res) => {
 
 // POST /ai/text-image — text scan with an image fetched via URL (listing image)
 // Body: { prompt: string, imageUrl: string }
+// ── Smart Appraisal — DB-backed + Gemini vision ─────────────────────────────
+// Full pipeline:
+// 1. Gemini reads the listing + photo and identifies all items (handles kits/bundles)
+// 2. Each item is looked up in product_price_stats for AU FB Marketplace second-hand prices
+// 3. If not in DB, Gemini's own knowledge of AU second-hand prices is used explicitly
+// 4. For bundles: each item gets its own price lookup, tallied up, compared to ask
+// 5. Final verdict based on real market data, not RRP or retail
+
+app.post('/ai/appraise', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured' });
+
+    const { prompt, imageUrl, imageB64, mediaType, listingId, title, price, keyword } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // Check cache first
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    if (cached) {
+      console.log(`[Appraise] Cache hit`);
+      return res.json({ ...cached, usedCache: true });
+    }
+
+    // Check appraisal limit
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    // ── Step 1: Identify items in the listing (especially for kits/bundles) ──
+    const identifyParts = [{ text: `You are identifying items in an Australian Facebook Marketplace listing for price research.
+
+Title: "${(title||'').slice(0,150)}"
+Listed price: ${price || '?'} AUD
+Search keyword: ${keyword || ''}
+
+Task: Identify ALL distinct items being sold. For a single item return one entry. For a kit/bundle/lot return each item separately.
+
+Return ONLY JSON (no markdown):
+{
+  "is_bundle": true | false,
+  "items": [
+    { "name": "exact product name e.g. Milwaukee M18 Impact Driver", "brand": "Milwaukee", "category": "power_tools", "qty": 1 }
+  ]
+}` }];
+
+    // Add image to identification step if available
+    let imgData = null;
+    if (imageB64 && mediaType) {
+      imgData = { mime_type: mediaType, data: imageB64 };
+    } else if (imageUrl) {
+      try {
+        const imgRes = await axios.get(imageUrl, {
+          responseType: 'arraybuffer', timeout: 10000,
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' }
+        });
+        imgData = { mime_type: imgRes.headers['content-type'] || 'image/jpeg', data: Buffer.from(imgRes.data).toString('base64') };
+      } catch(_) {}
+    }
+
+    if (imgData) identifyParts.unshift({ inline_data: imgData });
+
+    const identRes = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      { contents: [{ parts: identifyParts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+    const identText = identRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const identMatch = identText.match(/\{[\s\S]*\}/);
+    let identified = { is_bundle: false, items: [{ name: title || keyword || 'unknown item', brand: null, category: null, qty: 1 }] };
+    try { if (identMatch) identified = JSON.parse(identMatch[0]); } catch(_) {}
+
+    // ── Step 2: Look up each item in product_price_stats ──
+    const itemsWithPrices = await Promise.all((identified.items || []).map(async item => {
+      // Fuzzy search — find closest product name match
+      const { rows } = await pool.query(`
+        SELECT product_key, display_name, median_price, p25_price, p75_price, sample_count
+        FROM product_price_stats
+        WHERE LOWER(display_name) LIKE LOWER($1)
+           OR LOWER(display_name) LIKE LOWER($2)
+        ORDER BY sample_count DESC
+        LIMIT 1
+      `, [
+        `%${(item.name||'').split(' ').slice(0,3).join('%')}%`,
+        `%${(item.name||'').split(' ').slice(0,2).join('%')}%`,
+      ]);
+      const dbPrice = rows[0] || null;
+      return {
+        ...item,
+        db_median:   dbPrice?.median_price || null,
+        db_p25:      dbPrice?.p25_price    || null,
+        db_p75:      dbPrice?.p75_price    || null,
+        db_samples:  dbPrice?.sample_count || null,
+        db_name:     dbPrice?.display_name || null,
+        db_source:   dbPrice ? 'flipradar_db' : 'gemini_knowledge',
+      };
+    }));
+
+    // Build DB context block for the appraisal prompt
+    const dbContext = itemsWithPrices.map(item => {
+      if (item.db_median) {
+        return `- ${item.name} (qty: ${item.qty||1}): FlipRadar DB median ${item.db_median} AUD [${item.db_samples} FB Marketplace AU sales, p25=${item.db_p25}, p75=${item.db_p75}]`;
+      } else {
+        return `- ${item.name} (qty: ${item.qty||1}): No DB data — use your knowledge of current AU Facebook Marketplace second-hand prices`;
+      }
+    }).join('\n');
+
+    const isBundle = identified.is_bundle && itemsWithPrices.length > 1;
+    const dbTotal = itemsWithPrices.reduce((sum, i) => sum + (i.db_median || 0) * (i.qty || 1), 0);
+
+    // ── Step 3: Build the full appraisal prompt with DB context injected ──
+    const appraisalPrompt = `${prompt}
+
+=== MARKET DATA (Australian Facebook Marketplace second-hand prices) ===
+${isBundle ? `This is a BUNDLE/KIT containing ${itemsWithPrices.length} items:` : 'Single item:'}
+${dbContext}
+${isBundle && dbTotal > 0 ? `\nDB total value if sold individually: ${dbTotal} AUD` : ''}
+
+CRITICAL PRICING RULES:
+- All prices must reflect USED condition on Australian Facebook Marketplace — NOT RRP, NOT eBay, NOT retail
+- Australian FB Marketplace prices typically run 40-60% below RRP for electronics/tools
+- A seller on FB Marketplace needs to price below what they could buy it for at JB Hi-Fi or Bunnings
+- If DB data is available, anchor your estimate to it — it's real AU second-hand sales data
+- If no DB data, use realistic AU FB Marketplace pricing from your training knowledge
+- For bundles: buying as a kit is worth slightly less than individual items (buyer wants discount for bulk)`;
+
+    // ── Step 4: Final appraisal call with full context ──
+    const appraisalParts = [{ text: appraisalPrompt }];
+    if (imgData) appraisalParts.unshift({ inline_data: imgData });
+
+    const appraisalRes = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      { contents: [{ parts: appraisalParts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+    );
+
+    const text = appraisalRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+    // Try to parse and enrich with bundle breakdown
+    let parsed = null;
+    try {
+      const m = text.match(/\{[\s\S]*\}/);
+      if (m) {
+        parsed = JSON.parse(m[0]);
+        // Inject bundle breakdown into response
+        if (isBundle) {
+          parsed._bundleItems = itemsWithPrices.map(i => ({
+            name:      i.name,
+            qty:       i.qty || 1,
+            median:    i.db_median,
+            source:    i.db_source,
+            samples:   i.db_samples,
+          }));
+          parsed._bundleDbTotal = dbTotal || null;
+        }
+      }
+    } catch(_) {}
+
+    const result = parsed ? { ...parsed, text, usedCache: false } : { text, usedCache: false };
+
+    // Cache for future users
+    if (listingId || (title && price)) {
+      await setAppraisalCache(listingId, title, price, keyword, result).catch(() => {});
+    }
+
+    console.log(`[Appraise] ${isBundle ? 'Bundle' : 'Single'} — ${itemsWithPrices.length} item(s), ${itemsWithPrices.filter(i=>i.db_median).length} from DB`);
+    res.json(result);
+
+  } catch (e) {
+    console.error('[Appraise]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// ── Batch feed rating with DB price context ──────────────────────────────────
+// Called by autoAppraise() in the frontend for every batch of feed cards.
+// Looks up DB median for each listing's keyword/product before asking AI to rate.
+// This means the rating is anchored to real AU FB Marketplace second-hand prices.
+
+app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
+  try {
+    const { listings, keyword } = req.body;
+    if (!Array.isArray(listings) || !listings.length) return res.status(400).json({ error: 'listings array required' });
+
+    // Look up DB prices for each listing
+    const enriched = await Promise.all(listings.map(async (l, i) => {
+      const kw = (l.keyword || keyword || '').toLowerCase().trim();
+      let dbMedian = null, dbSamples = null, dbP25 = null, dbP75 = null;
+
+      // 1. Try product_price_stats first (most specific)
+      if (l.title) {
+        const words = l.title.split(' ').slice(0, 4).join('%');
+        const { rows: prodRows } = await pool.query(`
+          SELECT median_price, p25_price, p75_price, sample_count
+          FROM product_price_stats
+          WHERE LOWER(display_name) LIKE LOWER($1)
+          ORDER BY sample_count DESC LIMIT 1
+        `, [`%${words}%`]);
+        if (prodRows[0]?.median_price) {
+          dbMedian  = prodRows[0].median_price;
+          dbP25     = prodRows[0].p25_price;
+          dbP75     = prodRows[0].p75_price;
+          dbSamples = prodRows[0].sample_count;
+        }
+      }
+
+      // 2. Fall back to keyword_price_stats
+      if (!dbMedian && kw) {
+        const { rows: kwRows } = await pool.query(`
+          SELECT median_price, p25_price, p75_price, sample_count
+          FROM keyword_price_stats WHERE keyword = $1
+        `, [kw]);
+        if (kwRows[0]?.median_price) {
+          dbMedian  = kwRows[0].median_price;
+          dbP25     = kwRows[0].p25_price;
+          dbP75     = kwRows[0].p75_price;
+          dbSamples = kwRows[0].sample_count;
+        }
+      }
+
+      const priceStr = l.price ? `AUD ${l.price}` : 'price not listed';
+      const dbStr = dbMedian
+        ? ` [DB median: ${dbMedian}, p25: ${dbP25}, p75: ${dbP75}, ${dbSamples} sales]`
+        : ` [No DB data — use AU FB Marketplace second-hand knowledge]`;
+
+      return { idx: i, line: `${i}. "${(l.title||'').slice(0,100)}" listed ${priceStr}${dbStr}` };
+    }));
+
+    const lines = enriched.map(e => e.line).join(' | ');
+
+    const prompt = `You are an Australian Facebook Marketplace second-hand pricing expert rating listings for a flipper searching: "${keyword || 'unknown'}".
+
+CRITICAL: All ratings must be based on USED second-hand Australian Facebook Marketplace prices only — NOT RRP, NOT retail, NOT eBay.
+When DB median data is provided, use it as your primary price anchor.
+When no DB data exists, use your knowledge of current AU Facebook Marketplace second-hand prices.
+
+For each listing decide:
+1. Is it relevant to the search keyword? (filter out wrong items, accessories, parts if searching for whole item)
+2. Rate the price vs AU FB Marketplace second-hand market:
+   - rainbow = exceptional deal, 50%+ below real FB Marketplace value
+   - green = good deal, 25-50% below FB Marketplace value  
+   - yellow = fair, roughly at FB Marketplace market price
+   - red = overpriced vs FB Marketplace
+
+Listings:
+${lines}
+
+Reply ONLY as JSON array: [{"idx":0,"rating":"yellow","reason":"Fair FB price","relevant":true}]
+Max 6 words per reason. Be specific — mention the actual value if you know it.`;
+
+    const useGemini = !!GEMINI_API_KEY;
+    let text = '';
+
+    if (useGemini) {
+      const r = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+      );
+      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else if (ANTHROPIC_API_KEY) {
+      const r = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001', max_tokens: 1000,
+        messages: [{ role: 'user', content: prompt }],
+      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 20000 });
+      text = r.data?.content?.[0]?.text || '';
+    }
+
+    res.json({ text });
+  } catch (e) {
+    console.error('[RateBatch]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/ai/text-image', authMiddleware, async (req, res) => {
   try {
     if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured on server' });
