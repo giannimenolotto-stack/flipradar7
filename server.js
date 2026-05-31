@@ -4047,7 +4047,7 @@ async function runFullBootSequence() {
       WHERE price_quality = 'unscored'
         AND price > 0
         AND is_offer_price = FALSE
-        AND title NOT ~* '\\y(wanted|wtb|wtt|swap|trade|parts only|wrecking|for parts|not working|broken|faulty|damaged|cracked|smashed|as is|spares)\\y'
+        AND title NOT ~* '(wanted|wtb|wtt|swap|trade|parts only|wrecking|for parts|not working|broken|faulty|damaged|cracked|smashed|as is|spares)'
     `);
     console.log('[Boot] Quality pass done');
 
