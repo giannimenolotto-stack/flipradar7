@@ -550,7 +550,7 @@ Look at the photo and return ONLY this JSON (no markdown):
 Be strict on matches_keyword — only false if the item in the photo is clearly a DIFFERENT type of product. Minor brand differences are fine.`;
 
     const res = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: [
         { inline_data: { mime_type: imgMime, data: imgBase64 } },
         { text: prompt }
@@ -2910,7 +2910,7 @@ Scoring guide:
             } catch (_) {}
           }
           const res = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
             { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
             { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
           );
@@ -3038,7 +3038,7 @@ Return ONLY valid JSON (no markdown):
 Be strict on matches_keyword — only mark false if the item in the photo is clearly a DIFFERENT type of product than the keyword describes. Minor brand/model differences are fine.`;
 
         const geminiRes = await axios.post(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
           { contents: [{ parts: [
             { inline_data: { mime_type: imgMime, data: imgBase64 } },
             { text: prompt }
@@ -4494,7 +4494,7 @@ Look at the photo and return ONLY this JSON (no markdown):
 Only mark matches_keyword false if it is clearly a DIFFERENT type of product.`;
 
     const geminiRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: [
         { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
         { text: prompt }
@@ -5301,7 +5301,7 @@ Return ONLY JSON (no markdown):
     if (imgData) identifyParts.unshift({ inline_data: imgData });
 
     const identRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: identifyParts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
       { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
     );
@@ -5503,7 +5503,7 @@ Max 6 words per reason. Be specific — mention the actual value if you know it.
 
     if (useGemini) {
       const r = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
         { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
       );
