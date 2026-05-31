@@ -214,6 +214,10 @@ async function initDB() {
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS extracted_variant TEXT',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS extraction_confidence TEXT',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS extracted_at TIMESTAMPTZ',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS img_condition TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS img_matches_keyword BOOLEAN',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS img_mismatch_reason TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS img_analysed_at TIMESTAMPTZ',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS previous_price INTEGER',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_dropped_at TIMESTAMPTZ',
@@ -2663,10 +2667,143 @@ cron.schedule('0 2 * * *', async () => {
     // ── Step 9: Rebuild product_price_stats ────────────────
     await rebuildProductPriceStats();
 
+    // ── Step 10: Gemini image analysis ───────────────────────
+    await analyseListingImagesNightly();
+
   } catch (e) {
     console.error('[Cron] Stats rebuild error:', e.message);
   }
 });
+
+// ── Gemini Image Analysis ───────────────────────────────────────────────────
+// Analyses each listing photo to:
+//   1. Assess item condition (new/like_new/good/fair/poor/damaged)
+//   2. Verify the photo actually matches the keyword — flags mismatches (e.g. moped listed as electric scooter)
+// Runs nightly, never re-analyses a listing. Costs ~$0.000075 per image.
+
+async function analyseListingImagesNightly() {
+  if (!GEMINI_API_KEY) { console.log('[ImgAnalysis] No Gemini key — skipping'); return; }
+
+  const BATCH = 20;
+  let processed = 0;
+  let flagged = 0;
+
+  while (true) {
+    const { rows } = await pool.query(`
+      SELECT id, listing_id, title, keyword, price, image_url,
+             extracted_product, extracted_category
+      FROM listings
+      WHERE img_analysed_at IS NULL
+        AND image_url IS NOT NULL AND image_url != ''
+        AND price > 0
+        AND is_active = TRUE
+      ORDER BY scraped_at DESC
+      LIMIT $1
+    `, [BATCH]);
+
+    if (!rows.length) break;
+
+    console.log(`[ImgAnalysis] Analysing batch of ${rows.length} images...`);
+
+    for (const row of rows) {
+      try {
+        // Fetch image
+        let imgBase64 = null, imgMime = 'image/jpeg';
+        try {
+          const imgRes = await axios.get(row.image_url, {
+            responseType: 'arraybuffer', timeout: 12000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+          });
+          imgBase64 = Buffer.from(imgRes.data).toString('base64');
+          imgMime = imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg';
+        } catch (_) {
+          await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+          continue;
+        }
+
+        const keyword  = row.keyword || row.extracted_product || row.title || 'unknown';
+        const category = row.extracted_category || 'general';
+
+        const prompt = `Analyse this Facebook Marketplace listing photo.
+
+Listing:
+- Search keyword: "${keyword}"
+- Title: "${(row.title||'').slice(0,120)}"
+- Category: ${category}
+- Price: ${row.price} AUD
+
+Return ONLY valid JSON (no markdown):
+{
+  "condition": "new" | "like_new" | "good" | "fair" | "poor" | "damaged" | "cannot_assess",
+  "matches_keyword": true | false,
+  "mismatch_reason": null | "short reason e.g. photo shows a petrol moped not an electric scooter",
+  "visible_damage": true | false,
+  "is_stock_photo": true | false
+}
+
+Be strict on matches_keyword — only mark false if the item in the photo is clearly a DIFFERENT type of product than the keyword describes. Minor brand/model differences are fine.`;
+
+        const geminiRes = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+          { contents: [{ parts: [
+            { inline_data: { mime_type: imgMime, data: imgBase64 } },
+            { text: prompt }
+          ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+        );
+
+        const raw = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (!match) {
+          await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+          continue;
+        }
+
+        const result = JSON.parse(match[0]);
+
+        // Determine quality penalty
+        let newQuality = null;
+        if (result.matches_keyword === false) {
+          newQuality = 'spam'; // wrong item — exclude from price pool and deals
+          flagged++;
+          console.log(`[ImgAnalysis] ❌ MISMATCH: "${row.title}" (kw: ${keyword}) — ${result.mismatch_reason}`);
+        } else if (result.condition === 'damaged' || result.visible_damage) {
+          newQuality = 'damage'; // still shows in deals but tint is capped
+        }
+
+        await pool.query(`
+          UPDATE listings SET
+            img_condition       = $1,
+            img_matches_keyword = $2,
+            img_mismatch_reason = $3,
+            img_analysed_at     = NOW(),
+            price_quality = CASE
+              WHEN $4::TEXT IS NOT NULL THEN $4
+              ELSE price_quality
+            END
+          WHERE id = $5
+        `, [
+          result.condition || null,
+          result.matches_keyword !== false,
+          result.mismatch_reason || null,
+          newQuality,
+          row.id,
+        ]);
+
+        processed++;
+        await new Promise(r => setTimeout(r, 400));
+
+      } catch (e) {
+        console.error(`[ImgAnalysis] Error on ${row.listing_id}:`, e.message);
+        await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
+      }
+    }
+
+    console.log(`[ImgAnalysis] Running total: ${processed} analysed, ${flagged} mismatches flagged`);
+  }
+
+  console.log(`[ImgAnalysis] ✅ Done — ${processed} images analysed, ${flagged} removed as mismatches`);
+}
 
 // ── Product Extraction ────────────────────────────────────
 // Reads unprocessed listing titles in batches of 50, asks Claude to identify
@@ -3388,6 +3525,8 @@ async function rebuildGlobalDeals() {
           l.transmission,
           l.fuel_type AS "fuelType",
           l.listed_at AS "listedAt",
+          l.img_condition,
+          l.img_matches_keyword,
           k.median_price AS median
         FROM listings l
         JOIN keyword_price_stats k ON k.keyword = l.keyword
@@ -3439,6 +3578,8 @@ async function rebuildGlobalDeals() {
           l.transmission,
           l.fuel_type AS "fuelType",
           l.listed_at AS "listedAt",
+          l.img_condition,
+          l.img_matches_keyword,
           k.median_price AS median
         FROM listings l
         JOIN kmedians k ON k.keyword = l.keyword
@@ -3478,14 +3619,21 @@ async function rebuildGlobalDeals() {
         transmission: r.transmission || null,
         fuelType:     r.fuelType || null,
         listedAt:     r.listedAt ? r.listedAt.toISOString() : null,
+        imgCondition: r.img_condition || null,
+        imgVerified:  r.img_matches_keyword !== false,
         baseScore,
-        // Tint based on actual dollar saving — % off alone is misleading for cheap items.
-        // A $5 item 60% off is worthless. A $400 saving at 20% off is a great flip.
+        // Tint based on actual dollar saving + image condition.
+        // % off alone is misleading — a $5 item 60% off is worthless.
+        // Damaged items are capped at yellow even if the saving is huge.
         const saving = r.median - r.price;
-        tint: saving >= 500 && pctOff >= 20 ? 'rainbow'   // genuinely great flip
-            : saving >= 200 && pctOff >= 15 ? 'green'     // solid flip
-            : saving >= 100                 ? 'yellow'    // worth a look
-            :                                'grey',      // low profit, not worth the effort
+        const isDamaged = r.img_condition === 'damaged' || r.img_condition === 'poor';
+        const tintRaw = saving >= 500 && pctOff >= 20 ? 'rainbow'
+                      : saving >= 200 && pctOff >= 15 ? 'green'
+                      : saving >= 100                 ? 'yellow'
+                      :                                'grey';
+        tint: isDamaged && tintRaw === 'rainbow' ? 'green'
+            : isDamaged && tintRaw === 'green'   ? 'yellow'
+            : tintRaw,
       };
     });
 
