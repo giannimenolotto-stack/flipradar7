@@ -155,6 +155,8 @@ async function initDB() {
         ceiling_price   INTEGER,
         low_price       INTEGER,
         high_price      INTEGER,
+        anchor_price    INTEGER,
+        is_broad        BOOLEAN DEFAULT FALSE,
         updated_at      TIMESTAMPTZ DEFAULT NOW()
       );
 
@@ -225,6 +227,8 @@ async function initDB() {
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_fix_cost INTEGER',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_reasoning TEXT',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS flip_scored_at TIMESTAMPTZ',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS is_bulk_lot BOOLEAN DEFAULT FALSE',
+      'ALTER TABLE keyword_price_stats ADD COLUMN IF NOT EXISTS is_broad BOOLEAN DEFAULT FALSE',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS previous_price INTEGER',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_dropped_at TIMESTAMPTZ',
@@ -604,6 +608,13 @@ async function upsertListingToDB(rawListing) {
     const offerPrice = isOfferPrice(listing.price);
     const { flags, quality, inPricePool } = scoreListingQuality({ ...listing, price: listing.price });
 
+    // Bulk lot detection — flag bundles/lots so they don't pollute single-item medians
+    const titleLower = (listing.title || '').toLowerCase();
+    const isBulkLot = /\b(bundle|lot|job lot|bulk|set of|x\d+|\d+x|pack of|collection|joblot|wholesale|mixed lot|assorted|combo kit|\d+\s*piece|\d+\s*pcs|\d+\s*items?)\b/.test(titleLower)
+      && !/\b(single|one|1x|solo)\b/.test(titleLower);
+
+
+
     await pool.query(`
       INSERT INTO listings
         (listing_id, title, description, price, is_offer_price, location, state,
@@ -611,13 +622,15 @@ async function upsertListingToDB(rawListing) {
          make, model, series, variant, body_style, year, year_band,
          kms, mileage_band, transmission, fuel_type, engine,
          price_quality, quality_flags, in_price_pool,
+         is_bulk_lot,
          listed_at, scraped_at, last_seen_at, is_active, listing_status, seen_count)
       VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
         $13,$14,$15,$16,$17,$18,$19,
         $20,$21,$22,$23,$24,
         $25,$26,$27,
-        $28,NOW(),NOW(),TRUE,'active',1
+        $28,
+        $29,NOW(),NOW(),TRUE,'active',1
       )
       ON CONFLICT (listing_id) DO UPDATE SET
         price          = EXCLUDED.price,
@@ -634,9 +647,10 @@ async function upsertListingToDB(rawListing) {
         fuel_type      = COALESCE(EXCLUDED.fuel_type,   listings.fuel_type),
         engine         = COALESCE(EXCLUDED.engine,      listings.engine),
         description    = COALESCE(EXCLUDED.description, listings.description),
-        price_quality  = EXCLUDED.price_quality,
-        quality_flags  = EXCLUDED.quality_flags,
-        in_price_pool  = EXCLUDED.in_price_pool
+        price_quality    = EXCLUDED.price_quality,
+        quality_flags    = EXCLUDED.quality_flags,
+        in_price_pool    = EXCLUDED.in_price_pool,
+        is_bulk_lot      = EXCLUDED.is_bulk_lot
     `, [
       listing.id,
       scrubPII(listing.title),
@@ -667,6 +681,7 @@ async function upsertListingToDB(rawListing) {
       quality,
       flags,
       inPricePool,
+      isBulkLot,
       listing.listedAt      ? new Date(listing.listedAt) : null,
     ]);
 
@@ -2601,44 +2616,59 @@ cron.schedule('0 2 * * *', async () => {
         )
     `);
 
-    // ── Step 4: Rebuild keyword_price_stats with IQR data ──
+    // ── Step 4: Rebuild keyword_price_stats ──
+    // Anchor-gated, IQR-cleaned, bulk-excluded, condition-split, broad-flagged.
     await pool.query(`
       INSERT INTO keyword_price_stats
         (keyword, sample_count, raw_count, median_price, p25_price, p75_price,
-         iqr, floor_price, ceiling_price, low_price, high_price, updated_at)
-      WITH base AS (
-        SELECT keyword,
+         iqr, floor_price, ceiling_price, low_price, high_price,
+         is_broad, updated_at)
+      WITH anchors AS (
+        SELECT keyword, anchor_price FROM keyword_anchors
+      ),
+      base AS (
+        SELECT l.keyword,
           COUNT(*)::INT AS raw_count,
-          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
-          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
-        FROM listings
-        WHERE keyword IS NOT NULL AND price > 0
-          AND is_offer_price = FALSE AND in_price_pool = TRUE AND is_active = TRUE
-          AND scraped_at > NOW() - INTERVAL '90 days'
-        GROUP BY keyword HAVING COUNT(*) >= 5
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT AS p25,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT AS p75
+        FROM listings l
+        LEFT JOIN anchors a ON a.keyword = l.keyword
+        WHERE l.keyword IS NOT NULL AND l.price > 0
+          AND l.is_offer_price = FALSE AND l.in_price_pool = TRUE AND l.is_active = TRUE
+          AND l.scraped_at > NOW() - INTERVAL '90 days'
+          AND (l.is_bulk_lot IS NULL OR l.is_bulk_lot = FALSE)
+          AND (a.anchor_price IS NULL
+            OR l.price BETWEEN a.anchor_price * 0.30 AND a.anchor_price * 2.20)
+        GROUP BY l.keyword HAVING COUNT(*) >= 5
       ),
       fenced AS (
         SELECT l.keyword,
-          b.raw_count,
-          b.p25, b.p75,
+          b.raw_count, b.p25, b.p75,
           (b.p75 - b.p25)                               AS iqr,
           GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))::INT  AS fence_lo,
           (b.p75 + 1.5*(b.p75-b.p25))::INT             AS fence_hi,
           COUNT(*)::INT                                 AS clean_count,
           PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT AS median,
-          MIN(l.price)::INT                             AS low,
-          MAX(l.price)::INT                             AS high
-        FROM listings l JOIN base b ON l.keyword = b.keyword
+          MIN(l.price)::INT AS low, MAX(l.price)::INT AS high,
+
+        FROM listings l
+        JOIN base b ON l.keyword = b.keyword
+        LEFT JOIN anchors a ON a.keyword = l.keyword
         WHERE l.price BETWEEN GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))
                           AND (b.p75 + 1.5*(b.p75-b.p25))
+          AND (a.anchor_price IS NULL
+            OR l.price BETWEEN a.anchor_price * 0.30 AND a.anchor_price * 2.20)
           AND l.is_offer_price = FALSE AND l.in_price_pool = TRUE
           AND l.is_active = TRUE
+          AND (l.is_bulk_lot IS NULL OR l.is_bulk_lot = FALSE)
           AND l.scraped_at > NOW() - INTERVAL '90 days'
         GROUP BY l.keyword, b.raw_count, b.p25, b.p75
         HAVING COUNT(*) >= 5
       )
       SELECT keyword, clean_count, raw_count, median, p25, p75,
-             iqr::INT, fence_lo, fence_hi, low, high, NOW()
+             iqr::INT, fence_lo, fence_hi, low, high,
+             (iqr > median * 1.5) AS is_broad,
+             NOW()
       FROM fenced
       ON CONFLICT (keyword) DO UPDATE SET
         sample_count  = EXCLUDED.sample_count,
@@ -2651,6 +2681,7 @@ cron.schedule('0 2 * * *', async () => {
         ceiling_price = EXCLUDED.ceiling_price,
         low_price     = EXCLUDED.low_price,
         high_price    = EXCLUDED.high_price,
+        is_broad      = EXCLUDED.is_broad,
         updated_at    = NOW()
     `);
 
@@ -3800,6 +3831,8 @@ async function rebuildGlobalDeals() {
           AND l.scraped_at > NOW() - INTERVAL '30 days'
           AND k.median_price > 0
           AND k.sample_count >= 4
+          AND (k.is_broad IS NULL OR k.is_broad = FALSE)
+          AND (l.is_bulk_lot IS NULL OR l.is_bulk_lot = FALSE)
           AND l.price < k.median_price * 0.92
           AND (k.median_price - l.price) >= 100
         ORDER BY (k.median_price - l.price)::float / k.median_price DESC
@@ -3821,6 +3854,7 @@ async function rebuildGlobalDeals() {
             AND is_active = TRUE
             AND scraped_at > NOW() - INTERVAL '30 days'
             AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
+            AND (is_bulk_lot IS NULL OR is_bulk_lot = FALSE)
           GROUP BY keyword
           HAVING COUNT(*) >= 4
         )
@@ -5271,8 +5305,8 @@ Return ONLY JSON (no markdown):
 
     // ── Step 2: Look up each item in product_price_stats ──
     const itemsWithPrices = await Promise.all((identified.items || []).map(async item => {
-      // Fuzzy search — find closest product name match
-      const { rows } = await pool.query(`
+      // Try product_price_stats first (most specific)
+      const { rows: prodRows } = await pool.query(`
         SELECT product_key, display_name, median_price, p25_price, p75_price, sample_count
         FROM product_price_stats
         WHERE LOWER(display_name) LIKE LOWER($1)
@@ -5283,15 +5317,24 @@ Return ONLY JSON (no markdown):
         `%${(item.name||'').split(' ').slice(0,3).join('%')}%`,
         `%${(item.name||'').split(' ').slice(0,2).join('%')}%`,
       ]);
-      const dbPrice = rows[0] || null;
+      // Fall back to keyword_price_stats — skip broad keywords
+      let kwMedian = null;
+      if (!prodRows[0]) {
+        const kw = (item.name||'').toLowerCase().split(' ').slice(0,3).join(' ');
+        const { rows: kwRows } = await pool.query(
+          'SELECT median_price, is_broad FROM keyword_price_stats WHERE keyword = $1', [kw]
+        );
+        if (kwRows[0] && !kwRows[0].is_broad) kwMedian = kwRows[0].median_price;
+      }
+      const dbPrice = prodRows[0] || null;
       return {
         ...item,
-        db_median:   dbPrice?.median_price || null,
+        db_median:   dbPrice?.median_price || kwMedian || null,
         db_p25:      dbPrice?.p25_price    || null,
         db_p75:      dbPrice?.p75_price    || null,
         db_samples:  dbPrice?.sample_count || null,
         db_name:     dbPrice?.display_name || null,
-        db_source:   dbPrice ? 'flipradar_db' : 'gemini_knowledge',
+        db_source:   dbPrice ? 'flipradar_db' : kwMedian ? 'keyword_stats' : 'gemini_knowledge',
       };
     }));
 
@@ -5403,17 +5446,18 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
         }
       }
 
-      // 2. Fall back to keyword_price_stats
+      // 2. Fall back to keyword_price_stats (skip broad keywords)
       if (!dbMedian && kw) {
         const { rows: kwRows } = await pool.query(`
-          SELECT median_price, p25_price, p75_price, sample_count
+          SELECT median_price, p25_price, p75_price, sample_count, is_broad
           FROM keyword_price_stats WHERE keyword = $1
         `, [kw]);
-        if (kwRows[0]?.median_price) {
-          dbMedian  = kwRows[0].median_price;
-          dbP25     = kwRows[0].p25_price;
-          dbP75     = kwRows[0].p75_price;
-          dbSamples = kwRows[0].sample_count;
+        const kws = kwRows[0];
+        if (kws?.median_price && !kws.is_broad) {
+          dbMedian  = kws.median_price;
+          dbP25     = kws.p25_price;
+          dbP75     = kws.p75_price;
+          dbSamples = kws.sample_count;
         }
       }
 
