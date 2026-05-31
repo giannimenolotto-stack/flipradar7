@@ -208,10 +208,33 @@ async function initDB() {
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS quality_flags INTEGER DEFAULT 0',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS seen_count INTEGER DEFAULT 1',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS in_price_pool BOOLEAN DEFAULT TRUE',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS extracted_product TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS extracted_brand TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS extracted_category TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS extracted_variant TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS extraction_confidence TEXT',
+      'ALTER TABLE listings ADD COLUMN IF NOT EXISTS extracted_at TIMESTAMPTZ',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS kms INTEGER',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS previous_price INTEGER',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_dropped_at TIMESTAMPTZ',
       'CREATE TABLE IF NOT EXISTS keyword_anchors (keyword TEXT PRIMARY KEY, anchor_price INTEGER NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())',
+      `CREATE TABLE IF NOT EXISTS product_price_stats (
+        product_key     TEXT PRIMARY KEY,
+        display_name    TEXT NOT NULL,
+        brand           TEXT,
+        category        TEXT,
+        variant         TEXT,
+        sample_count    INTEGER DEFAULT 0,
+        median_price    INTEGER,
+        p25_price       INTEGER,
+        p75_price       INTEGER,
+        low_price       INTEGER,
+        high_price      INTEGER,
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+      )`,
+      'CREATE INDEX IF NOT EXISTS idx_product_stats_brand ON product_price_stats(brand)',
+      'CREATE INDEX IF NOT EXISTS idx_product_stats_category ON product_price_stats(category)',
+      'CREATE INDEX IF NOT EXISTS idx_listings_extracted ON listings(extracted_product) WHERE extracted_product IS NOT NULL',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS norm_category TEXT',
     ];
     for (const sql of migrations) {
@@ -352,622 +375,6 @@ function extractEngineFromTitle(title, description) {
   return m ? m[1].trim() : null;
 }
 
-
-// ══════════════════════════════════════════════════════════════════════
-// VEHICLE GENERATION RESOLVER
-// Knows which year ranges belong to which chassis/generation code.
-// e.g. BMW 318i 1995 → E36. Holden Commodore 1999 → VT.
-// Lookup table covers AU market. AI fills the gaps and caches 1 year.
-// ══════════════════════════════════════════════════════════════════════
-
-const VEHICLE_GENERATIONS = {
-  holden: {
-    commodore: [
-      { series:'VP', from:1991, to:1993 },
-      { series:'VR', from:1993, to:1995 },
-      { series:'VS', from:1995, to:1997 },
-      { series:'VT', from:1997, to:2000 },
-      { series:'VX', from:2000, to:2002 },
-      { series:'VY', from:2002, to:2004 },
-      { series:'VZ', from:2004, to:2006 },
-      { series:'VE', from:2006, to:2013 },
-      { series:'VF', from:2013, to:2017 },
-    ],
-    colorado: [
-      { series:'RC', from:2008, to:2012 },
-      { series:'RG', from:2012, to:2020 },
-      { series:'RG Facelift', from:2016, to:2020 },
-    ],
-    captiva: [
-      { series:'CG', from:2006, to:2018 },
-    ],
-  },
-  ford: {
-    falcon: [
-      { series:'EA', from:1988, to:1991 },
-      { series:'EB', from:1991, to:1993 },
-      { series:'EF', from:1994, to:1996 },
-      { series:'EL', from:1996, to:1998 },
-      { series:'AU', from:1998, to:2002 },
-      { series:'BA', from:2002, to:2005 },
-      { series:'BF', from:2005, to:2008 },
-      { series:'FG', from:2008, to:2014 },
-      { series:'FG X', from:2014, to:2016 },
-    ],
-    ranger: [
-      { series:'PX', from:2011, to:2015 },
-      { series:'PX MkII', from:2015, to:2018 },
-      { series:'PX MkIII', from:2018, to:2022 },
-      { series:'P703', from:2022, to:2099 },
-    ],
-    territory: [
-      { series:'SX', from:2004, to:2005 },
-      { series:'SY', from:2005, to:2011 },
-      { series:'SZ', from:2011, to:2016 },
-    ],
-    everest: [
-      { series:'UA', from:2015, to:2022 },
-      { series:'UB', from:2022, to:2099 },
-    ],
-  },
-  toyota: {
-    landcruiser: [
-      { series:'40 Series', from:1960, to:1984 },
-      { series:'60 Series', from:1980, to:1987 },
-      { series:'70 Series', from:1984, to:2099 },
-      { series:'80 Series', from:1989, to:1998 },
-      { series:'100 Series', from:1997, to:2007 },
-      { series:'200 Series', from:2007, to:2021 },
-      { series:'300 Series', from:2021, to:2099 },
-    ],
-    prado: [
-      { series:'J70',  from:1984, to:1990 },
-      { series:'J80',  from:1990, to:1996 },
-      { series:'J90',  from:1996, to:2002 },
-      { series:'J120', from:2002, to:2009 },
-      { series:'J150', from:2009, to:2099 },
-    ],
-    hilux: [
-      { series:'N60',      from:1983, to:1988 },
-      { series:'5th Gen',  from:1988, to:1997 },
-      { series:'6th Gen',  from:1997, to:2005 },
-      { series:'N70',      from:2005, to:2015 },
-      { series:'N80',      from:2015, to:2099 },
-    ],
-    camry: [
-      { series:'XV10', from:1991, to:1996 },
-      { series:'XV20', from:1996, to:2001 },
-      { series:'XV30', from:2001, to:2006 },
-      { series:'XV40', from:2006, to:2011 },
-      { series:'XV50', from:2011, to:2017 },
-      { series:'XV70', from:2017, to:2099 },
-    ],
-    corolla: [
-      { series:'E100', from:1991, to:1997 },
-      { series:'E110', from:1997, to:2002 },
-      { series:'E120', from:2001, to:2007 },
-      { series:'E140', from:2006, to:2013 },
-      { series:'E170', from:2013, to:2018 },
-      { series:'E210', from:2018, to:2099 },
-    ],
-    kluger: [
-      { series:'XU20',  from:2003, to:2007 },
-      { series:'GSU40', from:2007, to:2014 },
-      { series:'GSU50', from:2014, to:2020 },
-      { series:'AXUH80',from:2020, to:2099 },
-    ],
-    'rav4': [
-      { series:'XA10', from:1994, to:2000 },
-      { series:'XA20', from:2000, to:2005 },
-      { series:'XA30', from:2005, to:2012 },
-      { series:'XA40', from:2012, to:2018 },
-      { series:'XA50', from:2018, to:2099 },
-    ],
-    'hiace': [
-      { series:'H100', from:1989, to:2004 },
-      { series:'H200', from:2004, to:2019 },
-      { series:'H300', from:2019, to:2099 },
-    ],
-    'tarago': [
-      { series:'XR50', from:2006, to:2017 },
-    ],
-  },
-  nissan: {
-    patrol: [
-      { series:'GQ', from:1987, to:1997 },
-      { series:'GU', from:1997, to:2016 },
-      { series:'Y62', from:2010, to:2099 },
-    ],
-    navara: [
-      { series:'D21', from:1986, to:1997 },
-      { series:'D22', from:1997, to:2015 },
-      { series:'D40', from:2004, to:2015 },
-      { series:'D23', from:2015, to:2099 },
-    ],
-    skyline: [
-      { series:'R31', from:1985, to:1990 },
-      { series:'R32', from:1989, to:1993 },
-      { series:'R33', from:1993, to:1998 },
-      { series:'R34', from:1998, to:2002 },
-      { series:'V35', from:2001, to:2006 },
-      { series:'V36', from:2006, to:2014 },
-    ],
-    silvia: [
-      { series:'S12', from:1984, to:1988 },
-      { series:'S13', from:1988, to:1994 },
-      { series:'S14', from:1993, to:1999 },
-      { series:'S15', from:1999, to:2002 },
-    ],
-    'x-trail': [
-      { series:'T30', from:2001, to:2007 },
-      { series:'T31', from:2007, to:2013 },
-      { series:'T32', from:2013, to:2022 },
-      { series:'T33', from:2022, to:2099 },
-    ],
-  },
-  mitsubishi: {
-    triton: [
-      { series:'Mk2/L200', from:1986, to:1996 },
-      { series:'MK',       from:1996, to:2006 },
-      { series:'ML',       from:2006, to:2009 },
-      { series:'MN',       from:2009, to:2015 },
-      { series:'MQ',       from:2015, to:2019 },
-      { series:'MR',       from:2018, to:2099 },
-    ],
-    pajero: [
-      { series:'NH/NJ/NK/NL', from:1991, to:1999 },
-      { series:'NM/NP',       from:1999, to:2006 },
-      { series:'NS/NT/NW/NX', from:2006, to:2021 },
-    ],
-    lancer: [
-      { series:'CE', from:1996, to:2003 },
-      { series:'CH', from:2002, to:2007 },
-      { series:'CJ', from:2007, to:2017 },
-    ],
-    'evolution': [
-      { series:'Evo I-III', from:1992, to:1995 },
-      { series:'Evo IV',    from:1996, to:1998 },
-      { series:'Evo V',     from:1998, to:1999 },
-      { series:'Evo VI',    from:1999, to:2001 },
-      { series:'Evo VII',   from:2001, to:2003 },
-      { series:'Evo VIII',  from:2003, to:2005 },
-      { series:'Evo IX',    from:2005, to:2007 },
-      { series:'Evo X',     from:2007, to:2016 },
-    ],
-    outlander: [
-      { series:'ZG', from:2006, to:2012 },
-      { series:'ZJ', from:2012, to:2021 },
-      { series:'ZM', from:2021, to:2099 },
-    ],
-  },
-  subaru: {
-    impreza: [
-      { series:'GC/GF',   from:1992, to:2000 },
-      { series:'GD/GG',   from:2000, to:2007 },
-      { series:'GE/GH/GR',from:2007, to:2011 },
-      { series:'GJ/GP',   from:2011, to:2016 },
-      { series:'GT',      from:2016, to:2023 },
-    ],
-    wrx: [
-      { series:'GC WRX',  from:1994, to:2000 },
-      { series:'GD WRX',  from:2000, to:2007 },
-      { series:'GE WRX',  from:2007, to:2014 },
-      { series:'VA',      from:2014, to:2021 },
-      { series:'VB',      from:2021, to:2099 },
-    ],
-    'wrx sti': [
-      { series:'GC STI',  from:1994, to:2000 },
-      { series:'GD STI',  from:2000, to:2007 },
-      { series:'GR STI',  from:2007, to:2014 },
-      { series:'VA STI',  from:2014, to:2021 },
-    ],
-    forester: [
-      { series:'SF', from:1997, to:2002 },
-      { series:'SG', from:2002, to:2008 },
-      { series:'SH', from:2008, to:2012 },
-      { series:'SJ', from:2012, to:2018 },
-      { series:'SK', from:2018, to:2099 },
-    ],
-    outback: [
-      { series:'BH', from:1999, to:2003 },
-      { series:'BP', from:2003, to:2009 },
-      { series:'BR', from:2009, to:2014 },
-      { series:'BS', from:2014, to:2020 },
-      { series:'BT', from:2020, to:2099 },
-    ],
-    liberty: [
-      { series:'BH', from:1998, to:2003 },
-      { series:'BP', from:2003, to:2009 },
-      { series:'BR', from:2009, to:2014 },
-      { series:'BS', from:2014, to:2020 },
-    ],
-  },
-  bmw: {
-    // 3 series: 316-340, M3
-    '3': [
-      { series:'E21', from:1975, to:1983 },
-      { series:'E30', from:1982, to:1994 },
-      { series:'E36', from:1990, to:2000 },
-      { series:'E46', from:1997, to:2006 },
-      { series:'E90', from:2004, to:2013 },
-      { series:'F30', from:2011, to:2019 },
-      { series:'G20', from:2018, to:2099 },
-    ],
-    // 5 series: 518-550, M5
-    '5': [
-      { series:'E28', from:1981, to:1988 },
-      { series:'E34', from:1987, to:1996 },
-      { series:'E39', from:1995, to:2003 },
-      { series:'E60', from:2003, to:2010 },
-      { series:'F10', from:2009, to:2017 },
-      { series:'G30', from:2016, to:2099 },
-    ],
-    // 7 series: 728-760
-    '7': [
-      { series:'E23', from:1977, to:1986 },
-      { series:'E32', from:1986, to:1994 },
-      { series:'E38', from:1994, to:2001 },
-      { series:'E65', from:2001, to:2008 },
-      { series:'F01', from:2008, to:2015 },
-      { series:'G11', from:2015, to:2099 },
-    ],
-    // 1 series
-    '1': [
-      { series:'E87', from:2004, to:2012 },
-      { series:'F20', from:2011, to:2019 },
-      { series:'F40', from:2019, to:2099 },
-    ],
-    // 2 series
-    '2': [
-      { series:'F22', from:2013, to:2021 },
-      { series:'G42', from:2021, to:2099 },
-    ],
-    // 4 series (coupe/convertible of 3)
-    '4': [
-      { series:'F32', from:2013, to:2020 },
-      { series:'G22', from:2020, to:2099 },
-    ],
-    // X models
-    'x1': [
-      { series:'E84', from:2009, to:2015 },
-      { series:'F48', from:2015, to:2022 },
-      { series:'U11', from:2022, to:2099 },
-    ],
-    'x3': [
-      { series:'E83', from:2003, to:2010 },
-      { series:'F25', from:2010, to:2017 },
-      { series:'G01', from:2017, to:2099 },
-    ],
-    'x5': [
-      { series:'E53', from:1999, to:2006 },
-      { series:'E70', from:2006, to:2013 },
-      { series:'F15', from:2013, to:2018 },
-      { series:'G05', from:2018, to:2099 },
-    ],
-    'x6': [
-      { series:'E71', from:2008, to:2014 },
-      { series:'F16', from:2014, to:2019 },
-      { series:'G06', from:2019, to:2099 },
-    ],
-    'm3': [
-      { series:'E30 M3', from:1986, to:1991 },
-      { series:'E36 M3', from:1992, to:1999 },
-      { series:'E46 M3', from:2000, to:2006 },
-      { series:'E92 M3', from:2007, to:2013 },
-      { series:'F80 M3', from:2014, to:2018 },
-      { series:'G80 M3', from:2020, to:2099 },
-    ],
-    'm4': [
-      { series:'F82 M4', from:2014, to:2020 },
-      { series:'G82 M4', from:2020, to:2099 },
-    ],
-  },
-  mercedes: {
-    'c-class': [
-      { series:'W202', from:1993, to:2000 },
-      { series:'W203', from:2000, to:2007 },
-      { series:'W204', from:2007, to:2014 },
-      { series:'W205', from:2014, to:2022 },
-      { series:'W206', from:2021, to:2099 },
-    ],
-    'e-class': [
-      { series:'W124', from:1984, to:1997 },
-      { series:'W210', from:1995, to:2002 },
-      { series:'W211', from:2002, to:2009 },
-      { series:'W212', from:2009, to:2016 },
-      { series:'W213', from:2016, to:2099 },
-    ],
-    's-class': [
-      { series:'W126', from:1979, to:1991 },
-      { series:'W140', from:1991, to:1998 },
-      { series:'W220', from:1998, to:2005 },
-      { series:'W221', from:2005, to:2013 },
-      { series:'W222', from:2013, to:2020 },
-      { series:'W223', from:2020, to:2099 },
-    ],
-    'sprinter': [
-      { series:'T1N', from:1995, to:2006 },
-      { series:'W906', from:2006, to:2018 },
-      { series:'W907', from:2018, to:2099 },
-    ],
-    'vito': [
-      { series:'W638', from:1996, to:2003 },
-      { series:'W639', from:2003, to:2014 },
-      { series:'W447', from:2014, to:2099 },
-    ],
-  },
-  audi: {
-    'a3': [
-      { series:'8L', from:1996, to:2003 },
-      { series:'8P', from:2003, to:2013 },
-      { series:'8V', from:2012, to:2020 },
-      { series:'8Y', from:2020, to:2099 },
-    ],
-    'a4': [
-      { series:'B5', from:1994, to:2001 },
-      { series:'B6', from:2000, to:2004 },
-      { series:'B7', from:2004, to:2008 },
-      { series:'B8', from:2007, to:2015 },
-      { series:'B9', from:2015, to:2099 },
-    ],
-    'a6': [
-      { series:'C4', from:1994, to:1997 },
-      { series:'C5', from:1997, to:2004 },
-      { series:'C6', from:2004, to:2011 },
-      { series:'C7', from:2011, to:2018 },
-      { series:'C8', from:2018, to:2099 },
-    ],
-    'tt': [
-      { series:'8N', from:1998, to:2006 },
-      { series:'8J', from:2006, to:2014 },
-      { series:'8S', from:2014, to:2023 },
-    ],
-    'q5': [
-      { series:'8R', from:2008, to:2017 },
-      { series:'FY', from:2016, to:2099 },
-    ],
-  },
-  volkswagen: {
-    golf: [
-      { series:'MK1', from:1974, to:1983 },
-      { series:'MK2', from:1983, to:1992 },
-      { series:'MK3', from:1992, to:1998 },
-      { series:'MK4', from:1998, to:2006 },
-      { series:'MK5', from:2004, to:2009 },
-      { series:'MK6', from:2008, to:2014 },
-      { series:'MK7', from:2012, to:2020 },
-      { series:'MK8', from:2020, to:2099 },
-    ],
-    polo: [
-      { series:'9N', from:2001, to:2009 },
-      { series:'6R', from:2009, to:2014 },
-      { series:'6C', from:2014, to:2017 },
-      { series:'AW', from:2017, to:2099 },
-    ],
-    passat: [
-      { series:'B5', from:1996, to:2005 },
-      { series:'B6', from:2005, to:2010 },
-      { series:'B7', from:2010, to:2014 },
-      { series:'B8', from:2014, to:2099 },
-    ],
-    tiguan: [
-      { series:'5N', from:2007, to:2016 },
-      { series:'AD', from:2016, to:2099 },
-    ],
-    amarok: [
-      { series:'2H', from:2010, to:2022 },
-      { series:'NF', from:2022, to:2099 },
-    ],
-  },
-  mazda: {
-    '3': [
-      { series:'BK', from:2003, to:2009 },
-      { series:'BL', from:2009, to:2013 },
-      { series:'BM', from:2013, to:2019 },
-      { series:'BP', from:2019, to:2099 },
-    ],
-    '6': [
-      { series:'GG', from:2002, to:2007 },
-      { series:'GH', from:2007, to:2012 },
-      { series:'GJ', from:2012, to:2022 },
-    ],
-    'cx-5': [
-      { series:'KE', from:2012, to:2017 },
-      { series:'KF', from:2017, to:2099 },
-    ],
-    'cx-9': [
-      { series:'TB', from:2007, to:2016 },
-      { series:'TC', from:2016, to:2099 },
-    ],
-    'rx-7': [
-      { series:'FB', from:1978, to:1985 },
-      { series:'FC', from:1985, to:1992 },
-      { series:'FD', from:1992, to:2002 },
-    ],
-    'mx-5': [
-      { series:'NA', from:1989, to:1997 },
-      { series:'NB', from:1997, to:2005 },
-      { series:'NC', from:2005, to:2014 },
-      { series:'ND', from:2015, to:2099 },
-    ],
-  },
-  honda: {
-    civic: [
-      { series:'EG', from:1991, to:1995 },
-      { series:'EK', from:1995, to:2001 },
-      { series:'EP', from:2001, to:2005 },
-      { series:'FD', from:2005, to:2011 },
-      { series:'FB', from:2011, to:2016 },
-      { series:'FC', from:2015, to:2021 },
-      { series:'FL', from:2021, to:2099 },
-    ],
-    crv: [
-      { series:'RD', from:1995, to:2001 },
-      { series:'RD/RE', from:2001, to:2012 },
-      { series:'RM', from:2012, to:2016 },
-      { series:'RW', from:2016, to:2022 },
-      { series:'RS', from:2022, to:2099 },
-    ],
-    jazz: [
-      { series:'GD', from:2001, to:2008 },
-      { series:'GE', from:2008, to:2014 },
-      { series:'GK', from:2014, to:2020 },
-      { series:'GR', from:2020, to:2099 },
-    ],
-  },
-  hyundai: {
-    'i30': [
-      { series:'FD', from:2007, to:2012 },
-      { series:'GD', from:2011, to:2017 },
-      { series:'PD', from:2016, to:2099 },
-    ],
-    'tucson': [
-      { series:'JM', from:2004, to:2010 },
-      { series:'LM', from:2009, to:2015 },
-      { series:'TL', from:2015, to:2020 },
-      { series:'NX4', from:2020, to:2099 },
-    ],
-    'santa fe': [
-      { series:'SM', from:2000, to:2006 },
-      { series:'CM', from:2006, to:2012 },
-      { series:'DM', from:2012, to:2018 },
-      { series:'TM', from:2018, to:2099 },
-    ],
-  },
-  kia: {
-    'sportage': [
-      { series:'JA', from:1993, to:2004 },
-      { series:'KM', from:2004, to:2010 },
-      { series:'SL', from:2010, to:2016 },
-      { series:'QL', from:2015, to:2022 },
-      { series:'NQ5', from:2021, to:2099 },
-    ],
-    'cerato': [
-      { series:'LD', from:2003, to:2008 },
-      { series:'TD', from:2008, to:2013 },
-      { series:'YD', from:2012, to:2018 },
-      { series:'BD', from:2018, to:2099 },
-    ],
-  },
-};
-
-// Map a raw model string to the correct lookup key in VEHICLE_GENERATIONS
-function getModelLineKey(make, rawModel) {
-  if (!rawModel) return null;
-  const m = String(rawModel).toLowerCase().trim();
-
-  if (make === 'bmw') {
-    // M models first (specific)
-    if (/m3/.test(m)) return 'm3';
-    if (/m4/.test(m)) return 'm4';
-    if (/m5/.test(m)) return 'm5';
-    // X models
-    if (/x1/.test(m)) return 'x1';
-    if (/x3/.test(m)) return 'x3';
-    if (/x5/.test(m)) return 'x5';
-    if (/x6/.test(m)) return 'x6';
-    if (/x7/.test(m)) return 'x7';
-    // Number series: extract leading digit from model like "320d", "318i", "520d"
-    const numLine = m.match(/\b([1-8])\d{2}/);
-    if (numLine) return numLine[1]; // '3', '5', '7' etc.
-    // Already just a number ("3 series", "3-series", "3")
-    const justNum = m.match(/^([1-8])(?:\s*series)?$/);
-    if (justNum) return justNum[1];
-    return null;
-  }
-
-  if (make === 'mercedes') {
-    if (/\bc.?class\b|\bc ?\d{3}\b|\bc63\b|\bc43\b|\bc45\b/.test(m)) return 'c-class';
-    if (/\be.?class\b|\be ?\d{3}\b|\be63\b|\be53\b/.test(m)) return 'e-class';
-    if (/\bs.?class\b|\bs ?\d{3}\b/.test(m)) return 's-class';
-    if (/\bvito\b/.test(m)) return 'vito';
-    if (/\bsprinter\b/.test(m)) return 'sprinter';
-    return m.split(' ')[0]; // fallback to first word
-  }
-
-  if (make === 'audi') {
-    // A3, S3, RS3 → a3 table
-    if (/\b[sr]?s?3\b|\ba3\b/.test(m)) return 'a3';
-    // A4, S4, RS4 → a4 table
-    if (/\b[sr]?s?4\b|\ba4\b/.test(m)) return 'a4';
-    if (/\ba6\b|\bs6\b|\brs6\b/.test(m)) return 'a6';
-    if (/\btt\b/.test(m)) return 'tt';
-    if (/\bq5\b/.test(m)) return 'q5';
-    return m.split(' ')[0];
-  }
-
-  if (make === 'volkswagen') {
-    if (/\bgolf\b/.test(m)) return 'golf';
-    if (/\bpolo\b/.test(m)) return 'polo';
-    if (/\bpassat\b/.test(m)) return 'passat';
-    if (/\btiguan\b/.test(m)) return 'tiguan';
-    if (/\bamarok\b/.test(m)) return 'amarok';
-  }
-
-  // For Toyota, Nissan, Holden, Ford, Mazda, etc. — model is usually the key directly
-  // Clean it up: "3 series" → "3", "hilux sr5" → "hilux", etc.
-  return m.replace(/\s*(sr5?|sr|glx?|dx|gl|vx|vn|executive|elite|sport|turbo|diesel|petrol|auto|manual|4wd|2wd)\s*$/i,'').trim();
-}
-
-// Sync lookup: given make+model+year, return the chassis/generation series.
-// Returns null if not found — caller can then try aiResolveGeneration().
-function lookupGenerationByYear(make, rawModel, year) {
-  if (!make || !year || year < 1960) return null;
-  const mk = String(make).toLowerCase().trim();
-  const modelKey = getModelLineKey(mk, rawModel);
-  if (!modelKey) return null;
-
-  const gens = VEHICLE_GENERATIONS[mk]?.[modelKey];
-  if (!gens || !gens.length) return null;
-
-  // Find all generations whose year range covers this year
-  const matches = gens.filter(g => year >= g.from && year <= g.to);
-  if (!matches.length) return null;
-  // Overlap (changeover year): prefer the newer generation (higher from)
-  return matches.sort((a, b) => b.from - a.from)[0].series;
-}
-
-// AI fallback: asks Gemini/Haiku to identify the generation.
-// Cached for 1 year per (make, model, year) — static automotive knowledge.
-async function aiResolveGeneration(make, model, year) {
-  if (!make || !year) return null;
-  const ck = ('gen:' + String(make) + ':' + String(model||'') + ':' + String(year)).toLowerCase().replace(/\s/g,'_');
-  try {
-    const cached = await redisGet(ck);
-    if (cached && cached.s !== undefined) return cached.s || null;
-  } catch(_) {}
-
-  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
-
-  const prompt = [
-    'You are an automotive expert. What is the chassis/generation code for this vehicle?',
-    `Year: ${year}, Make: ${make}, Model: ${model || 'unknown'}`,
-    'Examples: BMW E36, Holden VT Commodore, Ford BF Falcon, Toyota N70 HiLux, Nissan GU Patrol, VW MK4 Golf, Mazda BL Mazda3',
-    'Return ONLY JSON — no explanation: { "series": "code" } or { "series": null } if unknown.',
-  ].join('\n');
-
-  try {
-    let text = '';
-    if (GEMINI_API_KEY) {
-      const r = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents:[{parts:[{text:prompt}]}], generationConfig:{ thinkingConfig:{thinkingBudget:0} } },
-        { headers:{'Content-Type':'application/json'}, timeout:8000 });
-      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    } else {
-      const r = await axios.post('https://api.anthropic.com/v1/messages',
-        { model:'claude-haiku-4-5-20251001', max_tokens:60, messages:[{role:'user',content:prompt}] },
-        { headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'}, timeout:8000 });
-      text = r.data?.content?.[0]?.text || '';
-    }
-    const mj = text.match(/\{[\s\S]*?\}/);
-    const parsed = mj ? JSON.parse(mj[0]) : null;
-    const s = (parsed?.series && typeof parsed.series === 'string') ? parsed.series.trim() : null;
-    await redisSet(ck, { s }, 365 * 24 * 3600).catch(()=>{});
-    return s;
-  } catch(e) { console.error('[GenAI]', make, model, year, e.message); return null; }
-}
-
 // ── Enrich a listing with all precise vehicle identity fields ──
 // Called before upsert — fills in series, variant, bands etc
 function enrichVehicleIdentity(listing) {
@@ -976,8 +383,7 @@ function enrichVehicleIdentity(listing) {
   const title = listing.title || '';
   const desc  = listing.description || '';
 
-  const series    = listing.series    || extractSeriesFromTitle(listing.make, listing.model, title)
-                  || lookupGenerationByYear(listing.make, listing.model, listing.year);
+  const series    = listing.series    || extractSeriesFromTitle(listing.make, listing.model, title);
   const variant   = listing.variant   || extractVariantFromTitle(title);
   const bodyStyle = listing.body_style || extractBodyStyleFromTitle(title, desc);
   const fuelType  = listing.fuel_type  || extractFuelTypeFromTitle(title, desc);
@@ -1078,10 +484,7 @@ function scoreListingQuality(listing) {
   else if (flags & (16 | 32)) quality = 'suspicious';  // price bounds
   else if (flags & 1) quality = 'offer_price';
 
-  // Vehicle without km data can't be placed in a cohort — exclude from pool
-  const isVehicle = !!(listing.make);
-  const hasMileage = listing.mileage && listing.mileage > 0;
-  const inPricePool = quality === 'ok' && (!isVehicle || hasMileage);
+  const inPricePool = quality === 'ok';
 
   return { flags, quality, inPricePool };
 }
@@ -2179,10 +1582,10 @@ function verificationEmail(name, email, code) {
 
 // ── Scan intervals per plan ───────────────────────────────
 const PLAN_INTERVALS = {
-  free:    30 * 60 * 1000,  // 30 minutes
-  basic:   30 * 60 * 1000,  // 30 minutes
-  pro:     30 * 60 * 1000,  // 30 minutes
-  premium: 30 * 60 * 1000,  // 30 minutes
+  free:    2 * 60 * 60 * 1000,  // 2 hours
+  basic:   2 * 60 * 60 * 1000,  // 2 hours
+  pro:     2 * 60 * 60 * 1000,  // 2 hours
+  premium: 2 * 60 * 60 * 1000,  // 2 hours
 };
 
 // ── In-memory state ───────────────────────────────────────
@@ -2992,104 +2395,6 @@ async function pauseInactiveUsers() {
   }
   console.log(`[AutoPause] Done — ${paused} watch(es) paused`);
 }
-
-// ── Seed scanner — runs every 2 days, stops each keyword once it has enough data ──
-// Builds the price-stats database without needing user watches.
-// Each keyword is automatically retired once it hits SEED_THRESHOLD clean listings.
-
-const SEED_THRESHOLD = 25; // min listings in price pool before a keyword is considered seeded
-
-const SEED_KEYWORDS = [
-  // Vehicles — generation resolver sorts them into correct cohorts by year
-  'holden commodore', 'ford falcon', 'toyota hilux', 'ford ranger',
-  'toyota landcruiser', 'toyota prado', 'nissan patrol', 'nissan navara',
-  'mitsubishi triton', 'subaru wrx', 'toyota kluger', 'holden ute',
-  'bmw 3 series', 'ford territory', 'toyota camry', 'toyota corolla',
-  // Power tools — brand specific for tight cohorts
-  'milwaukee m18', 'milwaukee m12', 'makita 18v', 'dewalt 18v',
-  'festool', 'hilti', 'ryobi one+',
-  // Phones & tablets
-  'iphone 14 pro', 'iphone 13', 'iphone 15', 'ipad pro',
-  'samsung galaxy s23', 'samsung galaxy s24',
-  // Gaming
-  'ps5 console', 'xbox series x', 'nintendo switch oled', 'steam deck',
-  // Computers
-  'macbook pro', 'macbook air',
-  // Home & appliances
-  'dyson v15', 'dyson v11', 'dyson airwrap', 'thermomix', 'kitchenaid',
-  // Outdoor & camping
-  'engel fridge', 'waeco fridge', 'weber bbq',
-];
-
-async function getSeedStatus() {
-  // Returns { keyword: sampleCount } for all seed keywords
-  try {
-    const placeholders = SEED_KEYWORDS.map((_, i) => `$${i + 1}`).join(',');
-    // Check actual pool-eligible listings in DB (works even before stats are rebuilt)
-    const { rows } = await pool.query(`
-      SELECT keyword, COUNT(*)::INT AS n
-      FROM listings
-      WHERE keyword = ANY($1) AND in_price_pool = TRUE AND is_active = TRUE
-      GROUP BY keyword
-    `, [SEED_KEYWORDS]);
-    const status = {};
-    SEED_KEYWORDS.forEach(kw => { status[kw] = 0; });
-    rows.forEach(r => { status[r.keyword] = r.n; });
-    return status;
-  } catch(e) {
-    console.error('[Seed] status check error:', e.message);
-    return {};
-  }
-}
-
-async function runSeedJob() {
-  console.log('[Seed] Starting seed scan run...');
-  const status = await getSeedStatus();
-  const pending = SEED_KEYWORDS.filter(kw => (status[kw] || 0) < SEED_THRESHOLD);
-  const complete = SEED_KEYWORDS.length - pending.length;
-
-  console.log(`[Seed] ${complete}/${SEED_KEYWORDS.length} keywords seeded. ${pending.length} remaining.`);
-
-  if (pending.length === 0) {
-    console.log('[Seed] All keywords seeded — seed job complete. No credits used.');
-    return;
-  }
-
-  let scanned = 0;
-  for (const keyword of pending) {
-    try {
-      // Scan using minimal opts — upsertListingToDB fires automatically inside the scan
-      await sociaVaultKeywordScan(keyword, {
-        keyword,
-        minPrice: null, maxPrice: null,
-        minYear: null, maxYear: null,
-        minKms: null, maxKms: null,
-        transmission: null,
-        excludeWords: [],
-        initialScan: true,
-      });
-      scanned++;
-      console.log(`[Seed] "${keyword}" scanned (${status[keyword] || 0} → checking...)`);
-      await new Promise(res => setTimeout(res, 400)); // small pause between calls
-    } catch(e) {
-      console.error(`[Seed] "${keyword}" error:`, e.message);
-    }
-  }
-  console.log(`[Seed] Run complete — ${scanned} keywords scanned.`);
-}
-
-// Run seed job every 2 days at 7am
-cron.schedule('0 7 */2 * *', () => {
-  runSeedJob().catch(e => console.error('[Seed] cron error:', e.message));
-});
-
-// Refresh global deals cache every 90 min
-cron.schedule('0,30 */1 * * *', () => {
-  // Runs at :00 and :30 past each hour — but only fires the cache rebuild every 90 min
-  // Simple approach: just rebuild; Redis TTL of 95 min means rarely two rebuilds overlap
-  buildGlobalDealsCache().catch(e => console.error('[DealsCache] cron error:', e.message));
-});
-
 cron.schedule('0 3 * * *', () => pauseInactiveUsers().catch(e => console.error('[AutoPause]', e.message)));
 
 // ── Nightly DB stats rebuild + IQR outlier pass (2am AEST) ──
@@ -3190,12 +2495,6 @@ cron.schedule('0 2 * * *', async () => {
     `);
 
     // ── Step 4: Rebuild keyword_price_stats with IQR data ──
-    // GENERAL GOODS ONLY — vehicles have their own vehicle_price_stats table.
-    // Also normalise known keyword typos before grouping.
-    await pool.query(`
-      UPDATE listings SET keyword = 'holden commodore'
-      WHERE keyword = 'holden comodore'
-    `);
     await pool.query(`
       INSERT INTO keyword_price_stats
         (keyword, sample_count, raw_count, median_price, p25_price, p75_price,
@@ -3207,7 +2506,6 @@ cron.schedule('0 2 * * *', async () => {
           PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
         FROM listings
         WHERE keyword IS NOT NULL AND price > 0
-          AND category = 'general'
           AND is_offer_price = FALSE AND in_price_pool = TRUE AND is_active = TRUE
           AND scraped_at > NOW() - INTERVAL '90 days'
         GROUP BY keyword HAVING COUNT(*) >= 5
@@ -3226,7 +2524,6 @@ cron.schedule('0 2 * * *', async () => {
         FROM listings l JOIN base b ON l.keyword = b.keyword
         WHERE l.price BETWEEN GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))
                           AND (b.p75 + 1.5*(b.p75-b.p25))
-          AND l.category = 'general'
           AND l.is_offer_price = FALSE AND l.in_price_pool = TRUE
           AND l.is_active = TRUE
           AND l.scraped_at > NOW() - INTERVAL '90 days'
@@ -3277,8 +2574,6 @@ cron.schedule('0 2 * * *', async () => {
           PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
         FROM listings
         WHERE make IS NOT NULL AND year_band IS NOT NULL
-          AND kms IS NOT NULL AND kms > 0
-          AND mileage_band IS NOT NULL AND mileage_band != 'unknown'
           AND price > 0 AND is_offer_price = FALSE
           AND in_price_pool = TRUE
           AND listing_status IN ('active','sold')
@@ -3362,10 +2657,203 @@ cron.schedule('0 2 * * *', async () => {
       `Marked sold: ${sold.rowCount} · ` +
       `Total sold in DB: ${soldCount.rows[0].cnt}`
     );
+    // ── Step 8: AI product extraction ────────────────────────
+    await extractProductsNightly();
+
+    // ── Step 9: Rebuild product_price_stats ────────────────
+    await rebuildProductPriceStats();
+
   } catch (e) {
     console.error('[Cron] Stats rebuild error:', e.message);
   }
 });
+
+// ── Product Extraction ────────────────────────────────────
+// Reads unprocessed listing titles in batches of 50, asks Claude to identify
+// the exact product, saves back to DB. Runs nightly — never re-processes a listing.
+
+async function extractProductsNightly() {
+  if (!ANTHROPIC_API_KEY) { console.log('[Extract] No Anthropic key — skipping'); return; }
+
+  const BATCH = 50;
+  let processed = 0;
+
+  while (true) {
+    // Grab next batch of unextracted listings (non-vehicle, has a real price)
+    const { rows } = await pool.query(`
+      SELECT id, listing_id, title, keyword, price
+      FROM listings
+      WHERE extracted_at IS NULL
+        AND category != 'vehicle'
+        AND price > 0
+        AND is_offer_price = FALSE
+        AND price_quality IN ('ok', 'unscored')
+        AND title IS NOT NULL AND title != ''
+      ORDER BY scraped_at DESC
+      LIMIT $1
+    `, [BATCH]);
+
+    if (!rows.length) break;
+
+    console.log(`[Extract] Processing batch of ${rows.length} listings...`);
+
+    // Build prompt — ask Claude to classify all titles in one call
+    const items = rows.map((r, i) => `${i+1}. "${r.title.replace(/"/g, "'").slice(0, 120)}" (keyword: ${r.keyword || 'unknown'}, price: ${r.price})`).join('\n');
+
+    const prompt = `You are extracting structured product data from Australian Facebook Marketplace listing titles.
+
+For each listing, identify the EXACT product being sold. Focus on the specific model/item, not accessories or bundles.
+
+Rules:
+- extracted_product: the clean standardised product name (e.g. "Milwaukee M18 Impact Driver", "iPhone 15 Pro 256GB", "Weber Q2200 BBQ", "Dyson V15 Detect", "Trek Marlin 7 Mountain Bike")
+- brand: the manufacturer/brand (e.g. "Milwaukee", "Apple", "Weber", "Trek")  
+- category: one of: phones | laptops | tablets | gaming | tvs | audio | power_tools | hand_tools | garden | camping | vehicles | bikes | furniture | appliances | fitness | musical_instruments | photography | baby_kids | clothing | watches | collectibles | trade_industrial | general
+- variant: any key differentiator like storage size, colour, voltage, size (e.g. "256GB", "18V", "65 inch", "XL") — null if none
+- confidence: "high" if you are certain of the exact product, "medium" if you made a reasonable guess, "low" if the title is too vague
+
+Listings:
+${items}
+
+Return ONLY a JSON array with ${rows.length} objects in the same order:
+[{"extracted_product":"...","brand":"...","category":"...","variant":"...","confidence":"..."},...]
+
+No explanation. No markdown. Start with [ and end with ].`;
+
+    try {
+      const resp = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 4000,
+        messages: [{ role: 'user', content: prompt }],
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        timeout: 30000,
+      });
+
+      const text = resp.data?.content?.[0]?.text || '';
+      const match = text.match(/\[[\s\S]*\]/);
+      if (!match) { console.error('[Extract] Bad response, skipping batch'); break; }
+
+      const results = JSON.parse(match[0]);
+
+      // Write results back to DB
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const r = results[i] || {};
+        await pool.query(`
+          UPDATE listings SET
+            extracted_product     = $1,
+            extracted_brand       = $2,
+            extracted_category    = $3,
+            extracted_variant     = $4,
+            extraction_confidence = $5,
+            extracted_at          = NOW()
+          WHERE id = $6
+        `, [
+          r.extracted_product || null,
+          r.brand             || null,
+          r.category          || null,
+          r.variant           || null,
+          r.confidence        || 'low',
+          row.id,
+        ]);
+      }
+
+      processed += rows.length;
+      console.log(`[Extract] ${processed} listings extracted so far...`);
+
+      // Small delay between batches — be gentle on API
+      await new Promise(res => setTimeout(res, 1000));
+
+    } catch (e) {
+      console.error('[Extract] Batch failed:', e.message);
+      // Mark these as attempted so we don't retry in an infinite loop
+      const ids = rows.map(r => r.id);
+      await pool.query(`UPDATE listings SET extracted_at = NOW() WHERE id = ANY($1)`, [ids]);
+      break;
+    }
+  }
+
+  console.log(`[Extract] ✅ Done — ${processed} listings extracted`);
+}
+
+// Rebuild product_price_stats from extracted data
+// Groups by extracted_product, runs IQR clean, computes median/p25/p75
+async function rebuildProductPriceStats() {
+  try {
+    await pool.query(`
+      INSERT INTO product_price_stats
+        (product_key, display_name, brand, category, variant,
+         sample_count, median_price, p25_price, p75_price,
+         low_price, high_price, updated_at)
+      WITH base AS (
+        SELECT
+          LOWER(REGEXP_REPLACE(extracted_product, '[^a-z0-9]+', '-', 'gi')) AS product_key,
+          extracted_product  AS display_name,
+          extracted_brand    AS brand,
+          extracted_category AS category,
+          extracted_variant  AS variant,
+          COUNT(*)::INT AS raw_count,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
+        FROM listings
+        WHERE extracted_product IS NOT NULL
+          AND extraction_confidence IN ('high', 'medium')
+          AND price > 0
+          AND is_offer_price = FALSE
+          AND price_quality = 'ok'
+          AND is_active = TRUE
+          AND scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY product_key, display_name, brand, category, variant
+        HAVING COUNT(*) >= 3
+      ),
+      fenced AS (
+        SELECT
+          b.product_key, b.display_name, b.brand, b.category, b.variant,
+          b.raw_count,
+          COUNT(l.id)::INT AS clean_count,
+          PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT AS median,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT AS p25_clean,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT AS p75_clean,
+          MIN(l.price)::INT AS low,
+          MAX(l.price)::INT AS high
+        FROM listings l
+        JOIN base b ON LOWER(REGEXP_REPLACE(l.extracted_product, '[^a-z0-9]+', '-', 'gi')) = b.product_key
+        WHERE l.price BETWEEN GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))
+                          AND (b.p75 + 1.5*(b.p75-b.p25))
+          AND l.is_offer_price = FALSE
+          AND l.price_quality = 'ok'
+          AND l.is_active = TRUE
+          AND l.scraped_at > NOW() - INTERVAL '90 days'
+        GROUP BY b.product_key, b.display_name, b.brand, b.category, b.variant, b.raw_count
+        HAVING COUNT(l.id) >= 3
+      )
+      SELECT product_key, display_name, brand, category, variant,
+             clean_count, raw_count, median, p25_clean, p75_clean, low, high, NOW()
+      FROM fenced
+      ON CONFLICT (product_key) DO UPDATE SET
+        display_name  = EXCLUDED.display_name,
+        brand         = EXCLUDED.brand,
+        category      = EXCLUDED.category,
+        variant       = EXCLUDED.variant,
+        sample_count  = EXCLUDED.sample_count,
+        median_price  = EXCLUDED.median_price,
+        p25_price     = EXCLUDED.p25_price,
+        p75_price     = EXCLUDED.p75_price,
+        low_price     = EXCLUDED.low_price,
+        high_price    = EXCLUDED.high_price,
+        updated_at    = NOW()
+    `);
+
+    const { rows } = await pool.query('SELECT COUNT(*)::INT AS cnt FROM product_price_stats');
+    console.log(`[ProductStats] ✅ Rebuilt — ${rows[0].cnt} unique products in stats table`);
+  } catch (e) {
+    console.error('[ProductStats] Rebuild failed:', e.message);
+  }
+}
 
 // ── Boot: load all watches from Redis ─────────────────────
 async function loadAllWatches() {
@@ -3714,198 +3202,6 @@ app.delete('/watchlist/:id', authMiddleware, async (req, res) => {
 });
 
 // ── Listings routes ───────────────────────────────────────
-
-// ── Deals Feed (Premium) ────────────────────────────────────────────────
-// Global cache (deals:global) holds the best 200 deals from the whole DB.
-// Rebuilt every 90 min — no DB query on user request.
-// Per-user: contextual filtering by lifestyle cluster + a small random jitter.
-// Deals outside the user's interest clusters are excluded (no dollhouses for 4WD folk).
-// Watched items bubble up within the same discount band.
-
-// Lifestyle clusters — which categories are "in range" for a user who watches X.
-// If a user's watches cover multiple clusters, they're merged (union).
-const LIFESTYLE_CLUSTERS = {
-  vehicle:    ['vehicle','power_tool','outdoor','vacuum'],
-  power_tool: ['power_tool','vehicle','outdoor','computer'],
-  phone:      ['phone','computer','audio','gaming'],
-  gaming:     ['gaming','computer','phone','audio'],
-  computer:   ['computer','phone','gaming','audio'],
-  audio:      ['audio','phone','computer','gaming'],
-  vacuum:     ['vacuum','vehicle','power_tool'],
-  outdoor:    ['outdoor','vehicle','power_tool'],
-  general:    ['general','phone','computer','audio','gaming'],
-};
-
-// Rebuild the global deals cache — called by cron + after nightly stats rebuild.
-// Adds norm_cat so personalisation can filter by category cluster.
-async function buildGlobalDealsCache() {
-  const deals = [];
-
-  try {
-    const { rows } = await pool.query(`
-      SELECT
-        l.listing_id, l.title, l.price, l.url, l.image_url,
-        l.location, l.make, l.model, l.series, l.year, l.mileage AS kms,
-        l.scraped_at, l.keyword,
-        vps.mkt   AS market_value,
-        ROUND((1 - l.price::numeric / vps.mkt) * 100, 1) AS discount_pct,
-        ROUND(vps.mkt - l.price)                          AS saving
-      FROM listings l
-      JOIN (
-        SELECT make, model, series,
-          PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY median_price)::INT AS mkt,
-          SUM(sample_count) AS total
-        FROM vehicle_price_stats
-        GROUP BY make, model, series
-        HAVING SUM(sample_count) >= 5
-      ) vps
-        ON LOWER(l.make)                   = LOWER(vps.make)
-       AND LOWER(COALESCE(l.model,''))      = LOWER(COALESCE(vps.model,''))
-       AND LOWER(COALESCE(l.series,''))     = LOWER(COALESCE(vps.series,''))
-      WHERE l.is_active=TRUE AND l.category='vehicle'
-        AND l.in_price_pool=TRUE AND l.price>0
-        AND l.price < vps.mkt * 0.80
-        AND l.scraped_at > NOW() - INTERVAL '21 days'
-      ORDER BY discount_pct DESC LIMIT 120
-    `);
-    rows.forEach(r => deals.push({ ...r, norm_cat: 'vehicle' }));
-  } catch(e) { console.error('[DealsCache] vehicle error:', e.message); }
-
-  try {
-    const { rows } = await pool.query(`
-      SELECT
-        l.listing_id, l.title, l.price, l.url, l.image_url,
-        l.location, l.keyword, l.scraped_at,
-        kps.median_price AS market_value, kps.sample_count,
-        ROUND((1 - l.price::numeric / kps.median_price) * 100, 1) AS discount_pct,
-        ROUND(kps.median_price - l.price)                          AS saving
-      FROM listings l
-      JOIN keyword_price_stats kps ON kps.keyword = l.keyword
-      WHERE l.is_active=TRUE AND l.category='general'
-        AND l.in_price_pool=TRUE AND kps.sample_count>=5
-        AND l.price>0 AND l.price < kps.median_price * 0.80
-        AND l.scraped_at > NOW() - INTERVAL '21 days'
-      ORDER BY discount_pct DESC LIMIT 120
-    `);
-    rows.forEach(r => deals.push({
-      ...r,
-      make: null, model: null,
-      // tag with normalised category so cluster filtering works
-      norm_cat: detectNormCategory(`${r.keyword||''} ${r.title||''}`),
-    }));
-  } catch(e) { console.error('[DealsCache] general error:', e.message); }
-
-  const seen = new Set();
-  const unique = deals
-    .filter(d => { if (seen.has(d.listing_id)||d.discount_pct<15) return false; seen.add(d.listing_id); return true; })
-    .sort((a,b) => b.discount_pct - a.discount_pct)
-    .slice(0, 200);
-
-  await redisSet('deals:global', { deals: unique, built_at: new Date().toISOString() }, 95 * 60).catch(()=>{});
-  console.log(`[DealsCache] rebuilt — ${unique.length} deals cached`);
-  return unique;
-}
-
-// Personalise the global deal pool for a specific user.
-// Filters to their lifestyle cluster, sorts by discount with a small jitter
-// so the order varies slightly on each page load (feels alive, not stuck).
-function personalizeDeals(allDeals, userId, userWatches) {
-  // Build allowed category set from user's watch clusters
-  const watchedCats = new Set();
-  if (userWatches.length === 0) {
-    // No watches → show everything
-    Object.keys(LIFESTYLE_CLUSTERS).forEach(c => watchedCats.add(c));
-  } else {
-    userWatches.forEach(w => {
-      const kw = w.keyword.toLowerCase();
-      const cat = isVehicleKeyword(kw) ? 'vehicle' : detectNormCategory(kw);
-      const cluster = LIFESTYLE_CLUSTERS[cat] || LIFESTYLE_CLUSTERS.general;
-      cluster.forEach(c => watchedCats.add(c));
-    });
-  }
-
-  // Watched keywords/makes for boosting
-  const watchedKws   = new Set(userWatches.map(w => w.keyword.toLowerCase().trim()));
-  const watchedMakes = new Set(userWatches
-    .filter(w => isVehicleKeyword(w.keyword))
-    .map(w => (extractMake(w.keyword, w.keyword)||'').toLowerCase())
-    .filter(Boolean));
-
-  // Filter to allowed categories, score, and jitter
-  const eligible = allDeals
-    .filter(d => watchedCats.has(d.norm_cat || d.category || 'general'))
-    .map(d => {
-      const isWatched = watchedKws.has((d.keyword||'').toLowerCase()) ||
-                        watchedMakes.has((d.make||'').toLowerCase());
-      const jitter = Math.random() * 8;   // ± up to 8% randomness — enough to vary, not random
-      const score  = d.discount_pct + (isWatched ? 12 : 0) + jitter;
-      return { ...d, match_type: isWatched ? 'watched' : 'similar', _score: score };
-    })
-    .sort((a, b) => b._score - a._score);
-
-  // Guarantee variety: if user watches only vehicles and a great phone deal exists
-  // it gets blocked by the cluster filter — that's intentional and correct.
-  // But if someone watches BOTH vehicles and phones, they see both.
-  return eligible.slice(0, 100);
-}
-
-async function broadenGeneralKeywords(watchedKeywords) {
-  if (!watchedKeywords.length) return [];
-  const prefixes = [...new Set(watchedKeywords.map(kw => kw.split(' ')[0]).filter(p => p.length > 2))];
-  try {
-    const { rows } = await pool.query(
-      `SELECT DISTINCT keyword FROM keyword_price_stats
-       WHERE keyword = ANY($1)
-          OR keyword LIKE ANY(SELECT p || '%' FROM unnest($2::text[]) AS t(p))
-       LIMIT 40`,
-      [watchedKeywords, prefixes]
-    );
-    return [...new Set([...watchedKeywords, ...rows.map(r => r.keyword)])];
-  } catch(e) { return watchedKeywords; }
-}
-
-
-
-// GET /deals  — Premium only
-app.get('/deals', authMiddleware, async (req, res) => {
-  try {
-    // ── Premium gate ──
-    const user = await getUser(req.userId);
-    if (!user || getEffectivePlan(user) !== 'premium') {
-      return res.status(403).json({
-        error: 'The deals feed is a premium feature.',
-        upgrade_required: true,
-        current_plan: getEffectivePlan(user),
-      });
-    }
-
-    const page  = Math.max(1, parseInt(req.query.page)  || 1);
-    const limit = Math.min(50, parseInt(req.query.limit) || 20);
-
-    // Pull from global cache; rebuild if stale
-    let globalCache = await redisGet('deals:global');
-    if (!globalCache || !globalCache.deals) {
-      await buildGlobalDealsCache();
-      globalCache = await redisGet('deals:global');
-    }
-    const allDeals   = globalCache?.deals || [];
-    const userWatches = watchlist.filter(w => w.userId === req.userId && !w.paused);
-    const dealsArr   = personalizeDeals(allDeals, req.userId, userWatches);
-
-    const start = (page - 1) * limit;
-    res.json({
-      deals:        dealsArr.slice(start, start + limit),
-      total:        dealsArr.length,
-      page, limit,
-      cached:       false,
-      generated_at: globalCache?.built_at || new Date().toISOString(),
-    });
-  } catch(e) {
-    console.error('[/deals]', e.message);
-    res.status(500).json({ error: 'Could not load deals' });
-  }
-});
-
 app.get('/listings', authMiddleware, async (req, res) => {
   try {
     const { keyword, since } = req.query;
@@ -4054,6 +3350,386 @@ app.post('/scan/test', async (req, res) => {
     const found = await scrapeKeyword(keyword, {});
     res.json({ keyword, count: found.length, listings: found });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Global Deals ─────────────────────────────────────────
+// Rebuilds every 90 min — no SociaVault credits used.
+// Pulls listings from the DB that have a known median (so we can compute % off),
+// filters to active + real-price, scores by discount depth, adds small jitter.
+
+async function rebuildGlobalDeals() {
+  console.log('[Deals] Rebuilding deals:global cache...');
+  try {
+    // Pull recent listings with a known keyword median so we can compute % off.
+    // Only real prices, active, not spam/damage, scraped within 14 days.
+    const { rows } = await pool.query(`
+      SELECT
+        l.listing_id,
+        l.title,
+        l.price,
+        l.image_url,
+        l.url,
+        l.location,
+        l.state,
+        l.keyword,
+        l.category,
+        l.make,
+        l.model,
+        l.year,
+        l.kms       AS mileage,
+        l.transmission,
+        l.fuel_type AS "fuelType",
+        l.listed_at AS "listedAt",
+        k.median_price AS median
+      FROM listings l
+      JOIN keyword_price_stats k ON k.keyword = l.keyword
+      WHERE l.is_active = TRUE
+        AND l.is_offer_price = FALSE
+        AND l.price > 0
+        AND l.price_quality IN ('ok')
+        AND l.in_price_pool = TRUE
+        AND l.scraped_at > NOW() - INTERVAL '14 days'
+        AND k.median_price > 0
+        AND k.sample_count >= 6
+        AND l.price < k.median_price * 0.92   -- must be at least 8% below median to qualify
+      ORDER BY (k.median_price - l.price)::float / k.median_price DESC
+      LIMIT 500
+    `);
+
+    // Compute pctOff and base score
+    const deals = rows.map(r => {
+      const pctOff   = Math.round(((r.median - r.price) / r.median) * 100);
+      // base deal score 0-100 — pure discount depth
+      const baseScore = Math.min(100, pctOff * 1.8);
+      return {
+        id:           r.listing_id,
+        title:        r.title,
+        price:        r.price,
+        median:       r.median,
+        pctOff,
+        image:        r.image_url || null,
+        url:          r.url || null,
+        location:     r.location || null,
+        state:        r.state || null,
+        keyword:      r.keyword || null,
+        category:     r.category || 'general',
+        make:         r.make || null,
+        model:        r.model || null,
+        year:         r.year || null,
+        mileage:      r.mileage || null,
+        transmission: r.transmission || null,
+        fuelType:     r.fuelType || null,
+        listedAt:     r.listedAt ? r.listedAt.toISOString() : null,
+        baseScore,
+        // tint: rainbow ≥55% off, green ≥30%, yellow ≥15%, else grey
+        tint: pctOff >= 55 ? 'rainbow' : pctOff >= 30 ? 'green' : pctOff >= 15 ? 'yellow' : 'grey',
+      };
+    });
+
+    await redisSet('deals:global', { deals, builtAt: new Date().toISOString() }, 6000); // 100 min TTL
+    console.log(`[Deals] Rebuilt deals:global — ${deals.length} deals`);
+  } catch (e) {
+    console.error('[Deals] Rebuild failed:', e.message);
+  }
+}
+
+// Rebuild on boot (after a short delay so DB is warm) + every 90 min
+setTimeout(() => rebuildGlobalDeals().catch(() => {}), 15000);
+cron.schedule('0 */2 * * *', () => rebuildGlobalDeals().catch(e => console.error('[Deals Cron]', e.message)));
+
+// ── Seed Keyword Scanner ──────────────────────────────────
+// Scans a broad list of keywords to build the price database independently
+// of user watchlists. 1 credit per keyword per scan. Staggered so we don't
+// hammer all keywords at once — splits into 6 batches across 6 hours.
+// Full rotation = 6 hours. At ~150 keywords that's 150 credits per rotation.
+
+const SEED_KEYWORDS = [
+  // ── Phones ───────────────────────────────────────────────
+  'iphone 16 pro', 'iphone 16', 'iphone 15 pro', 'iphone 15', 'iphone 14 pro',
+  'iphone 14', 'iphone 13', 'iphone 12', 'iphone 11', 'iphone se',
+  'samsung galaxy s25', 'samsung galaxy s24', 'samsung galaxy s23', 'samsung galaxy s22',
+  'samsung galaxy a55', 'samsung galaxy a54', 'google pixel 9', 'google pixel 8',
+  'oneplus 12', 'oppo find x8',
+
+  // ── Laptops & Computers ──────────────────────────────────
+  'macbook pro m3', 'macbook pro m2', 'macbook pro m1', 'macbook air m2', 'macbook air m1',
+  'macbook air m3', 'imac m3', 'imac m1',
+  'dell xps 15', 'dell xps 13', 'hp spectre x360', 'hp envy laptop',
+  'lenovo thinkpad', 'lenovo yoga', 'asus rog laptop', 'asus zenbook',
+  'surface pro', 'surface laptop', 'razer blade laptop', 'acer swift laptop',
+  'gaming pc', 'desktop computer',
+
+  // ── Tablets ──────────────────────────────────────────────
+  'ipad pro', 'ipad air', 'ipad mini', 'samsung galaxy tab s9', 'samsung galaxy tab s8',
+
+  // ── Gaming ───────────────────────────────────────────────
+  'ps5 console', 'ps5 digital', 'ps4 pro', 'ps4 console',
+  'xbox series x', 'xbox series s', 'xbox one x',
+  'nintendo switch oled', 'nintendo switch', 'nintendo switch lite',
+  'steam deck', 'meta quest 3', 'meta quest 2',
+  'gaming chair', 'gaming monitor',
+
+  // ── TVs & Audio ───────────────────────────────────────────
+  'samsung 65 inch tv', 'samsung 55 inch tv', 'lg oled tv', 'sony bravia tv',
+  'lg 65 tv', 'samsung qled tv', 'tcl tv', 'hisense tv',
+  'sonos speaker', 'jbl speaker', 'bose speaker', 'marshall speaker',
+  'sony wh1000xm5', 'airpods pro', 'airpods max', 'bose quietcomfort',
+
+  // ── Power Tools ──────────────────────────────────────────
+  'milwaukee m18 drill', 'milwaukee m18 impact driver', 'milwaukee m18 grinder',
+  'milwaukee m18 circular saw', 'milwaukee m18 multi tool', 'milwaukee m18 jigsaw',
+  'milwaukee m18 reciprocating saw', 'milwaukee m18 kit', 'milwaukee m12',
+  'dewalt 18v drill', 'dewalt 18v impact driver', 'dewalt 18v grinder',
+  'dewalt 18v circular saw', 'dewalt xr kit',
+  'makita 18v drill', 'makita 18v impact driver', 'makita 18v grinder',
+  'makita 18v circular saw', 'makita combo kit',
+  'ryobi 18v drill', 'ryobi 18v kit', 'ryobi one plus',
+  'bosch 18v drill', 'hikoki drill', 'festool sander', 'festool track saw',
+  'air compressor', 'bench grinder', 'angle grinder', 'drop saw',
+  'table saw', 'thicknesser', 'router table', 'laser level',
+
+  // ── Outdoor & Garden ─────────────────────────────────────
+  'husqvarna mower', 'honda mower', 'ride on mower', 'zero turn mower',
+  'ego lawn mower', 'greenworks mower', 'lawn mower petrol',
+  'husqvarna chainsaw', 'stihl chainsaw', 'echo chainsaw',
+  'pressure washer', 'karcher pressure washer', 'leaf blower',
+  'garden trailer', 'wood chipper', 'post hole digger',
+
+  // ── Camping & Outdoors ────────────────────────────────────
+  'engel fridge', 'waeco fridge', 'dometic fridge', 'arb fridge',
+  'camp trailer', 'roof top tent', 'swag', 'camping trailer',
+  'weber bbq', 'traeger bbq', 'bbq grill', 'kamado bbq',
+  'kayak', 'canoe', 'stand up paddle board', 'inflatable kayak',
+  'fishing rod', 'fishing reel', 'fishing kayak',
+  'hiking boots', 'tent', 'sleeping bag',
+
+  // ── Vehicles ─────────────────────────────────────────────
+  'toyota hilux', 'toyota landcruiser 200', 'toyota landcruiser 79',
+  'toyota prado', 'toyota rav4', 'toyota camry', 'toyota corolla',
+  'ford ranger', 'ford everest', 'ford mustang',
+  'holden commodore', 'holden colorado',
+  'nissan patrol', 'nissan navara', 'nissan x trail',
+  'mitsubishi triton', 'mitsubishi pajero', 'mitsubishi outlander',
+  'isuzu dmax', 'isuzu mu x',
+  'mazda cx5', 'mazda bt50', 'mazda 3',
+  'subaru forester', 'subaru outback', 'subaru wrx',
+  'hyundai tucson', 'hyundai i30', 'kia sportage',
+  'jeep wrangler', 'jeep gladiator',
+  'bmw 3 series', 'mercedes c class', 'audi a4',
+  'motorcycle', 'dirt bike', 'trail bike', 'enduro bike',
+  'honda cbr', 'yamaha r1', 'kawasaki ninja', 'suzuki gsxr',
+  'caravan', 'camper trailer', 'pop top caravan',
+
+  // ── Vehicles — Parts & Accessories ───────────────────────
+  'bull bar', 'winch', 'lift kit', 'snorkel', 'roof rack',
+  'drawer system', 'dual battery system',
+
+  // ── Bikes & Scooters ─────────────────────────────────────
+  'mountain bike', 'road bike', 'bmx bike', 'electric bike',
+  'trek bike', 'specialized bike', 'giant bike', 'scott bike',
+  'electric scooter', 'segway ninebot',
+
+  // ── Furniture ─────────────────────────────────────────────
+  'couch lounge', 'sectional sofa', 'leather couch', '3 seater lounge',
+  'dining table', 'dining chairs', 'coffee table', 'tv unit',
+  'queen bed frame', 'king bed frame', 'bedside table',
+  'office desk', 'standing desk', 'ergonomic chair', 'office chair',
+  'wardrobe', 'chest of drawers', 'bookshelf',
+
+  // ── Baby & Kids ───────────────────────────────────────────
+  'pram stroller', 'baby cot', 'baby capsule', 'baby carrier',
+  'kids bike', 'trampoline', 'swing set', 'lego',
+
+  // ── Sports & Fitness ──────────────────────────────────────
+  'treadmill', 'rowing machine', 'spin bike', 'exercise bike',
+  'bowflex', 'home gym', 'barbell set', 'dumbbells',
+  'squat rack', 'bench press', 'weight plates',
+  'golf clubs', 'callaway driver', 'titleist irons',
+  'surfboard', 'skateboard', 'snowboard',
+  'tennis racket', 'basketball hoop',
+
+  // ── Musical Instruments ────────────────────────────────────
+  'electric guitar', 'acoustic guitar', 'fender stratocaster', 'gibson les paul',
+  'fender telecaster', 'marshall amp', 'fender amp',
+  'drum kit', 'electronic drums', 'keyboard piano', 'yamaha keyboard',
+  'bass guitar', 'ukulele',
+
+  // ── Photography ───────────────────────────────────────────
+  'sony a7', 'sony a6', 'canon eos r', 'canon 5d', 'nikon z6', 'nikon d750',
+  'fujifilm xt', 'fujifilm x100', 'drone dji', 'dji mini', 'dji mavic',
+  'camera lens', 'gopro',
+
+  // ── Appliances ─────────────────────────────────────────────
+  'thermomix', 'kitchenaid mixer', 'breville coffee machine',
+  'delonghi coffee machine', 'nespresso machine', 'coffee grinder',
+  'dyson vacuum', 'roomba', 'dyson v11', 'dyson v12', 'dyson v15',
+  'washing machine', 'dryer', 'dishwasher', 'fridge freezer',
+  'air fryer', 'instant pot', 'ninja foodi',
+
+  // ── Tech Accessories ──────────────────────────────────────
+  'monitor 27 inch', 'monitor 32 inch', 'ultrawide monitor',
+  'mechanical keyboard', 'logitech mx keys',
+  'standing desk converter', 'webcam',
+
+  // ── Collectibles & Fashion ────────────────────────────────
+  'vintage levi jeans', 'vintage adidas', 'nike air jordan',
+  'rolex watch', 'omega watch', 'seiko watch',
+  'vintage camera', 'vinyl records', 'trading cards',
+
+  // ── Trade & Industrial ────────────────────────────────────
+  'generator', 'inverter generator', 'honda generator', 'yamaha generator',
+  'welder', 'mig welder', 'tig welder',
+  'scaffolding', 'trailer', 'box trailer', 'car trailer', 'boat trailer',
+  'forklift', 'pallet jack', 'scissor lift',
+];
+
+// How many keywords per batch — spread evenly across 6 hourly slots
+const SEED_BATCH_SIZE = Math.ceil(SEED_KEYWORDS.length / 6);
+let _seedBatchIndex = 0;
+
+async function runSeedBatch() {
+  const start = _seedBatchIndex * SEED_BATCH_SIZE;
+  const batch = SEED_KEYWORDS.slice(start, start + SEED_BATCH_SIZE);
+  _seedBatchIndex = (_seedBatchIndex + 1) % 6;
+
+  console.log(`[SeedScan] Batch ${_seedBatchIndex}/${6} — scanning ${batch.length} keywords (starting at index ${start})`);
+
+  let saved = 0;
+  for (const keyword of batch) {
+    try {
+      // Use shared scan cache — if recently cached, costs 0 credits
+      const cached = await redisGet(K.sharedScan(keyword));
+      if (cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
+        console.log(`[SeedScan] "${keyword}" — cache hit, skipping`);
+        continue;
+      }
+
+      const raw = await scrapeKeyword(keyword, {
+        city: 'Melbourne', lat: -37.8136, lng: 144.9631, radius: 100,
+      });
+
+      if (!Array.isArray(raw) || !raw.length) continue;
+
+      // Cache for shared use by user watchlists
+      await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
+
+      // Save to DB for price stats
+      for (const item of raw) {
+        try { await upsertListingToDB({ ...item, keyword }); } catch (e) { /* skip bad rows */ }
+      }
+
+      saved += raw.length;
+      console.log(`[SeedScan] "${keyword}" → ${raw.length} listings saved`);
+
+      // Small delay between keywords — be gentle on SociaVault
+      await new Promise(r => setTimeout(r, 800));
+    } catch (e) {
+      console.error(`[SeedScan] "${keyword}" failed:`, e.message);
+    }
+  }
+  console.log(`[SeedScan] Batch done — ${saved} total listings saved`);
+}
+
+// One-time full scan on boot — scans all seed keywords once, then stops.
+// Re-deploy to trigger again. No recurring cron.
+async function runFullSeedScanOnce() {
+  console.log(`[SeedScan] Starting one-time full scan of ${SEED_KEYWORDS.length} keywords...`);
+  let totalSaved = 0;
+  for (let i = 0; i < SEED_KEYWORDS.length; i++) {
+    const keyword = SEED_KEYWORDS[i];
+    try {
+      const cached = await redisGet(K.sharedScan(keyword));
+      if (cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
+        console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" — cache hit, skipping`);
+        continue;
+      }
+      const raw = await scrapeKeyword(keyword, {
+        city: 'Melbourne', lat: -37.8136, lng: 144.9631, radius: 100,
+      });
+      if (!Array.isArray(raw) || !raw.length) {
+        console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" — 0 results`);
+        continue;
+      }
+      await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
+      for (const item of raw) {
+        try { await upsertListingToDB({ ...item, keyword }); } catch (e) { /* skip bad rows */ }
+      }
+      totalSaved += raw.length;
+      console.log(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" → ${raw.length} listings`);
+      await new Promise(r => setTimeout(r, 600));
+    } catch (e) {
+      console.error(`[SeedScan] (${i+1}/${SEED_KEYWORDS.length}) "${keyword}" failed:`, e.message);
+    }
+  }
+  console.log(`[SeedScan] ✅ Done — ${totalSaved} listings saved across ${SEED_KEYWORDS.length} keywords`);
+}
+
+setTimeout(() => runFullSeedScanOnce().catch(e => console.error('[SeedScan Boot]', e.message)), 30000);
+
+// Admin endpoint to check seed scan status
+app.get('/admin/seed-status', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    const counts = await Promise.all(SEED_KEYWORDS.map(async kw => {
+      const cached = await redisGet(K.sharedScan(kw));
+      return { keyword: kw, cached: !!cached, cachedAt: cached?.scannedAt || null, count: cached?.listings?.length || 0 };
+    }));
+    const dbCount = await pool.query('SELECT keyword, COUNT(*)::INT as n FROM listings WHERE keyword = ANY($1) GROUP BY keyword ORDER BY n DESC', [SEED_KEYWORDS]);
+    res.json({ total: SEED_KEYWORDS.length, batchSize: SEED_BATCH_SIZE, nextBatch: _seedBatchIndex, cache: counts, db: dbCount.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin endpoint to manually re-trigger the full one-time scan
+app.post('/admin/seed-scan-all', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+    res.json({ ok: true, message: `Starting full scan of ${SEED_KEYWORDS.length} keywords in background` });
+    runFullSeedScanOnce().catch(e => console.error('[SeedScan Manual]', e.message));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /deals — personalised deal feed for premium users
+// Scores deals against the user's watchlist keywords/makes with jitter so order shifts each visit.
+app.get('/deals', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    if (getEffectivePlan(user) !== 'premium') return res.status(403).json({ error: 'premium_required' });
+
+    const cached = await redisGet('deals:global');
+    if (!cached || !cached.deals) return res.json({ deals: [], builtAt: null });
+
+    const watches    = await getUserWatches(req.userId);
+    const watchKeys  = watches.map(w => (w.keyword || '').toLowerCase().trim()).filter(Boolean);
+    const watchMakes = watches.map(w => (w.keyword || '').toLowerCase().trim())
+                              .filter(kw => kw.split(' ').length <= 2); // crude make heuristic
+
+    // Score each deal — watched keywords/makes bubble up; random jitter per request
+    const scored = cached.deals.map(d => {
+      let boost = 0;
+      const kw = (d.keyword || '').toLowerCase();
+      const make = (d.make || '').toLowerCase();
+      // Boost for exact keyword match
+      if (watchKeys.some(wk => kw === wk || kw.includes(wk) || wk.includes(kw))) boost += 40;
+      // Boost for make match
+      if (make && watchMakes.some(wm => make.includes(wm) || wm.includes(make))) boost += 20;
+      // Small random jitter — makes the feed feel alive on refresh
+      const jitter = (Math.random() - 0.5) * 18;
+      return { ...d, _score: d.baseScore + boost + jitter, _watched: boost > 0 };
+    });
+
+    scored.sort((a, b) => b._score - a._score);
+
+    // Remove internal scoring fields before sending
+    const deals = scored.map(({ _score, baseScore, ...d }) => d);
+
+    res.json({ deals, builtAt: cached.builtAt });
+  } catch (e) {
+    console.error('[Deals]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // ── Stripe routes ─────────────────────────────────────────
@@ -4972,5 +4648,4 @@ app.listen(PORT, async () => {
     console.log(`[DB] ${dbSummary.total_listings} listings · ${dbSummary.unique_keywords} keywords · ${dbSummary.unique_makes} vehicle makes`);
   }
   console.log('[Ready] Server fully loaded');
-  runSeedJob().catch(e => console.error('[Seed] startup run error:', e.message));
 });
