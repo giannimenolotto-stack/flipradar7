@@ -3399,6 +3399,7 @@ async function rebuildGlobalDeals() {
           AND k.median_price > 0
           AND k.sample_count >= 4
           AND l.price < k.median_price * 0.92
+          AND (k.median_price - l.price) >= 100
         ORDER BY (k.median_price - l.price)::float / k.median_price DESC
         LIMIT 500
       `));
@@ -3447,6 +3448,7 @@ async function rebuildGlobalDeals() {
           AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
           AND l.scraped_at > NOW() - INTERVAL '30 days'
           AND l.price < k.median_price * 0.92
+          AND (k.median_price - l.price) >= 100
         ORDER BY (k.median_price - l.price)::float / k.median_price DESC
         LIMIT 500
       `));
@@ -3477,8 +3479,13 @@ async function rebuildGlobalDeals() {
         fuelType:     r.fuelType || null,
         listedAt:     r.listedAt ? r.listedAt.toISOString() : null,
         baseScore,
-        // tint: rainbow ≥55% off, green ≥30%, yellow ≥15%, else grey
-        tint: pctOff >= 55 ? 'rainbow' : pctOff >= 30 ? 'green' : pctOff >= 15 ? 'yellow' : 'grey',
+        // Tint based on actual dollar saving — % off alone is misleading for cheap items.
+        // A $5 item 60% off is worthless. A $400 saving at 20% off is a great flip.
+        const saving = r.median - r.price;
+        tint: saving >= 500 && pctOff >= 20 ? 'rainbow'   // genuinely great flip
+            : saving >= 200 && pctOff >= 15 ? 'green'     // solid flip
+            : saving >= 100                 ? 'yellow'    // worth a look
+            :                                'grey',      // low profit, not worth the effort
       };
     });
 
