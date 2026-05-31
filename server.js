@@ -671,24 +671,6 @@ async function upsertListingToDB(rawListing) {
       listing.listedAt      ? new Date(listing.listedAt) : null,
     ]);
 
-    // Fire Gemini photo check async — non-blocking, updates DB when done.
-    // Only runs on new listings that have an image and haven't been checked yet.
-    if (listing.image && GEMINI_API_KEY) {
-      const { rows: existing } = await pool.query(
-        'SELECT img_analysed_at FROM listings WHERE listing_id = $1', [listing.id]
-      );
-      if (existing.length && !existing[0].img_analysed_at) {
-        // New listing — fire async, don't await
-        quickGeminiPhotoCheck(
-          listing.id,
-          listing.image,
-          listing.title,
-          listing.keyword,
-          price,
-        ).catch(() => {});
-      }
-    }
-
   } catch (e) {
     if (!e.message.includes('duplicate')) {
       console.error('[DB] upsertListing error:', e.message.slice(0, 120));
@@ -4337,6 +4319,131 @@ app.post('/admin/deals-rebuild', authMiddleware, async (req, res) => {
     const cache = await redisGet('deals:global');
     res.json({ ok: true, deals_in_cache: cache?.deals?.length || 0, built_at: cache?.builtAt });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Browser-driven photo check ────────────────────────────────────────────────
+// Called from the frontend after an image loads in the Feed.
+// Browser sends base64 image data — avoids Facebook CDN expiry issues entirely.
+// Gemini checks: does the photo match the keyword, and what's the condition?
+// Result is saved to the listing and returned so the card border updates live.
+
+app.post('/photo-check', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.json({ ok: false, reason: 'no_gemini_key' });
+
+    const { listingId, imageBase64, mimeType, title, keyword, price } = req.body;
+    if (!listingId || !imageBase64) return res.status(400).json({ error: 'Missing listingId or imageBase64' });
+
+    // Skip if already analysed
+    const existing = await pool.query(
+      'SELECT img_analysed_at, img_condition, img_matches_keyword FROM listings WHERE listing_id = $1',
+      [listingId]
+    );
+    if (existing.rows[0]?.img_analysed_at) {
+      return res.json({
+        ok: true,
+        cached: true,
+        condition:       existing.rows[0].img_condition,
+        matchesKeyword:  existing.rows[0].img_matches_keyword,
+      });
+    }
+
+    const prompt = `You are doing a quick quality check on a Facebook Marketplace listing photo.
+
+Listing:
+- Search keyword: "${(keyword||'').slice(0,80)}"
+- Title: "${(title||'').slice(0,120)}"
+- Price: ${price || '?'} AUD
+
+Look at the photo and return ONLY this JSON (no markdown):
+{
+  "matches_keyword": true | false,
+  "mismatch_reason": null | "brief reason if wrong item e.g. photo shows a petrol moped not an electric scooter",
+  "condition": "new" | "like_new" | "good" | "fair" | "poor" | "damaged" | "cannot_assess",
+  "visible_damage": true | false,
+  "is_stock_photo": true | false
+}
+
+Only mark matches_keyword false if it is clearly a DIFFERENT type of product.`;
+
+    const geminiRes = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      { contents: [{ parts: [
+        { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
+        { text: prompt }
+      ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+
+    const raw = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return res.json({ ok: false, reason: 'bad_response' });
+
+    const result = JSON.parse(match[0]);
+
+    // Determine quality penalty
+    let newQuality = null;
+    if (result.matches_keyword === false) {
+      newQuality = 'spam';
+      console.log(`[PhotoCheck] ❌ MISMATCH "${(title||'').slice(0,60)}" — ${result.mismatch_reason}`);
+
+      // Add to the requesting user's blocked list so it never shows in their feed again
+      try {
+        const existing = await redisGet(K.blocked(req.userId)) || [];
+        const already  = existing.some(b => b.id === listingId);
+        if (!already) {
+          const entry = {
+            id:          listingId,
+            title:       title       || null,
+            price:       price       || null,
+            url:         req.body.url || null,
+            image:       req.body.imageUrl || null,
+            keyword:     keyword     || null,
+            blockedAt:   new Date().toISOString(),
+            blockedBy:   'photo_mismatch',
+            reason:      result.mismatch_reason || 'Photo does not match keyword',
+          };
+          await redisSet(K.blocked(req.userId), [entry, ...existing].slice(0, 200));
+          console.log(`[PhotoCheck] 🚫 Added to blocked: "${(title||'').slice(0,50)}"`);
+        }
+      } catch (blockErr) {
+        console.error('[PhotoCheck] Failed to add to blocked:', blockErr.message);
+      }
+    } else if (result.condition === 'damaged' || result.visible_damage) {
+      newQuality = 'damage';
+    }
+
+    await pool.query(`
+      UPDATE listings SET
+        img_condition        = $1,
+        img_matches_keyword  = $2,
+        img_mismatch_reason  = $3,
+        img_analysed_at      = NOW(),
+        in_price_pool        = CASE WHEN $4::TEXT IN ('spam','damage') THEN FALSE ELSE in_price_pool END,
+        price_quality        = CASE WHEN $4::TEXT IS NOT NULL THEN $4 ELSE price_quality END
+      WHERE listing_id = $5
+    `, [
+      result.condition || null,
+      result.matches_keyword !== false,
+      result.mismatch_reason || null,
+      newQuality,
+      listingId,
+    ]);
+
+    res.json({
+      ok:             true,
+      cached:         false,
+      condition:      result.condition,
+      matchesKeyword: result.matches_keyword !== false,
+      mismatchReason: result.mismatch_reason || null,
+      isStockPhoto:   result.is_stock_photo || false,
+      qualityFlag:    newQuality,
+    });
+
+  } catch (e) {
+    console.error('[PhotoCheck]', e.message?.slice(0, 100));
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /deals — personalised deal feed for premium users
