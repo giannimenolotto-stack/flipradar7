@@ -3830,7 +3830,7 @@ async function rebuildGlobalDeals() {
         AND l.price_quality NOT IN ('spam','swap','accessory')
         AND (l.is_bulk_lot IS NULL OR l.is_bulk_lot = FALSE)
         AND l.img_matches_keyword IS NOT FALSE
-        AND l.scraped_at > NOW() - INTERVAL '24 hours'
+        AND l.scraped_at > NOW() - INTERVAL '3 days'
         AND l.keyword = ANY($1)
         AND l.title NOT ~* '(hire|for hire|per day|per week|hourly rate|daily rate|wanted|wtb|wtt)'
       ORDER BY l.scraped_at DESC
