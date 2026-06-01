@@ -5681,18 +5681,26 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
 
     const prompt = `You are an Australian Facebook Marketplace second-hand pricing expert rating listings for a flipper searching: "${keyword || 'unknown'}".
 
-CRITICAL RULES:
-- All ratings must be based on USED second-hand Australian Facebook Marketplace prices only — NOT RRP, NOT retail, NOT eBay
-- When DB avg data is provided, use it as your primary anchor — but adjust for year/km if provided
-- VEHICLES: year and mileage are critical. A 2005 BMW X3 with 210,000km is worth $2,500-3,500 even if newer X3s average $15,000. Always price based on the SPECIFIC year and km shown — never compare against an all-years average
-- High mileage (150,000km+) significantly reduces value
-- Old age (15+ years) significantly reduces value  
-- A listing is only a deal if there is REAL profit margin after all costs — purchase price, selling fees (~8%), time
-- rainbow = exceptional flip, 40%+ below real value for that specific year/condition/km
-- green = good deal, 20-40% below real value for that year/km
-- yellow = fair price for what it is
-- red = overpriced, or marginal — not worth the effort even if slightly below avg (e.g. old high-km vehicle where avg is skewed by newer models)
-- relevant:false = wrong item, spam, or genuinely no realistic profit margin after costs
+KEYWORD RELEVANCE — THIS IS THE MOST IMPORTANT CHECK:
+The search keyword is: "${keyword || 'unknown'}"
+Mark relevant:false if the listing is NOT the actual item being searched for. Be strict:
+- Searching "moped" → only actual mopeds/50cc motorised bikes. NOT: electric scooters, mobility scooters, push scooters, bike parts, hub motors, accessories
+- Searching "iphone 13" → only actual iPhone 13 devices. NOT: cases, cables, chargers, screen protectors, other iPhone models
+- Searching "milwaukee drill" → only actual Milwaukee drills. NOT: other brands, batteries only, accessories, cases
+- Searching "ps5" → only actual PS5 consoles. NOT: controllers only, games only, headsets
+- General rule: if it's an accessory, part, or different category to what was searched — relevant:false
+- If genuinely unsure whether it matches the keyword → relevant:false (be strict)
+
+PRICING RULES:
+- All ratings based on USED AU Facebook Marketplace prices only — NOT RRP, NOT retail
+- VEHICLES: price based on the SPECIFIC year and km shown — never use all-years average
+- High mileage (150k+) and old age (15+ years) significantly reduce value
+- Only green/rainbow if REAL profit margin after all costs (buy, relist, 8% fees, time)
+- rainbow = exceptional flip, 40%+ below real AU FB value
+- green = good deal, 20-40% below real AU FB value  
+- yellow = fair price
+- red = overpriced or marginal
+- relevant:false = wrong item, part/accessory, or no realistic profit
 
 Listings (year, km, make shown in brackets where available):
 ${lines}
