@@ -4075,59 +4075,23 @@ cron.schedule('0 */2 * * *', () => rebuildGlobalDeals().catch(e => console.error
 async function runFullBootSequence() {
   console.log('[Boot] Starting full boot sequence...');
   try {
-    // Step 1: Seed scan — fills DB with fresh listings across all 332 keywords
-    // This runs in background and doesn't block the rest of the sequence
+    // Step 1: Seed scan — runs in background, doesn't block
     console.log('[Boot] Step 1 — Starting seed scan in background...');
     runFullSeedScanOnce().catch(e => console.error('[Boot] Seed scan error:', e.message));
 
-    // Step 2: Anchor refresh — Gemini prices every keyword
-    // Wait 2 min first so seed scan has had time to land some initial data
-    console.log('[Boot] Step 2 — Waiting 2min for initial seed data, then refreshing anchors...');
-    await new Promise(r => setTimeout(r, 2 * 60 * 1000));
-    await refreshKeywordAnchors();
-    console.log('[Boot] Anchors refreshed');
-
-    // Step 3: Stats rebuild — anchor-gated IQR-cleaned medians
-    console.log('[Boot] Step 3 — Rebuilding keyword stats...');
-    await quickStatsAndDealsRebuild();
-    console.log('[Boot] Stats + deals rebuilt');
-
-    // Step 4: Score all listings — quality pass
-    console.log('[Boot] Step 4 — Running quality scoring pass...');
-    await pool.query(`
-      UPDATE listings SET price_quality = 'ok'
-      WHERE price_quality = 'unscored'
-        AND price > 0
-        AND is_offer_price = FALSE
-        AND title NOT ~* '(wanted|wtb|wtt|swap|trade|parts only|wrecking|for parts|not working|broken|faulty|damaged|cracked|smashed|as is|spares|hire|rental|for hire|per day|per week)'
-    `);
-    console.log('[Boot] Quality pass done');
-
-    // Step 5: AI product extraction — identify exact products from titles
-    console.log('[Boot] Step 5 — AI product extraction...');
-    await extractProductsNightly();
-
-    // Step 6: Rebuild product price stats
-    console.log('[Boot] Step 6 — Rebuilding product stats...');
-    await rebuildProductPriceStats();
-
-    // Step 7: Gemini image analysis — any unanalysed listings
-    console.log('[Boot] Step 7 — Gemini image analysis...');
-    await analyseListingImagesNightly();
-
-    // Step 8: AI flip scoring
-    console.log('[Boot] Step 8 — AI flip scoring...');
-    await scoreDealsWithAINightly();
-
-    // Step 9: Final deals rebuild with all fresh data
-    // Always clear deals cache on boot — ensures new Gemini prompt takes effect immediately
-    // Remove this line once deal quality is satisfactory
+    // Step 2: Rebuild deals immediately from existing data — no waiting
+    // Anchor refresh and full stats rebuild happen in the nightly 2am cron
+    console.log('[Boot] Step 2 — Rebuilding deals from existing listings...');
     await redisSet('deals:global', null);
     await rebuildGlobalDeals();
+    console.log('[Boot] ✅ Deals rebuilt — Today\'s Picks is live');
 
-    console.log('[Boot] ✅ Full boot sequence complete — everything is live');
+    // Step 3: Stats rebuild in background — doesn't block deals
+    console.log('[Boot] Step 3 — Rebuilding keyword stats in background...');
+    quickStatsAndDealsRebuild().catch(e => console.error('[Boot] Stats error:', e.message));
+
   } catch (e) {
-    console.error('[Boot] Sequence error:', e.message);
+    console.error('[Boot] Sequence error:', e.message, e.stack?.split('\n')[1]);
   }
 }
 
