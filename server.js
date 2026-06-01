@@ -4566,6 +4566,55 @@ Only mark matches_keyword false if it is clearly a DIFFERENT type of product.`;
 
 // GET /deals — personalised deal feed for premium users
 // Scores deals against the user's watchlist keywords/makes with jitter so order shifts each visit.
+// ── Interest category map ─────────────────────────────────
+// When a user watches something, we also boost adjacent categories.
+// Mirrors how Facebook surfaces related items you didn't explicitly search for.
+const INTEREST_ADJACENCY = {
+  // Vehicles → tools, trailers, camping
+  'vehicles':    ['power_tools', 'camping', 'trailers', '4wd_accessories'],
+  // Tools → vehicles, trade gear, gardening
+  'power_tools': ['vehicles', 'trade_industrial', 'garden'],
+  // Phones → laptops, tablets, audio
+  'phones':      ['laptops', 'tablets', 'audio'],
+  // Gaming → TVs, electronics
+  'gaming':      ['tvs', 'laptops'],
+  // Camping → vehicles, bikes, outdoor
+  'camping':     ['vehicles', 'bikes', 'garden'],
+  // Fitness → bikes, outdoor
+  'fitness':     ['bikes', 'camping'],
+};
+
+// Map seed keywords to broad interest buckets
+function kwToBucket(kw) {
+  const k = (kw || '').toLowerCase();
+  if (/iphone|samsung|pixel|oneplus|oppo|galaxy.*phone|mobile phone/.test(k)) return 'phones';
+  if (/macbook|laptop|imac|desktop|computer|lenovo|dell|hp.*spec|surface|razer|asus.*book/.test(k)) return 'laptops';
+  if (/ipad|tablet|galaxy.*tab/.test(k)) return 'tablets';
+  if (/ps5|ps4|xbox|nintendo|switch|steam deck|gaming.*chair|gaming.*monitor/.test(k)) return 'gaming';
+  if (/tv|television|oled|qled|bravia|hisense|tcl/.test(k)) return 'tvs';
+  if (/sonos|jbl|bose|marshall|airpods|speaker|headphone|wh1000/.test(k)) return 'audio';
+  if (/milwaukee|dewalt|makita|ryobi|bosch|hikoki|festool|drill|grinder|saw|compressor/.test(k)) return 'power_tools';
+  if (/mower|chainsaw|pressure washer|leaf blower|chipper|post hole/.test(k)) return 'garden';
+  if (/engel|waeco|dometic|arb.*fridge|camping|swag|roof.*tent|tent|sleeping bag|kayak|paddle/.test(k)) return 'camping';
+  if (/weber|bbq|traeger|kamado/.test(k)) return 'camping';
+  if (/hilux|landcruiser|patrol|ranger|triton|dmax|pajero|prado|rav4|commodore|falcon|mustang|bmw|mercedes|audi|subaru|hyundai|kia|mazda|ford|toyota|nissan|mitsubishi|isuzu|jeep/.test(k)) return 'vehicles';
+  if (/motorcycle|dirt.*bike|trail.*bike|enduro|cbr|ninja|gsxr|kawasaki|harley/.test(k)) return 'motorcycles';
+  if (/caravan|camper.*trailer|pop.*top/.test(k)) return 'caravans';
+  if (/bull.*bar|winch|lift.*kit|snorkel|roof.*rack|drawer.*system|dual.*battery/.test(k)) return '4wd_accessories';
+  if (/mountain.*bike|road.*bike|electric.*bike|ebike|trek|specialized|giant|scott/.test(k)) return 'bikes';
+  if (/electric.*scooter|ninebot|segway/.test(k)) return 'bikes';
+  if (/couch|lounge|sofa|dining.*table|bed.*frame|wardrobe|bookshelf|coffee.*table/.test(k)) return 'furniture';
+  if (/treadmill|rowing|spin.*bike|barbell|dumbbell|squat.*rack|home.*gym/.test(k)) return 'fitness';
+  if (/golf|surfboard|skateboard|snowboard|tennis|basketball/.test(k)) return 'sports';
+  if (/guitar|amp|drum|keyboard.*piano|bass|ukulele/.test(k)) return 'music';
+  if (/camera|sony.*a7|canon|nikon|fujifilm|dji|drone|gopro/.test(k)) return 'photography';
+  if (/thermomix|kitchenaid|coffee.*machine|dyson|roomba|washing.*machine|dishwasher|air.*fryer/.test(k)) return 'appliances';
+  if (/generator|welder|scaffolding|forklift|pallet.*jack|scissor.*lift/.test(k)) return 'trade_industrial';
+  if (/pram|baby|cot|kids.*bike|trampoline|lego/.test(k)) return 'baby_kids';
+  if (/trailer|box.*trailer|car.*trailer|boat.*trailer/.test(k)) return 'trailers';
+  return 'general';
+}
+
 app.get('/deals', authMiddleware, async (req, res) => {
   try {
     const user = await getUser(req.userId);
@@ -4573,31 +4622,122 @@ app.get('/deals', authMiddleware, async (req, res) => {
     if (getEffectivePlan(user) !== 'premium') return res.status(403).json({ error: 'premium_required' });
 
     const cached = await redisGet('deals:global');
-    if (!cached || !cached.deals) return res.json({ deals: [], builtAt: null });
+    if (!cached || !cached.deals || !cached.deals.length) {
+      return res.json({ deals: [], builtAt: null });
+    }
 
-    const watches    = await getUserWatches(req.userId);
-    const watchKeys  = watches.map(w => (w.keyword || '').toLowerCase().trim()).filter(Boolean);
-    const watchMakes = watches.map(w => (w.keyword || '').toLowerCase().trim())
-                              .filter(kw => kw.split(' ').length <= 2); // crude make heuristic
+    // ── Build user interest profile ────────────────────────
+    const watches = await getUserWatches(req.userId);
+    const saved   = []; // saved are in localStorage on client — server doesn't have them yet
 
-    // Score each deal — watched keywords/makes bubble up; random jitter per request
+    // Primary interests — explicit watchlist keywords (highest weight)
+    const primaryKeywords = watches.map(w => (w.keyword || '').toLowerCase().trim()).filter(Boolean);
+    const primaryBuckets  = [...new Set(primaryKeywords.map(kwToBucket))];
+
+    // Adjacent interests — categories related to what they watch
+    const adjacentBuckets = new Set();
+    primaryBuckets.forEach(b => {
+      (INTEREST_ADJACENCY[b] || []).forEach(adj => adjacentBuckets.add(adj));
+    });
+    // Remove buckets already in primary
+    primaryBuckets.forEach(b => adjacentBuckets.delete(b));
+
+    // Seen listings — don't repeat what they've already been shown
+    const seenMap = await getUserSeen(req.userId);
+
+    // ── Score every deal ───────────────────────────────────
     const scored = cached.deals.map(d => {
-      let boost = 0;
-      const kw = (d.keyword || '').toLowerCase();
-      const make = (d.make || '').toLowerCase();
-      // Boost for exact keyword match
-      if (watchKeys.some(wk => kw === wk || kw.includes(wk) || wk.includes(kw))) boost += 40;
-      // Boost for make match
-      if (make && watchMakes.some(wm => make.includes(wm) || wm.includes(make))) boost += 20;
-      // Small random jitter — makes the feed feel alive on refresh
-      const jitter = (Math.random() - 0.5) * 18;
-      return { ...d, _score: d.baseScore + boost + jitter, _watched: boost > 0 };
+      const kw     = (d.keyword || '').toLowerCase();
+      const bucket = kwToBucket(kw);
+      const make   = (d.make || '').toLowerCase();
+
+      let score = 50; // base
+
+      // Primary interest match — strong boost
+      if (primaryBuckets.includes(bucket)) score += 40;
+
+      // Exact keyword match — even stronger
+      if (primaryKeywords.some(pk => kw === pk || kw.includes(pk) || pk.includes(kw))) score += 30;
+
+      // Make match for vehicles
+      if (make && primaryKeywords.some(pk => pk.includes(make) || make.includes(pk))) score += 25;
+
+      // Adjacent interest — medium boost
+      if (adjacentBuckets.has(bucket)) score += 15;
+
+      // Tint quality boost
+      if (d.tint === 'rainbow') score += 20;
+      else if (d.tint === 'green') score += 10;
+
+      // Flip score boost
+      if (d.flipScore) score += Math.round(d.flipScore * 0.15);
+
+      // Recency boost — newer listings score higher
+      if (d.listedAt) {
+        const ageHours = (Date.now() - new Date(d.listedAt).getTime()) / 3600000;
+        if (ageHours < 2)  score += 25;
+        else if (ageHours < 6)  score += 15;
+        else if (ageHours < 24) score += 8;
+        else if (ageHours < 48) score += 3;
+      }
+
+      // Already seen penalty
+      if (seenMap[d.id]) score -= 60;
+
+      // Random jitter — keeps the feed feeling alive on refresh
+      score += (Math.random() - 0.5) * 12;
+
+      // Watched badge
+      const _watched = primaryKeywords.some(pk => kw === pk || kw.includes(pk) || pk.includes(kw)) ||
+                       (make && primaryKeywords.some(pk => pk.includes(make)));
+
+      return { ...d, _score: score, _watched };
     });
 
+    // Sort by score descending
     scored.sort((a, b) => b._score - a._score);
 
-    // Remove internal scoring fields before sending
-    const deals = scored.map(({ _score, baseScore, ...d }) => d);
+    // ── Composition: 60% interests, 25% adjacent, 15% discovery ──
+    // This gives the Facebook effect — mostly relevant, occasionally surprising
+    const primary   = scored.filter(d => primaryBuckets.includes(kwToBucket((d.keyword||'').toLowerCase())));
+    const adjacent  = scored.filter(d => adjacentBuckets.has(kwToBucket((d.keyword||'').toLowerCase())));
+    const discovery = scored.filter(d => {
+      const b = kwToBucket((d.keyword||'').toLowerCase());
+      return !primaryBuckets.includes(b) && !adjacentBuckets.has(b);
+    });
+
+    const total = 200; // max deals to return
+    const nPrimary   = Math.min(primary.length,   Math.round(total * 0.60));
+    const nAdjacent  = Math.min(adjacent.length,  Math.round(total * 0.25));
+    const nDiscovery = Math.min(discovery.length, total - nPrimary - nAdjacent);
+
+    // Interleave so it doesn't feel like blocks of the same category
+    const merged = [];
+    const pSlice = primary.slice(0, nPrimary);
+    const aSlice = adjacent.slice(0, nAdjacent);
+    const dSlice = discovery.slice(0, nDiscovery);
+
+    const maxLen = Math.max(pSlice.length, aSlice.length, dSlice.length);
+    for (let i = 0; i < maxLen; i++) {
+      // 60/25/15 interleave ratio — roughly every 4 primary, 2 adjacent, 1 discovery
+      if (i < pSlice.length)   merged.push(pSlice[i]);
+      if (i < pSlice.length)   { if (pSlice[i+1]) merged.push(pSlice[i+1]); i++; }
+      if (i < aSlice.length)   merged.push(aSlice[Math.floor(i/2)]);
+      if (i % 4 === 0 && dSlice[Math.floor(i/4)]) merged.push(dSlice[Math.floor(i/4)]);
+    }
+
+    // Deduplicate (id might appear in multiple slices)
+    const seen = new Set();
+    const deals = merged
+      .filter(d => { if (seen.has(d.id)) return false; seen.add(d.id); return true; })
+      .slice(0, total)
+      .map(({ _score, ...d }) => d);
+
+    // Mark these as shown in seen map so next request doesn't repeat them
+    const nowTs = Date.now();
+    const newSeen = {};
+    deals.forEach(d => { if (d.id) newSeen[d.id] = nowTs; });
+    saveUserSeen(req.userId, newSeen).catch(() => {});
 
     res.json({ deals, builtAt: cached.builtAt });
   } catch (e) {
