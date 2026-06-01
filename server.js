@@ -438,6 +438,7 @@ const CATEGORY_PRICE_BOUNDS = {
 const DAMAGE_PATTERNS    = /\b(broken|cracked|faulty|damaged|spares?|repairs?|parts? only|not working|doesn'?t work|dead|seized|blown|written off|wrecked|flood|hail|smash|project car|needs work|no rego|unregistered|as.?is|as is)\b/i;
 const SWAP_PATTERNS      = /\b(swap|swaps|trade|trades|pto|part trade|part swap|swopping|swop)\b/i;
 const SPAM_PATTERNS      = /\b(follow|instagram|whatsapp|contact me|dm me|text me|call me|click link|bit\.ly|t\.me|telegram)\b/i;
+const HIRE_PATTERNS      = /\b(hire|rental|rent|hiring|for hire|available for hire|hire only|rent only|per day|per week|per hour|hourly rate|daily rate|weekly rate)\b/i;
 const PLACEHOLDER_TITLES = /^(car|item|stuff|thing|product|misc|other|test|listing)\s*$/i;
 
 // Catches accessories, parts, bundles — keeps them OUT of the price pool
@@ -481,6 +482,7 @@ function scoreListingQuality(listing) {
 
   // Bit 6 — spam signals in title/description
   if (SPAM_PATTERNS.test(full)) flags |= 64;
+  if (HIRE_PATTERNS.test(title)) { flags |= 64; quality = 'spam'; } // hire/rental = never a deal
 
   // Placeholder titles that give no useful signal
   if (PLACEHOLDER_TITLES.test(listing.title || '')) flags |= 64;
@@ -3829,6 +3831,7 @@ async function rebuildGlobalDeals() {
         AND l.img_matches_keyword IS NOT FALSE
         AND l.scraped_at > NOW() - INTERVAL '3 days'
         AND l.keyword = ANY($1)
+        AND l.title NOT ~* '\\y(hire|rental|rent|for hire|hire only|per day|per week|hourly rate|daily rate)\\y'
       ORDER BY l.scraped_at DESC
       LIMIT 800
     `, [SEED_KEYWORDS]);
@@ -4036,7 +4039,7 @@ async function runFullBootSequence() {
       WHERE price_quality = 'unscored'
         AND price > 0
         AND is_offer_price = FALSE
-        AND title NOT ~* '(wanted|wtb|wtt|swap|trade|parts only|wrecking|for parts|not working|broken|faulty|damaged|cracked|smashed|as is|spares)'
+        AND title NOT ~* '(wanted|wtb|wtt|swap|trade|parts only|wrecking|for parts|not working|broken|faulty|damaged|cracked|smashed|as is|spares|hire|rental|for hire|per day|per week)'
     `);
     console.log('[Boot] Quality pass done');
 
