@@ -507,125 +507,12 @@ function scoreListingQuality(listing) {
   return { flags, quality, inPricePool };
 }
 
-// ── Gemini call with exponential backoff on 503/429 ─────────────────────────
-// Drop-in replacement for axios.post(...) on Gemini endpoints.
-// Retries up to 4 times with doubling delay (2s → 4s → 8s → 16s, capped 30s).
-async function geminiPost(url, body, opts = {}) {
-  const MAX_RETRIES = 4;
-  let delay = 2000;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      return await axios.post(url, body, {
-        timeout: 25000,
-        ...opts,
-      });
-    } catch (e) {
-      const status = e.response?.status;
-      if ((status === 503 || status === 429) && attempt < MAX_RETRIES) {
-        console.warn(`[Gemini] ${status} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
-        await new Promise(r => setTimeout(r, delay));
-        delay = Math.min(delay * 2, 30000);
-        continue;
-      }
-      throw e;
-    }
-  }
-}
-
 // ── Quick Gemini photo check — runs async at upsert time ────────────────────
 // Fires immediately when a new listing lands. Non-blocking — upsert doesn't
 // wait for it. Updates the DB row once the result comes back.
 // Checks: does the photo match the keyword, rough condition, stock photo flag.
 // Result feeds straight into price_quality and img fields so the border is
 // accurate the first time the card appears in the Feed.
-
-async function quickGeminiPhotoCheck(listingId, imageUrl, title, keyword, price) {
-  if (!GEMINI_API_KEY) return;
-  if (!imageUrl) return;
-
-  try {
-    // Fetch image
-    let imgBase64, imgMime = 'image/jpeg';
-    try {
-      const imgRes = await axios.get(imageUrl, {
-        responseType: 'arraybuffer', timeout: 10000,
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
-      });
-      imgBase64 = Buffer.from(imgRes.data).toString('base64');
-      imgMime = imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg';
-    } catch (_) {
-      // Image fetch failed — mark analysed so nightly doesn't retry
-      await pool.query(`UPDATE listings SET img_analysed_at = NOW() WHERE listing_id = $1`, [listingId]);
-      return;
-    }
-
-    const prompt = `You are doing a fast quality check on a Facebook Marketplace listing photo.
-
-Listing:
-- Search keyword: "${(keyword||'').slice(0,80)}"
-- Title: "${(title||'').slice(0,120)}"
-- Price: ${price || '?'} AUD
-
-Look at the photo and return ONLY this JSON (no markdown):
-{
-  "matches_keyword": true | false,
-  "mismatch_reason": null | "one short reason e.g. photo shows a petrol moped not an electric scooter",
-  "condition": "new" | "like_new" | "good" | "fair" | "poor" | "damaged" | "cannot_assess",
-  "visible_damage": true | false,
-  "is_stock_photo": true | false
-}
-
-Be strict on matches_keyword — only false if the item in the photo is clearly a DIFFERENT type of product. Minor brand differences are fine.`;
-
-    const res = await geminiPost(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-      { contents: [{ parts: [
-        { inline_data: { mime_type: imgMime, data: imgBase64 } },
-        { text: prompt }
-      ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-      { timeout: 15000 }
-    );
-
-    const raw = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) {
-      await pool.query(`UPDATE listings SET img_analysed_at = NOW() WHERE listing_id = $1`, [listingId]);
-      return;
-    }
-
-    const r = JSON.parse(match[0]);
-
-    // Determine quality impact from photo result
-    let newQuality = null;
-    if (r.matches_keyword === false) {
-      newQuality = 'spam'; // wrong item — exclude from feed + deals + price pool
-      console.log(`[PhotoCheck] ❌ MISMATCH "${(title||'').slice(0,60)}" — ${r.mismatch_reason}`);
-    } else if (r.condition === 'damaged' || r.visible_damage === true) {
-      newQuality = 'damage'; // still shows but border capped, excluded from price pool
-    }
-
-    await pool.query(`
-      UPDATE listings SET
-        img_condition        = $1,
-        img_matches_keyword  = $2,
-        img_mismatch_reason  = $3,
-        img_analysed_at      = NOW(),
-        in_price_pool        = CASE WHEN $4::TEXT IN ('spam','damage') THEN FALSE ELSE in_price_pool END,
-        price_quality        = CASE WHEN $4::TEXT IS NOT NULL THEN $4 ELSE price_quality END
-      WHERE listing_id = $5
-    `, [
-      r.condition           || null,
-      r.matches_keyword !== false,
-      r.mismatch_reason     || null,
-      newQuality,
-      listingId,
-    ]);
-
-  } catch (e) {
-    // Silent fail — nightly batch will catch it
-    console.error(`[PhotoCheck] ${listingId}:`, e.message?.slice(0,80));
-  }
-}
 
 async function upsertListingToDB(rawListing) {
   try {
@@ -1256,10 +1143,10 @@ async function aiExtractVehicleFields(title, keyword, description = '') {
 
     let text = '';
     if (GEMINI_API_KEY) {
-      const res = await geminiPost(
+      const res = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { timeout: 10000 }
+        { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
       );
       text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else {
@@ -1366,10 +1253,14 @@ const APPRAISAL_CACHE_TTL_BY_ID   = 7 * 24 * 3600;   // 7 days — listing unlik
 const APPRAISAL_CACHE_TTL_BY_HASH = 3 * 24 * 3600;   // 3 days — same item, different listing
 
 function buildAppraisalHash(title, price, keyword) {
-  // Normalise inputs so minor differences don't bust the cache
+  // Normalise inputs so minor differences don't bust the cache.
+  // Price rounding is tiered — coarser for expensive items (market noise is larger),
+  // finer for cheap items where $50 is a meaningful difference.
   const normTitle   = (title   || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 80);
   const normKeyword = (keyword || '').toLowerCase().trim().slice(0, 30);
-  const normPrice   = Math.round((parseFloat(price) || 0) / 50) * 50; // round to nearest $50
+  const p           = parseFloat(price) || 0;
+  const bucket      = p < 500 ? 10 : p < 2000 ? 25 : 50; // $10 / $25 / $50 buckets
+  const normPrice   = Math.round(p / bucket) * bucket;
   const raw = `${normKeyword}|${normTitle}|${normPrice}`;
   return crypto.createHash('sha1').update(raw).digest('hex').slice(0, 16);
 }
@@ -1427,7 +1318,75 @@ async function setAppraisalCache(listingId, title, price, keyword, result) {
 //
 // We never expose this score to the user.
 
+const DB_MIN_SAMPLES    = 4;  // minimum listings in a cohort to use DB pricing
 const DB_TRUST_THRESHOLD = 65; // minimum score to prefer DB over AI
+
+// ── Category-aware sell price discounts ──────────────────────────────────────
+// FB Marketplace asking prices vs what things actually sell for.
+// Derived from AU market behaviour — fast-moving commodity items sell close to
+// asking; niche/slow items require deeper discounts to move.
+//
+// sellDiscount: fraction below asking median to get a realistic sell price
+// flipCostLow:  minimum prep cost for this category (clean, list, meet buyer)
+// flipCostHigh: higher end when item needs more work / is more complex to sell
+const CATEGORY_SELL_RATES = {
+  // Phones — huge demand, sell within days, minimal prep
+  phone:         { sellDiscount: 0.08, flipCostLow: 50,  flipCostHigh: 150 },
+  // Laptops — good demand but need testing, factory reset
+  laptop:        { sellDiscount: 0.10, flipCostLow: 100, flipCostHigh: 250 },
+  // Tablets — similar to phones
+  tablet:        { sellDiscount: 0.08, flipCostLow: 50,  flipCostHigh: 150 },
+  // Gaming — PS5/Xbox sell fast at right price, minor cleaning
+  gaming:        { sellDiscount: 0.10, flipCostLow: 50,  flipCostHigh: 200 },
+  // TVs — harder to transport, need testing, slower to sell
+  tv:            { sellDiscount: 0.15, flipCostLow: 100, flipCostHigh: 300 },
+  // Audio — varies wildly, speakers awkward to move
+  audio:         { sellDiscount: 0.12, flipCostLow: 50,  flipCostHigh: 200 },
+  // Power tools — good demand, condition matters a lot
+  power_tool:    { sellDiscount: 0.12, flipCostLow: 50,  flipCostHigh: 200 },
+  // Cameras — niche buyers, can sit for weeks
+  camera:        { sellDiscount: 0.15, flipCostLow: 50,  flipCostHigh: 150 },
+  // Vehicles — wide price variance, selling costs high (rego, RWC, time)
+  vehicle:       { sellDiscount: 0.12, flipCostLow: 500, flipCostHigh: 1500 },
+  // Motorcycles — similar to vehicles
+  motorcycle:    { sellDiscount: 0.12, flipCostLow: 300, flipCostHigh: 800 },
+  // Bikes — popular, easy to sell
+  bike:          { sellDiscount: 0.12, flipCostLow: 50,  flipCostHigh: 200 },
+  // Camping/outdoor — seasonal, niche buyers
+  camping:       { sellDiscount: 0.15, flipCostLow: 100, flipCostHigh: 300 },
+  // Gym equipment — bulky, hard to move, slower market
+  fitness:       { sellDiscount: 0.18, flipCostLow: 100, flipCostHigh: 300 },
+  // Watches — collector market, can wait for right buyer
+  watch:         { sellDiscount: 0.10, flipCostLow: 50,  flipCostHigh: 150 },
+  // Sneakers — fast market if you know it
+  sneakers:      { sellDiscount: 0.10, flipCostLow: 20,  flipCostHigh: 50  },
+  // Coffee machines / premium appliances
+  appliance:     { sellDiscount: 0.15, flipCostLow: 50,  flipCostHigh: 200 },
+  // Default for anything unrecognised
+  _default:      { sellDiscount: 0.15, flipCostLow: 100, flipCostHigh: 300 },
+};
+
+// Map a keyword to a CATEGORY_SELL_RATES key
+function kwToSellCategory(keyword) {
+  const k = (keyword || '').toLowerCase();
+  if (/iphone|samsung.*galaxy|google pixel|oneplus|oppo/.test(k))   return 'phone';
+  if (/macbook|imac|laptop|thinkpad|dell xps|surface pro|razer blade|asus rog/.test(k)) return 'laptop';
+  if (/ipad|galaxy tab/.test(k))                                     return 'tablet';
+  if (/ps5|ps4|xbox|nintendo switch|steam deck|meta quest|gaming pc|rtx/.test(k)) return 'gaming';
+  if (/oled tv|qled|bravia|inch tv|samsung.*tv|lg.*tv/.test(k))      return 'tv';
+  if (/sony wh|airpods|bose|sonos|marshall speaker/.test(k))         return 'audio';
+  if (/milwaukee|dewalt|makita|festool|hilti|chainsaw|pressure washer|mower|welder|generator/.test(k)) return 'power_tool';
+  if (/sony a7|canon eos|nikon|fujifilm|dji|gopro/.test(k))          return 'camera';
+  if (/hilux|landcruiser|patrol|ranger|triton|dmax|pajero|prado|rav4|commodore|mustang|bmw|mercedes|audi|volkswagen|subaru wrx|jeep/.test(k)) return 'vehicle';
+  if (/motorcycle|dirt bike|ktm|ducati|harley|kawasaki ninja|honda cbr|yamaha r1/.test(k)) return 'motorcycle';
+  if (/mountain bike|road bike|electric bike|trek|specialized|santa cruz|giant trance/.test(k)) return 'bike';
+  if (/engel|waeco|dometic|arb fridge|roof top tent|camper trailer|weber bbq|traeger|big green egg/.test(k)) return 'camping';
+  if (/squat rack|barbell|dumbbells|weight plates|bench press|treadmill|concept2|peloton/.test(k)) return 'fitness';
+  if (/rolex|omega|seiko prospex|tag heuer|ap royal oak|grand seiko/.test(k)) return 'watch';
+  if (/jordan|yeezy|nike dunk|air max|new balance 550/.test(k))      return 'sneakers';
+  if (/thermomix|kitchenaid|breville barista|breville oracle|delonghi|jura|dyson v/.test(k)) return 'appliance';
+  return '_default';
+}
 
 function scoreDBResult(stats) {
   if (!stats || !stats.samples) return 0;
@@ -1511,134 +1470,73 @@ async function fetchBestVehiclePrice(make, model, year, mileage, opts = {}) {
 
 async function getPriceCacheForKeyword(keyword) {
   const dbStats = await getDBPriceStats(keyword);
-  if (!dbStats) {
-    console.log(`[PriceCache] "${keyword}" → no DB data, using AI`);
-    return null;
-  }
-  const score = scoreDBKeywordResult(dbStats);
-  if (score >= DB_TRUST_THRESHOLD) {
+  const score   = dbStats ? scoreDBKeywordResult(dbStats) : 0;
+
+  if (dbStats && score >= DB_TRUST_THRESHOLD) {
+    // DB has enough clean data — use it as primary source
     console.log(`[PriceCache] "${keyword}" → DB preferred (score ${score}, n=${dbStats.count})`);
     return { ...dbStats, low: dbStats.p25 || dbStats.low, high: dbStats.p75 || dbStats.high };
   }
-  console.log(`[PriceCache] "${keyword}" → DB score ${score} < ${DB_TRUST_THRESHOLD} — AI preferred`);
-  return null;
+
+  // DB data is thin or missing — get AI anchor and blend with any DB data we have
+  // The anchor call is cached for 30 days so this is cheap after first hit
+  const sampleTitles = [];
+  if (dbStats && dbStats.count > 0) {
+    // Pull a few recent titles so AI has real context to price against
+    try {
+      const { rows } = await pool.query(
+        `SELECT title FROM listings WHERE keyword = $1 AND price > 0 AND is_active = TRUE
+         ORDER BY scraped_at DESC LIMIT 5`,
+        [keyword.toLowerCase().trim()]
+      );
+      rows.forEach(r => r.title && sampleTitles.push(r.title));
+    } catch (_) {}
+  }
+
+  const anchor = await getKeywordPriceAnchor(keyword, sampleTitles);
+
+  if (!anchor) {
+    // No AI anchor either — nothing to work with
+    console.log(`[PriceCache] "${keyword}" → no data available`);
+    return null;
+  }
+
+  if (dbStats && dbStats.count >= 2) {
+    // Blend: weight DB median by sample count, anchor by (1 - weight)
+    // Small DB sample still pulls the estimate toward real AU listings
+    const dbWeight  = Math.min(0.7, dbStats.count / 20); // caps at 70% weight at 20+ samples
+    const aiWeight  = 1 - dbWeight;
+    const blended   = Math.round(dbStats.median * dbWeight + anchor.asking_median * aiWeight);
+    console.log(`[PriceCache] "${keyword}" → blended (DB ${dbStats.count} samples @ ${Math.round(dbWeight*100)}%, AI anchor @ ${Math.round(aiWeight*100)}%) → $${blended}`);
+    return {
+      count:       dbStats.count,
+      median:      blended,
+      p25:         dbStats.p25 || Math.round(anchor.price_low),
+      p75:         dbStats.p75 || Math.round(anchor.price_high),
+      low:         dbStats.p25 || Math.round(anchor.price_low),
+      high:        dbStats.p75 || Math.round(anchor.price_high),
+      sell_price:  anchor.sell_price,
+      source:      'blended',
+      sourceLabel: `FlipRadar DB (${dbStats.count} listings) + AI estimate`,
+    };
+  }
+
+  // Pure AI anchor — no DB data at all
+  console.log(`[PriceCache] "${keyword}" → AI anchor only → asking $${anchor.asking_median}, sell ~$${anchor.sell_price}`);
+  return {
+    count:       0,
+    median:      anchor.asking_median,
+    p25:         anchor.price_low,
+    p75:         anchor.price_high,
+    low:         anchor.price_low,
+    high:        anchor.price_high,
+    sell_price:  anchor.sell_price,
+    source:      'ai_anchor',
+    sourceLabel: 'AI market estimate (building DB data)',
+  };
 }
 
 // Build a verdict from price data alone (no AI)
-function buildCacheVerdict(listingPrice, priceData) {
-  const { low, median, high, count, source } = priceData;
-
-  const roi = median > 0 ? Math.round(((median - listingPrice) / listingPrice) * 100) : 0;
-  const estimatedProfit = Math.round(median - listingPrice);
-
-  let verdict, oneLiner, dealScore;
-  if (roi >= 50) {
-    verdict   = 'STEAL';
-    oneLiner  = `Listed ${roi}% below median sold — incredible flip potential`;
-    dealScore = 95;
-  } else if (roi >= 30) {
-    verdict   = 'GOOD DEAL';
-    oneLiner  = `Listed ${roi}% below median sold price — strong flip potential`;
-    dealScore = 80;
-  } else if (roi >= 10) {
-    verdict   = 'GOOD DEAL';
-    oneLiner  = `Priced below market — room to profit`;
-    dealScore = 65;
-  } else if (roi >= 0) {
-    verdict   = 'FAIR';
-    oneLiner  = `Around market rate — slim margin`;
-    dealScore = 45;
-  } else {
-    verdict   = 'PASS';
-    oneLiner  = `Listed ${Math.abs(roi)}% above typical sold prices — negotiate hard or pass`;
-    dealScore = 20;
-  }
-
-  return {
-    verdict,
-    dealScore,
-    oneLiner,
-    estimatedResellLow:  low,
-    estimatedResellHigh: high,
-    recommendedOffer:    Math.round(listingPrice * 0.85),
-    walkAwayPrice:       Math.round(median * 1.05),
-    estimatedProfit:     Math.max(0, estimatedProfit),
-    roiPercent:          roi,
-    dataPoints:          count,
-    source,
-    low, median, high,
-    negotiationScript:   `Similar listings sell for around $${median} — would you take $${Math.round(listingPrice * 0.85)}?`,
-  };
-}
-
-// Mileage-aware verdict from DB price data (used when DB beats AI threshold).
-function buildVehicleVerdict(listingPrice, priceSource, mileage) {
-  const { marketMedian, marketLow, marketHigh, mileageAdjusted, make, model, year } = priceSource;
-
-  const feeAdj          = marketMedian * 0.92;  // ~8% selling fees (FB/Gumtree)
-  const roi             = marketMedian > 0 ? Math.round(((feeAdj - listingPrice) / listingPrice) * 100) : 0;
-  const estimatedProfit = Math.max(0, Math.round(feeAdj - listingPrice));
-
-  let verdict, oneLiner, dealScore;
-  if (roi >= 50) {
-    verdict = 'STEAL'; dealScore = 95;
-    oneLiner = `Listed ${roi}% below market median — exceptional flip potential`;
-  } else if (roi >= 30) {
-    verdict = 'GOOD DEAL'; dealScore = 82;
-    oneLiner = `Listed ${roi}% below market — strong flip potential`;
-  } else if (roi >= 15) {
-    verdict = 'GOOD DEAL'; dealScore = 68;
-    oneLiner = `Priced below market — solid room to profit`;
-  } else if (roi >= 0) {
-    verdict = 'FAIR'; dealScore = 45;
-    oneLiner = `Around market rate — slim margin`;
-  } else {
-    verdict = 'PASS'; dealScore = 18;
-    oneLiner = `Listed ${Math.abs(roi)}% above market — negotiate hard or pass`;
-  }
-
-  let timeToSell;
-  if (dealScore >= 80)      timeToSell = '1–3 days';
-  else if (dealScore >= 60) timeToSell = '3–7 days';
-  else if (dealScore >= 40) timeToSell = '1–2 weeks';
-  else                      timeToSell = '2–4 weeks';
-
-  let demandLevel;
-  if (dealScore >= 80)      demandLevel = '🔥 High';
-  else if (dealScore >= 55) demandLevel = '📈 Moderate';
-  else                      demandLevel = '📉 Low';
-
-  if (!mileageAdjusted)          dealScore = Math.max(0, dealScore - 8);
-  if (mileage && mileage > 200000) dealScore = Math.max(0, dealScore - 5);  // mileage param = kms value
-
-  const carLabel         = [year, make, model].filter(Boolean).join(' ');
-  const mileageWarning   = !mileageAdjusted ? ' Kms not listed — actual value may vary.' : '';
-  const whyItsWorth      = `Based on comparable ${carLabel} listings currently on the AU market.${mileageWarning}`;
-
-  return {
-    verdict,
-    dealScore,
-    oneLiner,
-    estimatedMarketValue: marketMedian,
-    estimatedResellLow:   marketLow,
-    estimatedResellHigh:  marketHigh,
-    recommendedOffer:     Math.round(listingPrice * 0.82),
-    walkAwayPrice:        Math.round(marketMedian * 0.95),
-    estimatedProfit,
-    roiPercent:           roi,
-    timeToSell,
-    demandLevel,
-    whyItsWorth,
-    greenFlags:          [],
-    redFlags:            [],
-    whatToCheckInPerson: [],
-    low:    marketLow,
-    median: marketMedian,
-    high:   marketHigh,
-    negotiationScript: `Similar ${carLabel}s are going for around $${marketMedian.toLocaleString()} — would you take $${Math.round(listingPrice * 0.82).toLocaleString()}?`,
-  };
-}
-
 // ── Email (Resend) ────────────────────────────────────────
 async function sendEmail(to, subject, html) {
   if (!RESEND_API_KEY) { console.log(`[Email] No RESEND_API_KEY — skipping email to ${to}`); return; }
@@ -1733,9 +1631,9 @@ function verificationEmail(name, email, code) {
 // ── Scan intervals per plan ───────────────────────────────
 const PLAN_INTERVALS = {
   free:    2 * 60 * 60 * 1000,  // 2 hours
-  basic:   2 * 60 * 60 * 1000,  // 2 hours
-  pro:     2 * 60 * 60 * 1000,  // 2 hours
-  premium: 2 * 60 * 60 * 1000,  // 2 hours
+  basic:   30 * 60 * 1000,      // 30 mins
+  pro:     30 * 60 * 1000,      // 30 mins
+  premium: 30 * 60 * 1000,      // 30 mins
 };
 
 // ── In-memory state ───────────────────────────────────────
@@ -2219,11 +2117,214 @@ function isOfferPrice(price) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── Shared scan cache TTL ────────────────────────────────
-const SHARED_SCAN_TTL_MS = 110 * 60 * 1000; // 110 mins — slightly under the 2hr scan interval
+const SHARED_SCAN_TTL_MS = 28 * 60 * 1000; // 28 mins — just under 30-min scan interval
 
 // ── Distribute raw listings to a single user ─────────────
+// ── Stage 1: Text-only AI filter ─────────────────────────────────────────────
+// One Haiku call for the whole batch. Returns array of listing IDs that passed.
+// Runs BEFORE listings hit the feed or DB — keeps junk out entirely.
+async function aiTextFilter(listings, keyword) {
+  if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY) return listings; // no key — pass all through
+  if (!listings.length) return listings;
+
+  try {
+    const lines = listings.map((l, i) => {
+      const price = l.price ? `$${l.price}` : 'no price';
+      const spec  = [l.year, l.mileage ? `${Number(l.mileage).toLocaleString()}km` : null, l.make]
+        .filter(Boolean).join(', ');
+      return `${i}|${(l.title || '').slice(0, 100)}|${price}${spec ? '|' + spec : ''}`;
+    }).join('\n');
+
+    const prompt = `You are filtering Australian Facebook Marketplace listings for a flipper searching: "${keyword}"
+
+For each listing decide:
+- relevant: is this actually the item being searched for? Strict — accessories, parts, services, wrong category = false
+- pass: would a flipper even consider this? False if: hire/rental, wanted ad, placeholder price, obvious junk with no resale value
+
+Return ONLY a JSON array, one entry per line, same order as input:
+[{"i":0,"relevant":true,"pass":true},...]
+
+Listings (index|title|price|specs):
+${lines}`;
+
+    let text = '';
+    if (ANTHROPIC_API_KEY) {
+      const r = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001', max_tokens: 800,
+        messages: [{ role: 'user', content: prompt }],
+      }, {
+        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+        timeout: 15000,
+      });
+      text = r.data?.content?.[0]?.text || '';
+    } else {
+      const r = await geminiPost(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { timeout: 15000 }
+      );
+      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    }
+
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) {
+      console.warn('[TextFilter] Bad AI response — passing all through');
+      return listings;
+    }
+
+    const results = JSON.parse(match[0]);
+    const passSet = new Set(
+      results.filter(r => r.relevant !== false && r.pass !== false).map(r => r.i)
+    );
+
+    const passed  = listings.filter((_, i) => passSet.has(i));
+    const removed = listings.length - passed.length;
+    if (removed > 0) {
+      const removedTitles = listings
+        .filter((_, i) => !passSet.has(i))
+        .map(l => `"${(l.title || '').slice(0, 50)}"`)
+        .join(', ');
+      console.log(`[TextFilter] "${keyword}" → removed ${removed}: ${removedTitles}`);
+    }
+    console.log(`[TextFilter] "${keyword}" → ${passed.length}/${listings.length} passed text filter`);
+    return passed;
+
+  } catch (e) {
+    console.error('[TextFilter] Error:', e.message);
+    return listings; // fail open — don't lose listings on API error
+  }
+}
+
+// ── Stage 2: Image filter ─────────────────────────────────────────────────────
+// Runs on text-filtered listings while FB image URLs are still fresh.
+// One Gemini Flash call per listing (parallel, capped at 6 concurrent).
+// Rejects: wrong item in photo, derelict/destroyed condition, pure stock photos
+// that hide real condition, photos that clearly mismatch the title.
+async function aiImageFilter(listings, keyword) {
+  if (!GEMINI_API_KEY) return listings;
+  if (!listings.length) return listings;
+
+  const CONCURRENCY = 6;
+  const results     = new Array(listings.length).fill(null);
+
+  async function checkOne(listing, idx) {
+    if (!listing.image) {
+      results[idx] = { pass: true, reason: 'no_image' };
+      return;
+    }
+    try {
+      // Fetch image — if it's already expired just pass through (text filter already ran)
+      let imgBase64, imgMime = 'image/jpeg';
+      try {
+        const imgRes = await axios.get(listing.image, {
+          responseType: 'arraybuffer', timeout: 8000,
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+        });
+        imgBase64 = Buffer.from(imgRes.data).toString('base64');
+        imgMime   = imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg';
+      } catch (_) {
+        // Image expired or unreachable — pass through, text filter already ran
+        results[idx] = { pass: true, reason: 'image_unavailable' };
+        return;
+      }
+
+      const prompt = `Australian Facebook Marketplace listing photo check.
+Keyword searched: "${keyword}"
+Title: "${(listing.title || '').slice(0, 120)}"
+Price: ${listing.price ? '$' + listing.price : 'unknown'} AUD
+
+Look at the photo. Return ONLY JSON:
+{
+  "pass": true|false,
+  "condition": "new"|"like_new"|"good"|"fair"|"poor"|"damaged"|"cannot_assess",
+  "reject_reason": null|"brief reason e.g. photo shows a rusted wreck"|"wrong item — photo shows X not Y"
+}
+
+Reject (pass:false) ONLY if:
+- Photo clearly shows a completely DIFFERENT type of item to the keyword
+- Item is obviously destroyed/derelict/unsalvageable (not just worn — actually wrecked)
+- Photo is clearly a placeholder/no-item (blank wall, random object, meme)
+Approve everything else — minor wear, fair condition, stock photos are all fine.`;
+
+      const gemRes = await geminiPost(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts: [
+          { inline_data: { mime_type: imgMime, data: imgBase64 } },
+          { text: prompt }
+        ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { timeout: 12000 }
+      );
+
+      const raw   = gemRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const mJson = raw.match(/\{[\s\S]*\}/);
+      if (!mJson) { results[idx] = { pass: true, reason: 'parse_error' }; return; }
+
+      const r = JSON.parse(mJson[0]);
+      results[idx] = { pass: r.pass !== false, condition: r.condition, reason: r.reject_reason };
+
+      // Save image analysis to DB so nightly batch skips it
+      // Damaged items also excluded from price pool — a smashed phone skews medians down
+      if (listing.id) {
+        const isDamaged = r.condition === 'damaged' || r.condition === 'poor';
+        const isWrong   = r.pass === false;
+        pool.query(`
+          UPDATE listings SET
+            img_condition       = $1,
+            img_matches_keyword = $2,
+            img_mismatch_reason = $3,
+            img_analysed_at     = NOW(),
+            price_quality = CASE
+              WHEN $2 = FALSE THEN 'spam'
+              WHEN $4 = TRUE  THEN 'damage'
+              ELSE price_quality
+            END,
+            in_price_pool = CASE
+              WHEN $2 = FALSE THEN FALSE
+              WHEN $4 = TRUE  THEN FALSE
+              ELSE in_price_pool
+            END
+          WHERE listing_id = $5
+        `, [r.condition || null, !isWrong, r.reject_reason || null, isDamaged, listing.id])
+        .catch(() => {});
+      }
+
+    } catch (e) {
+      console.error(`[ImageFilter] Error on "${(listing.title||'').slice(0,40)}":`, e.message);
+      results[idx] = { pass: true, reason: 'error' }; // fail open
+    }
+  }
+
+  // Run with concurrency cap — don't hammer Gemini with 50 simultaneous calls
+  for (let i = 0; i < listings.length; i += CONCURRENCY) {
+    const batch = listings.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map((l, j) => checkOne(l, i + j)));
+  }
+
+  const passed  = listings.filter((_, i) => results[i]?.pass !== false);
+  const removed = listings.length - passed.length;
+  if (removed > 0) {
+    listings
+      .filter((_, i) => results[i]?.pass === false)
+      .forEach(l => console.log(`[ImageFilter] ❌ "${(l.title||'').slice(0,60)}" — ${results[listings.indexOf(l)]?.reason}`));
+  }
+  console.log(`[ImageFilter] "${keyword}" → ${passed.length}/${listings.length} passed image filter`);
+  return passed;
+}
+
+// ── Two-stage AI gate — runs once per scrape, shared across all users ─────────
+// Text filter first (cheap), then image filter on survivors (more expensive but
+// only runs on listings that already passed text — keeps cost down).
+// Result is cached so multiple users watching the same keyword share the work.
+async function runAIGate(listings, keyword) {
+  if (!listings.length) return listings;
+  const stage1 = await aiTextFilter(listings, keyword);
+  const stage2 = await aiImageFilter(stage1, keyword);
+  console.log(`[AIGate] "${keyword}" → ${listings.length} in → ${stage1.length} after text → ${stage2.length} after image`);
+  return stage2;
+}
+
 async function distributeListingsToUser(watcher, raw, opts = {}) {
-  if (!Array.isArray(raw)) raw = []; // safety net
+  if (!Array.isArray(raw)) raw = [];
   const keyword      = watcher.keyword.toLowerCase();
   const userId       = watcher.userId;
   const seen         = await getUserSeen(userId);
@@ -2232,161 +2333,44 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
 
   const excludeWords = Array.isArray(watcher.excludeWords) ? watcher.excludeWords : [];
 
-  // ── Keyword synonym map ──────────────────────────────────
-  // Known brands, models and aliases that count as a match even without exact keyword words
-  const SYNONYMS = {
-
-    // ── Electric scooters ─────────────────────────────────
-    'electric scooter': ['ninebot', 'segway', 'xiaomi', 'mi scooter', 'gotrax', 'inokim', 'kaabo', 'dualtron', 'apollo', 'zero 8', 'zero 10', 'evo scooter', 'mearth', 'mercane', 'vsett', 'kugoo', 'fluidfreeride', 'turboant', 'hiboy', 'unagi', 'pure air', 'blade gt', 'mantis', 'wolf king', 'speedway', 'emove', 'joyor', 'navee', 'yadea', 'okai'],
-    'e scooter':        ['ninebot', 'segway', 'xiaomi', 'gotrax', 'inokim', 'kaabo', 'dualtron', 'apollo', 'mearth', 'mercane', 'vsett', 'kugoo', 'emove', 'navee', 'yadea'],
-    'scooter':          ['ninebot', 'segway', 'xiaomi', 'vespa', 'honda pcx', 'honda lead', 'yamaha nmax', 'yamaha vino', 'suzuki address', 'kymco', 'sym', 'peugeot scooter', 'piaggio', 'aprilia sr', 'genuine scooter', 'wolf scooter'],
-
-    // ── Electric bikes ────────────────────────────────────
-    'electric bike':    ['ebike', 'e-bike', 'e bike', 'bafang', 'bosch ebike', 'shimano steps', 'levo', 'turbo levo', 'specialized turbo', 'rad power', 'radpower', 'aventon', 'lectric', 'ride1up', 'juiced', 'super73', 'cake bike', 'riese muller', 'gazelle', 'trek powerfly', 'giant trance e', 'giant reign e', 'cannondale neo', 'bulls ebike', 'haibike', 'cube stereo hybrid', 'focus jam', 'orbea rise', 'yt decoy'],
-    'ebike':            ['ebike', 'e-bike', 'e bike', 'bafang', 'bosch', 'shimano steps', 'levo', 'rad power', 'aventon', 'super73', 'haibike', 'cube hybrid'],
-    'electric bicycle': ['ebike', 'e-bike', 'e bike', 'bafang', 'bosch', 'rad power', 'aventon', 'lectric'],
-
-    // ── Mopeds ───────────────────────────────────────────
-    'moped':            ['ninebot', 'segway', 'honda cub', 'ct110', 'postie bike', 'monkey bike', 'honda ct', 'yamaha cy', 'puch', 'tomos', 'garelli', 'derbi', 'piaggio ciao', 'vespa ciao'],
-
-    // ── Motorcycles ──────────────────────────────────────
-    'motorcycle':       ['honda cbr', 'honda cb', 'yamaha r1', 'yamaha r6', 'yamaha mt', 'kawasaki ninja', 'kawasaki z', 'suzuki gsxr', 'suzuki sv', 'ducati', 'bmw gs', 'bmw s1000', 'triumph', 'ktm duke', 'ktm exc', 'husqvarna', 'royal enfield', 'harley', 'indian scout', 'aprilia rsv', 'mv agusta', 'benelli', 'cfmoto', 'loncin'],
-    'dirt bike':        ['ktm', 'husqvarna', 'yamaha yz', 'yamaha wr', 'honda crf', 'kawasaki kx', 'suzuki rmz', 'beta rr', 'sherco', 'gasgas', 'tm racing', 'pitbike', 'pit bike', 'stomp', 'thumpstar'],
-
-    // ── Apple devices ─────────────────────────────────────
-    'iphone':           ['apple iphone', 'iphone 15', 'iphone 14', 'iphone 13', 'iphone 12', 'iphone 11', 'iphone x', 'iphone se', 'iphone pro', 'iphone plus', 'iphone max'],
-    'macbook':          ['apple macbook', 'macbook pro', 'macbook air', 'macbook m1', 'macbook m2', 'macbook m3', 'apple laptop', 'mac laptop'],
-    'ipad':             ['apple ipad', 'ipad pro', 'ipad air', 'ipad mini', 'ipad 10th', 'ipad 9th', 'apple tablet'],
-    'apple watch':      ['iwatch', 'series 9', 'series 8', 'series 7', 'apple watch ultra', 'watch ultra', 'watch se'],
-    'airpods':          ['airpod pro', 'airpods pro', 'airpods max', 'apple earbuds', 'apple earphones', 'apple headphones'],
-
-    // ── Gaming consoles ───────────────────────────────────
-    'ps5':              ['playstation 5', 'playstation5', 'sony ps5', 'ps5 console', 'ps5 digital', 'ps5 disc', 'dualsense'],
-    'ps4':              ['playstation 4', 'playstation4', 'sony ps4', 'ps4 console', 'ps4 pro', 'ps4 slim'],
-    'xbox':             ['xbox series x', 'xbox series s', 'xbox one', 'microsoft xbox', 'series x', 'series s'],
-    'nintendo switch':  ['switch oled', 'switch lite', 'nintendo oled', 'switch console', 'switch bundle'],
-    'gaming pc':        ['gaming computer', 'gaming desktop', 'rtx gaming', 'rgb gaming', 'gaming rig', 'gaming setup', 'custom pc', 'prebuilt gaming'],
-
-    // ── Golf ─────────────────────────────────────────────
-    'golf clubs':       ['callaway', 'titleist', 'taylormade', 'ping', 'cleveland', 'mizuno', 'cobra golf', 'srixon', 'wilson golf', 'tour edge', 'honma', 'full set', 'iron set', 'golf set', 'driver set', 'wedge set'],
-    'golf club':        ['callaway', 'titleist', 'taylormade', 'ping', 'cleveland', 'mizuno', 'cobra golf', 'srixon', 'driver', 'putter', 'wedge', 'iron', '3 wood', '5 wood'],
-    'golf bag':         ['cart bag', 'stand bag', 'staff bag', 'pencil bag', 'titleist bag', 'callaway bag', 'taylormade bag', 'ping bag'],
-
-    // ── Cameras ──────────────────────────────────────────
-    'camera':           ['sony a7', 'sony a6', 'canon eos', 'canon r5', 'canon r6', 'nikon z', 'nikon d', 'fujifilm xt', 'fujifilm x100', 'panasonic gh', 'olympus om', 'leica', 'hasselblad', 'mirrorless', 'dslr'],
-    'gopro':            ['hero 12', 'hero 11', 'hero 10', 'hero 9', 'gopro hero', 'action cam', 'action camera', 'dji action', 'insta360'],
-    'drone':            ['dji mini', 'dji mavic', 'dji air', 'dji phantom', 'dji fpv', 'autel evo', 'skydio', 'fpv drone', 'quadcopter'],
-
-    // ── Audio ─────────────────────────────────────────────
-    'headphones':       ['sony wh', 'sony xm4', 'sony xm5', 'bose qc', 'bose 700', 'bose quietcomfort', 'sennheiser', 'audio technica', 'beats studio', 'beats pro', 'jabra evolve', 'beyerdynamic', 'akg', 'anker soundcore', 'jbl live'],
-    'speakers':         ['jbl charge', 'jbl flip', 'jbl xtreme', 'bose soundlink', 'sonos', 'marshall speaker', 'ultimate ears', 'ue boom', 'harman kardon', 'klipsch', 'polk audio', 'audioengine', 'yamaha speaker'],
-    'turntable':        ['record player', 'vinyl player', 'technics', 'audio technica lp', 'pro-ject', 'rega', 'pioneer plx', 'reloop', 'denon dp'],
-
-    // ── Computers ────────────────────────────────────────
-    'laptop':           ['macbook', 'thinkpad', 'dell xps', 'hp spectre', 'hp envy', 'lenovo yoga', 'asus rog', 'asus zenbook', 'surface pro', 'surface laptop', 'acer swift', 'razer blade', 'lg gram'],
-    'graphics card':    ['rtx 4090', 'rtx 4080', 'rtx 4070', 'rtx 3090', 'rtx 3080', 'rtx 3070', 'rtx 3060', 'rx 7900', 'rx 6900', 'rx 6800', 'gpu', 'nvidia', 'radeon'],
-    'monitor':          ['ultrawide', '4k monitor', '144hz', '240hz', 'oled monitor', 'curved monitor', 'dell ultrasharp', 'lg ultragear', 'samsung odyssey', 'asus rog monitor', 'benq'],
-
-    // ── Tools & Equipment ─────────────────────────────────
-    'power tools':      ['dewalt', 'milwaukee', 'makita', 'bosch tools', 'festool', 'hikoki', 'metabo', 'ryobi', 'ridgid', 'snap-on', 'impact driver', 'drill set', 'circular saw', 'angle grinder'],
-    'generator':        ['honda generator', 'yamaha generator', 'kipor', 'hyundai generator', 'briggs stratton', 'powertech', 'genset', 'inverter generator'],
-    'pressure washer':  ['karcher', 'gerni', 'ryobi pressure', 'dewalt pressure', 'simpson pressure', 'generac', 'pressure cleaner'],
-
-    // ── Fitness ───────────────────────────────────────────
-    'treadmill':        ['nordictrack', 'bowflex', 'sole treadmill', 'life fitness', 'concept2', 'peloton tread', 'reebok treadmill', 'running machine'],
-    'weights':          ['dumbbells', 'barbell', 'kettlebell', 'weight plates', 'olympic weights', 'gym weights', 'bumper plates', 'cast iron weights'],
-    'exercise bike':    ['spin bike', 'peloton', 'wattbike', 'schwinn', 'assault bike', 'concept2 bike', 'nordictrack bike', 'indoor cycle', 'stationary bike'],
-
-    // ── Furniture ─────────────────────────────────────────
-    'couch':            ['sofa', 'lounge', 'sectional', 'chesterfield', 'loveseat', '3 seater', '4 seater', '2 seater', 'corner sofa'],
-    'sofa':             ['couch', 'lounge', 'sectional', 'chesterfield', '3 seater', '4 seater', 'corner lounge'],
-    'dining table':     ['dining set', 'kitchen table', 'dinner table', 'table and chairs', 'dining suite'],
-
-    // ── Cars (common searches) ────────────────────────────
-    'ute':              ['hilux', 'ranger', 'navara', 'triton', 'colorado', 'd-max', 'bt-50', 'amarok', 'ram 1500', 'f-150', 'silverado', 'tundra'],
-    'van':              ['transit', 'sprinter', 'vito', 'ducato', 'daily', 'hiace', 'nv200', 'master', 'vivaro', 'trafic', 'transporter'],
-    '4wd':              ['landcruiser', 'prado', 'patrol', 'pajero', 'defender', 'discovery', 'wrangler', 'everest', 'fortuner', 'outlander', 'rav4', 'crv'],
-
-    // ── Watches ───────────────────────────────────────────
-    'watch':            ['rolex', 'omega', 'seiko', 'casio', 'citizen', 'tag heuer', 'tissot', 'breitling', 'iwc', 'panerai', 'tudor', 'oris', 'longines', 'hamilton', 'garmin watch', 'suunto'],
-    'smartwatch':       ['apple watch', 'samsung galaxy watch', 'garmin fenix', 'garmin forerunner', 'fitbit', 'polar', 'suunto', 'huawei watch', 'pixel watch'],
-
-    // ── Clothing & Fashion ────────────────────────────────
-    'sneakers':         ['nike air', 'jordan', 'adidas yeezy', 'yeezy', 'new balance', 'asics gel', 'vans old skool', 'converse', 'reebok classic', 'puma', 'salehe', 'dunk', 'air force', 'air max', 'ultraboost'],
-    'designer bag':     ['louis vuitton', 'lv bag', 'gucci bag', 'prada bag', 'chanel bag', 'hermes', 'balenciaga', 'burberry', 'coach bag', 'kate spade', 'michael kors', 'tory burch'],
-
-    // ── Musical instruments ───────────────────────────────
-    'guitar':           ['fender', 'gibson', 'martin guitar', 'taylor guitar', 'epiphone', 'ibanez', 'prs guitar', 'schecter', 'telecaster', 'stratocaster', 'les paul', 'sg guitar', 'acoustic guitar', 'electric guitar'],
-    'keyboard':         ['yamaha keyboard', 'roland keyboard', 'korg', 'casio keyboard', 'nord piano', 'kawai', 'digital piano', 'midi keyboard', 'synthesizer'],
-
-    // ── Baby & Kids ───────────────────────────────────────
-    'pram':             ['stroller', 'bugaboo', 'uppababy', 'babyzen yoyo', 'silver cross', 'mountain buggy', 'baby jogger', 'icandy', 'nuna', 'cybex'],
-    'baby car seat':    ['car seat', 'britax', 'maxi cosi', 'cybex seat', 'nuna rava', 'uppababy mesa', 'clek', 'jolly jumper'],
-  };
-
-  // Find synonyms for this keyword
-  const kwSynonyms = SYNONYMS[keyword] || [];
-
-  // Split keyword into words — all must appear in title OR a synonym matches
-  const kwWords = keyword.replace(/['"]/g, '').toLowerCase().split(/\s+/).filter(w => w.length > 0);
-
+  // Apply user-defined exclude words — everything else handled by AI gate upstream
   const relevant = raw.filter(l => {
-    const title = (l.title || '').toLowerCase();
-    const desc  = (l.description || '').toLowerCase();
-    const full  = title + ' ' + desc;
-
-    // Only block user-defined excluded words — AI handles all relevance filtering
-    if (excludeWords.length && excludeWords.some(w => w && full.includes(w))) return false;
-
-    return true;
+    if (!excludeWords.length) return true;
+    const full = ((l.title || '') + ' ' + (l.description || '')).toLowerCase();
+    return !excludeWords.some(w => w && full.includes(w));
   });
 
   const dropped = raw.length - relevant.length;
   if (dropped > 0) {
-    console.log(`[Filter] "${keyword}" — dropped ${dropped} listing(s) (matched excluded words)`);
-    // Save blocked listings so user can review them
+    console.log(`[Filter] "${keyword}" — dropped ${dropped} listing(s) (excluded words)`);
     const blockedListings = raw.filter(l => !relevant.includes(l)).map(l => ({
       id: l.id, title: l.title, price: l.price, url: l.url,
       image: l.image, keyword, blockedAt: new Date().toISOString()
     }));
     redisGet(K.blocked(watcher.userId)).then(existing => {
-      const all = Array.isArray(existing) ? existing : [];
+      const all    = Array.isArray(existing) ? existing : [];
       const merged = [...blockedListings, ...all.filter(e => !blockedListings.find(b => b.id === e.id))];
-      redisSet(K.blocked(watcher.userId), merged.slice(0, 100)); // keep last 100
+      redisSet(K.blocked(watcher.userId), merged.slice(0, 100));
     }).catch(() => {});
   }
 
   let seenSkipped = 0;
-  let seenModified = false;
-  // Debug counters — logged at end to show exactly where listings went
   let dropMaxPrice = 0, dropMinPrice = 0;
-  // On regular scans (after initial scan completed), drop any listing that was
-  // posted before the initial scan finished — those should have been caught then.
-  // This stops old listings trickling in on every 30-min scan.
-  const initialScanCutoff = watcher.initialScanCompletedAt
-    ? new Date(watcher.initialScanCompletedAt).getTime()
-    : null;
 
   for (let listing of relevant) {
-    // ── Check for price drop + write to Neon DB ───────────
-    // Price drop check runs first — enriches the listing object with
-    // priceDropped/previousPrice flags before anything else sees it.
     listing = await checkPriceDrop(listing);
     storeScanPrice(keyword, listing).catch(() => {});
 
     const key    = `${keyword}:${listing.id}`;
     const seenTs = seen[key];
 
-    // Price-dropped listings always get through to the feed even if seen before
-    // — the user needs to know the price changed
     const isPriceDrop = listing.priceDropped && listing.price < (listing.previousPrice || Infinity);
     if (seenTs && (Date.now() - seenTs) < SEEN_TTL_MS && !isPriceDrop) {
       if (!opts.initialScan) { seenSkipped++; continue; }
     }
-    // Price range filter — only applies when the user has set a min/max
+
     if (watcher.maxPrice && listing.price && listing.price > watcher.maxPrice) { dropMaxPrice++; continue; }
     if (watcher.minPrice && listing.price && listing.price < watcher.minPrice) { dropMinPrice++; continue; }
-    // Vehicle filters
     if (watcher.minYear && listing.year && listing.year < watcher.minYear) continue;
     if (watcher.maxYear && listing.year && listing.year > watcher.maxYear) continue;
     if (watcher.minKms  && listing.mileage && listing.mileage < watcher.minKms) continue;
@@ -2404,18 +2388,16 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
       if (userListings.length > 500) userListings.length = 500;
     }
     newCount++;
+
     const pToken   = watcher.pushoverToken || process.env.PUSHOVER_TOKEN;
     const pUser    = watcher.pushoverUser  || process.env.PUSHOVER_USER;
     const priceStr = listing.price ? `$${listing.price}` : 'Price unknown';
     const dropStr  = listing.priceDropped
       ? ` 🔻 Price dropped from $${listing.previousPrice} (-$${listing.dropAmount})`
       : '';
-    const pushTitle = listing.priceDropped
-      ? `💸 Price Drop: ${keyword}`
-      : `FlipRadar: ${keyword}`;
-    // Pushover notification (if configured)
+    const pushTitle = listing.priceDropped ? `💸 Price Drop: ${keyword}` : `FlipRadar: ${keyword}`;
+
     await sendPushover(pToken, pUser, pushTitle, `${listing.title}\n${priceStr}${dropStr}`, listing.url);
-    // Web push notification — works even when app is closed, no extra app needed
     sendWebPush(watcher.userId, {
       title: pushTitle,
       body:  `${priceStr}${dropStr} · ${listing.location || keyword}`,
@@ -2425,49 +2407,47 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     await sleep(300);
   }
 
-  // Log the breakdown so we can see exactly where listings went
-  const totalIn = relevant.length;
-  const totalOut = newCount;
-  if (totalIn > 0) {
-    console.log(`[Distribute] "${keyword}" → ${totalIn} in, ${totalOut} new, ${seenSkipped} already seen, ${dropMaxPrice + dropMinPrice} outside price range`);
+  if (relevant.length > 0) {
+    console.log(`[Distribute] "${keyword}" → ${relevant.length} in, ${newCount} new, ${seenSkipped} seen, ${dropMaxPrice + dropMinPrice} outside price range`);
   }
 
   if (newCount > 0) {
     await saveUserListings(userId, userListings);
-    await saveUserSeen(userId, seen);
-  } else if (seenModified) {
-    // Seen map changed (cutoff blocks or initial-scan refreshes) but no new listings.
-    // Must persist so those entries survive across the next scan cycle.
     await saveUserSeen(userId, seen);
   }
 
   return { newCount, userListings };
 }
 
-// ── Per-watch scan — shared cache across all users ────────
-// If two users watch "mercedes benz", only ONE BrightData call is made per 25 mins
-// Both users get results from the shared cache — huge cost saving
+// ── Per-watch scan — shared cache + shared AI gate across all users ────────────
+// One SociaVault call + one AI gate pass per keyword per scan interval.
+// All users watching the same keyword share both the scrape and the filtering.
 async function scanWatchItem(watcher, opts = {}) {
   const keyword = watcher.keyword.toLowerCase();
 
-  // ── Check shared scan cache first ────────────────────────
   let raw;
   const cached = await redisGet(K.sharedScan(keyword));
   if (!opts.initialScan && cached && (Date.now() - new Date(cached.scannedAt).getTime()) < SHARED_SCAN_TTL_MS) {
-    // Serve from cache — no limit, serve everything cached
     raw = cached.listings || [];
-    console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache (no SociaVault call)`);
+    console.log(`[SharedCache] "${keyword}" → ${raw.length} listings from cache`);
   } else {
-    raw = await scrapeKeyword(keyword, {
+    // Scrape fresh
+    const scraped = await scrapeKeyword(keyword, {
       city: watcher.location, lat: watcher.lat, lng: watcher.lng,
       radius: watcher.radius, initialScan: opts.initialScan || false,
       minPrice: watcher.minPrice || null,
       maxPrice: watcher.maxPrice || null,
     });
-    await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
-    console.log(`[SharedCache] "${keyword}" → cached ${raw.length} listings`);
 
-    // ── Also distribute to ALL other users watching this keyword ──
+    // ── Run two-stage AI gate before caching ──────────────
+    // Filters here means every user who hits this cache gets clean listings.
+    // Image URLs are still fresh at this point — critical for image filter.
+    raw = await runAIGate(scraped, keyword);
+
+    await redisSet(K.sharedScan(keyword), { listings: raw, scannedAt: new Date().toISOString() });
+    console.log(`[SharedCache] "${keyword}" → cached ${raw.length} clean listings (${scraped.length - raw.length} removed by AI gate)`);
+
+    // Distribute to other users watching this keyword
     const otherWatchers = watchlist.filter(w =>
       w.keyword.toLowerCase() === keyword &&
       w.userId !== watcher.userId &&
@@ -2480,27 +2460,19 @@ async function scanWatchItem(watcher, opts = {}) {
     }
   }
 
-  // NOTE: We do NOT clear seen cache on initial scan anymore
-  // This preserves existing listings in the feed when adding a new keyword
-
-  // ── Distribute to this user ───────────────────────────────
-  // Safety net — ensure raw is always an array
   if (!Array.isArray(raw)) raw = [];
 
-  // On initial scan: sort by recency so the feed shows newest first.
-  // No cap — let all scraped listings through (up to 50).
   if (opts.initialScan && raw.length > 1) {
     raw = [...raw].sort((a, b) => {
       if (a.listedAtUnknown && !b.listedAtUnknown) return 1;
       if (!a.listedAtUnknown && b.listedAtUnknown) return -1;
       return new Date(b.listedAt || b.foundAt || 0) - new Date(a.listedAt || a.foundAt || 0);
     });
-    console.log(`[InitialScan] "${keyword}" → passing all ${raw.length} listings through`);
+    console.log(`[InitialScan] "${keyword}" → passing all ${raw.length} AI-filtered listings`);
   }
 
   const { newCount, userListings } = await distributeListingsToUser(watcher, raw, opts);
 
-  // Mark initial scan complete — regular scans will filter by listedAt after this timestamp
   if (opts.initialScan) {
     watcher.initialScanCompletedAt = new Date().toISOString();
   }
@@ -2829,10 +2801,7 @@ cron.schedule('0 2 * * *', async () => {
     // ── Step 9: Rebuild product_price_stats ────────────────
     await rebuildProductPriceStats();
 
-    // ── Step 10: Gemini image analysis ───────────────────────
-    await analyseListingImagesNightly();
-
-    // ── Step 11: AI flip scoring ──────────────────────────────
+    // ── Step 10: AI flip scoring ──────────────────────────────
     await scoreDealsWithAINightly();
 
   } catch (e) {
@@ -2870,9 +2839,15 @@ async function scoreDealsWithAINightly() {
         AND l.is_active = TRUE
         AND l.price_quality NOT IN ('spam','swap','accessory')
         AND l.img_matches_keyword IS NOT FALSE
-      ORDER BY l.scraped_at DESC
+        -- Only score listings from flipper-relevant seed keywords
+        AND l.keyword = ANY($2)
+        -- Minimum price floor — nothing under $50 is worth scoring
+        AND l.price >= 50
+        -- Exclude obvious household junk from scoring budget
+        AND l.title !~* '\\m(casserole|saucepan|pot set|cutlery|crockery|dinner set|plate set|vase|ornament|curtain|cushion|doona|pillow|towel|rug|lamp|candle|dining chair|coffee table|bedside table|chest of drawers|tv unit|bunk bed)\\M'
+      ORDER BY l.price DESC, l.scraped_at DESC
       LIMIT $1
-    `, [BATCH]);
+    `, [BATCH, SEED_KEYWORDS]);
 
     if (!rows.length) break;
     console.log(`[FlipScore] Scoring batch of ${rows.length} listings...`);
@@ -2937,10 +2912,10 @@ Scoring guide:
               }});
             } catch (_) {}
           }
-          const res = await geminiPost(
+          const res = await axios.post(
             `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
             { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-            { timeout: 20000 }
+            { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
           );
           text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         } else {
@@ -3002,130 +2977,6 @@ Scoring guide:
 //   1. Assess item condition (new/like_new/good/fair/poor/damaged)
 //   2. Verify the photo actually matches the keyword — flags mismatches (e.g. moped listed as electric scooter)
 // Runs nightly, never re-analyses a listing. Costs ~$0.000075 per image.
-
-async function analyseListingImagesNightly() {
-  if (!GEMINI_API_KEY) { console.log('[ImgAnalysis] No Gemini key — skipping'); return; }
-
-  const BATCH = 20;
-  let processed = 0;
-  let flagged = 0;
-
-  while (true) {
-    const { rows } = await pool.query(`
-      SELECT id, listing_id, title, keyword, price, image_url,
-             extracted_product, extracted_category
-      FROM listings
-      WHERE img_analysed_at IS NULL
-        AND image_url IS NOT NULL AND image_url != ''
-        AND price > 0
-        AND is_active = TRUE
-      ORDER BY scraped_at DESC
-      LIMIT $1
-    `, [BATCH]);
-
-    if (!rows.length) break;
-
-    console.log(`[ImgAnalysis] Analysing batch of ${rows.length} images...`);
-
-    for (const row of rows) {
-      try {
-        // Fetch image
-        let imgBase64 = null, imgMime = 'image/jpeg';
-        try {
-          const imgRes = await axios.get(row.image_url, {
-            responseType: 'arraybuffer', timeout: 12000,
-            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
-          });
-          imgBase64 = Buffer.from(imgRes.data).toString('base64');
-          imgMime = imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg';
-        } catch (_) {
-          await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
-          continue;
-        }
-
-        const keyword  = row.keyword || row.extracted_product || row.title || 'unknown';
-        const category = row.extracted_category || 'general';
-
-        const prompt = `Analyse this Facebook Marketplace listing photo.
-
-Listing:
-- Search keyword: "${keyword}"
-- Title: "${(row.title||'').slice(0,120)}"
-- Category: ${category}
-- Price: ${row.price} AUD
-
-Return ONLY valid JSON (no markdown):
-{
-  "condition": "new" | "like_new" | "good" | "fair" | "poor" | "damaged" | "cannot_assess",
-  "matches_keyword": true | false,
-  "mismatch_reason": null | "short reason e.g. photo shows a petrol moped not an electric scooter",
-  "visible_damage": true | false,
-  "is_stock_photo": true | false
-}
-
-Be strict on matches_keyword — only mark false if the item in the photo is clearly a DIFFERENT type of product than the keyword describes. Minor brand/model differences are fine.`;
-
-        const geminiRes = await geminiPost(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-          { contents: [{ parts: [
-            { inline_data: { mime_type: imgMime, data: imgBase64 } },
-            { text: prompt }
-          ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-          { timeout: 20000 }
-        );
-
-        const raw = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        const match = raw.match(/\{[\s\S]*\}/);
-        if (!match) {
-          await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
-          continue;
-        }
-
-        const result = JSON.parse(match[0]);
-
-        // Determine quality penalty
-        let newQuality = null;
-        if (result.matches_keyword === false) {
-          newQuality = 'spam'; // wrong item — exclude from price pool and deals
-          flagged++;
-          console.log(`[ImgAnalysis] ❌ MISMATCH: "${row.title}" (kw: ${keyword}) — ${result.mismatch_reason}`);
-        } else if (result.condition === 'damaged' || result.visible_damage) {
-          newQuality = 'damage'; // still shows in deals but tint is capped
-        }
-
-        await pool.query(`
-          UPDATE listings SET
-            img_condition       = $1,
-            img_matches_keyword = $2,
-            img_mismatch_reason = $3,
-            img_analysed_at     = NOW(),
-            price_quality = CASE
-              WHEN $4::TEXT IS NOT NULL THEN $4
-              ELSE price_quality
-            END
-          WHERE id = $5
-        `, [
-          result.condition || null,
-          result.matches_keyword !== false,
-          result.mismatch_reason || null,
-          newQuality,
-          row.id,
-        ]);
-
-        processed++;
-        await new Promise(r => setTimeout(r, 400));
-
-      } catch (e) {
-        console.error(`[ImgAnalysis] Error on ${row.listing_id}:`, e.message);
-        await pool.query('UPDATE listings SET img_analysed_at = NOW() WHERE id = $1', [row.id]);
-      }
-    }
-
-    console.log(`[ImgAnalysis] Running total: ${processed} analysed, ${flagged} mismatches flagged`);
-  }
-
-  console.log(`[ImgAnalysis] ✅ Done — ${processed} images analysed, ${flagged} removed as mismatches`);
-}
 
 // ── Product Extraction ────────────────────────────────────
 // Reads unprocessed listing titles in batches of 50, asks Claude to identify
@@ -3267,7 +3118,7 @@ async function rebuildProductPriceStats() {
           AND is_active = TRUE
           AND scraped_at > NOW() - INTERVAL '90 days'
         GROUP BY product_key, display_name, brand, category, variant
-        HAVING COUNT(*) >= 8
+        HAVING COUNT(*) >= 4
       ),
       fenced AS (
         SELECT
@@ -3288,7 +3139,7 @@ async function rebuildProductPriceStats() {
           AND l.is_active = TRUE
           AND l.scraped_at > NOW() - INTERVAL '90 days'
         GROUP BY b.product_key, b.display_name, b.brand, b.category, b.variant, b.raw_count
-        HAVING COUNT(l.id) >= 8
+        HAVING COUNT(l.id) >= 4
       )
       SELECT product_key, display_name, brand, category, variant,
              clean_count, raw_count, median, p25_clean, p75_clean, low, high, NOW()
@@ -3871,10 +3722,87 @@ async function rebuildGlobalDeals() {
 
     const approved = [];
 
+    // ── Category minimum prices — anything below these is never worth flipping ──
+    // Based on real AU FB Marketplace flip economics: you need at least $150+ margin
+    // after transport, time and relisting fees to make it worth your while.
+    const CATEGORY_FLOORS = {
+      // Tech
+      phone:        300,   // anything under $300 is a parts phone, not a flip
+      laptop:       400,
+      tablet:       200,
+      gaming:       150,   // some accessories are fine
+      tv:           300,
+      audio:        150,
+      camera:       300,
+      // Tools
+      power_tool:   100,   // even a single Milwaukee battery is worth flipping
+      // Vehicles & outdoor
+      vehicle:      2000,
+      motorcycle:   1500,
+      bike:         300,
+      camping:      200,
+      // Fitness
+      fitness:      200,
+      // Watches/fashion
+      watch:        300,
+      sneakers:     150,
+      // General catch-all
+      _default:     150,
+    };
+
+    // ── Category whitelist — only these are worth flipping on FB Marketplace ──
+    // Anything not in this list gets rejected regardless of price/discount.
+    const FLIPPABLE_KEYWORDS = new Set([
+      'phone','laptop','tablet','gaming','tv','audio','camera','power_tool',
+      'vehicle','motorcycle','bike','camping','fitness','watch','sneakers',
+      'appliance','photography','music',
+    ]);
+
+    // Map keyword → category bucket for floor check
+    function dealsBucket(kw) {
+      const k = (kw || '').toLowerCase();
+      if (/iphone|samsung.*galaxy|google pixel|oneplus|oppo find/.test(k)) return 'phone';
+      if (/macbook|imac|laptop|thinkpad|dell xps|surface pro|razer blade|asus rog/.test(k)) return 'laptop';
+      if (/ipad|galaxy tab/.test(k)) return 'tablet';
+      if (/ps5|ps4|xbox|nintendo switch|steam deck|meta quest|gaming pc|rtx|gaming monitor/.test(k)) return 'gaming';
+      if (/oled tv|qled|bravia|samsung.*tv|lg.*tv|inch tv/.test(k)) return 'tv';
+      if (/sony wh|airpods|bose|sonos|marshall speaker/.test(k)) return 'audio';
+      if (/milwaukee|dewalt|makita|festool|hilti|snap on|mac tools|ryobi|hikoki|bosch 18v/.test(k)) return 'power_tool';
+      if (/chainsaw|pressure washer|husqvarna|stihl|mower|ride on/.test(k)) return 'power_tool';
+      if (/hilux|landcruiser|patrol|ranger|triton|dmax|pajero|prado|rav4|commodore|mustang|bmw|mercedes|audi|volkswagen|subaru wrx|jeep/.test(k)) return 'vehicle';
+      if (/motorcycle|dirt bike|ktm|ducati|harley|kawasaki ninja|honda cbr|yamaha r1/.test(k)) return 'motorcycle';
+      if (/bull bar|winch|lift kit|roof rack|drawer system|dual battery|arb|tjm/.test(k)) return 'vehicle'; // 4wd accessories
+      if (/mountain bike|road bike|electric bike|trek|specialized|santa cruz|yeti|giant trance|pinarello|cervelo|scott bike/.test(k)) return 'bike';
+      if (/engel fridge|waeco|dometic|arb fridge|roof top tent|camper trailer|camp trailer/.test(k)) return 'camping';
+      if (/weber bbq|traeger|big green egg|kamado joe/.test(k)) return 'camping';
+      if (/squat rack|barbell|dumbbells|weight plates|bench press|cable machine|rogue|treadmill|concept2|assault bike|peloton/.test(k)) return 'fitness';
+      if (/sony a7|canon eos|nikon z|fujifilm|dji mavic|dji mini|gopro/.test(k)) return 'camera';
+      if (/thermomix|kitchenaid|breville barista|breville oracle|delonghi|jura|dyson v/.test(k)) return 'appliance';
+      if (/rolex|omega seamaster|omega speedmaster|tag heuer|ap royal oak|seiko prospex|grand seiko/.test(k)) return 'watch';
+      if (/jordan|yeezy|nike dunk|air max|new balance 550/.test(k)) return 'sneakers';
+      if (/callaway|titleist|taylormade|ping|scotty cameron/.test(k)) return 'fitness'; // golf
+      if (/honda generator|yamaha generator|inverter generator|welder|trailer/.test(k)) return 'power_tool';
+      return '_default';
+    }
+
     for (const row of rows) {
-      const t = (row.title || '').toLowerCase();
+      const t   = (row.title || '').toLowerCase();
+      const kw  = (row.keyword || '').toLowerCase();
+
+      // ── Hard rejects — never flip these ──────────────────
       if (/\b(hire|rental|for hire|per day|per week|hourly|service|installation|wanted|wtb|wtt)\b/.test(t)) continue;
-      if (/^(tools?|stuff|items?|electronics?|misc|other|various|assorted|junk|lot)\s*$/.test(t)) continue;
+      if (/^(tools?|stuff|items?|electronics?|misc|other|various|assorted|junk|lot|furniture|clothing|clothes)\s*$/.test(t)) continue;
+      // Reject low-value household junk regardless of keyword
+      if (/\b(casserole|saucepan|pot set|cutlery|crockery|dinner set|plate set|bowl set|vase|ornament|picture frame|curtain|cushion|doona|pillow|towel|sheet set|rug|mat|lamp|candle|decor)\b/.test(t)) continue;
+      // Reject generic furniture (not worth the effort on FB Marketplace)
+      if (/\b(dining chair|dining table|coffee table|side table|bedside table|wardrobe|dresser|bookshelf|shelf|shelving unit|chest of drawers|tv unit|entertainment unit|kids bed|bunk bed)\b/.test(t) && !/\b(herman miller|aeron|embody|jarvis|standing desk)\b/.test(t)) continue;
+      // Reject cheap single items not worth flipping
+      if (row.price && row.price < 50) continue;
+
+      // ── Category-based minimum price floor ────────────────
+      const bucket = dealsBucket(kw);
+      const floor  = CATEGORY_FLOORS[bucket] || CATEGORY_FLOORS._default;
+      if (row.price && row.price < floor) continue;
 
       const isBroken = /\b(broken|faulty|not working|dead|cracked|smashed|parts only|as is|for parts|damaged|needs work|spares|repair)\b/.test(t);
 
@@ -3932,7 +3860,6 @@ async function rebuildGlobalDeals() {
     console.error('[Deals] Rebuild failed:', e.message, '|', e.detail || '', '| position:', e.position || '');
   }
 }
-
 
 
 // Boot sequence is handled by runFullBootSequence() — see below
@@ -4036,146 +3963,146 @@ async function runFullBootSequence() {
 // Full rotation = 6 hours. At ~150 keywords that's 150 credits per rotation.
 
 const SEED_KEYWORDS = [
-  // ── Phones ───────────────────────────────────────────────
+  // ── iPhones — high demand, fast flip, easy to price ──────
   'iphone 16 pro', 'iphone 16', 'iphone 15 pro', 'iphone 15', 'iphone 14 pro',
-  'iphone 14', 'iphone 13', 'iphone 12', 'iphone 11', 'iphone se',
+  'iphone 14', 'iphone 13', 'iphone 12', 'iphone 11',
+
+  // ── Samsung flagships ─────────────────────────────────────
   'samsung galaxy s25', 'samsung galaxy s24', 'samsung galaxy s23', 'samsung galaxy s22',
-  'samsung galaxy a55', 'samsung galaxy a54', 'google pixel 9', 'google pixel 8',
-  'oneplus 12', 'oppo find x8',
+  'google pixel 9', 'google pixel 8',
 
-  // ── Laptops & Computers ──────────────────────────────────
-  'macbook pro m3', 'macbook pro m2', 'macbook pro m1', 'macbook air m2', 'macbook air m1',
-  'macbook air m3', 'imac m3', 'imac m1',
-  'dell xps 15', 'dell xps 13', 'hp spectre x360', 'hp envy laptop',
-  'lenovo thinkpad', 'lenovo yoga', 'asus rog laptop', 'asus zenbook',
-  'surface pro', 'surface laptop', 'razer blade laptop', 'acer swift laptop',
-  'gaming pc', 'desktop computer',
+  // ── MacBooks — premium, liquid market ────────────────────
+  'macbook pro m3', 'macbook pro m2', 'macbook pro m1',
+  'macbook air m3', 'macbook air m2', 'macbook air m1',
+  'imac m3', 'imac m1',
 
-  // ── Tablets ──────────────────────────────────────────────
-  'ipad pro', 'ipad air', 'ipad mini', 'samsung galaxy tab s9', 'samsung galaxy tab s8',
+  // ── Other laptops with real resale ───────────────────────
+  'dell xps 15', 'dell xps 13', 'lenovo thinkpad x1',
+  'asus rog laptop', 'razer blade laptop', 'surface pro',
 
-  // ── Gaming ───────────────────────────────────────────────
-  'ps5 console', 'ps5 digital', 'ps4 pro', 'ps4 console',
-  'xbox series x', 'xbox series s', 'xbox one x',
-  'nintendo switch oled', 'nintendo switch', 'nintendo switch lite',
+  // ── Tablets ───────────────────────────────────────────────
+  'ipad pro', 'ipad air', 'ipad mini',
+  'samsung galaxy tab s9', 'samsung galaxy tab s8',
+
+  // ── Gaming consoles — best flip category on FB Marketplace
+  'ps5 console', 'ps5 digital',
+  'ps4 pro', 'ps4 console',
+  'xbox series x', 'xbox series s',
+  'nintendo switch oled', 'nintendo switch',
   'steam deck', 'meta quest 3', 'meta quest 2',
-  'gaming chair', 'gaming monitor',
 
-  // ── TVs & Audio ───────────────────────────────────────────
-  'samsung 65 inch tv', 'samsung 55 inch tv', 'lg oled tv', 'sony bravia tv',
-  'lg 65 tv', 'samsung qled tv', 'tcl tv', 'hisense tv',
-  'sonos speaker', 'jbl speaker', 'bose speaker', 'marshall speaker',
-  'sony wh1000xm5', 'airpods pro', 'airpods max', 'bose quietcomfort',
+  // ── Gaming PCs & monitors ────────────────────────────────
+  'gaming pc', 'rtx 4090', 'rtx 4080', 'rtx 4070', 'rtx 3090', 'rtx 3080',
+  'gaming monitor', 'ultrawide monitor',
 
-  // ── Power Tools ──────────────────────────────────────────
+  // ── TVs — large format hold value ────────────────────────
+  'lg oled tv', 'samsung qled tv', 'sony bravia tv',
+  'samsung 65 inch tv', 'samsung 75 inch tv', 'lg 65 tv',
+
+  // ── Premium audio ─────────────────────────────────────────
+  'sony wh1000xm5', 'sony wh1000xm4', 'airpods pro', 'airpods max',
+  'bose quietcomfort', 'sonos speaker',
+
+  // ── Milwaukee — king of FB Marketplace tool flips ────────
   'milwaukee m18 drill', 'milwaukee m18 impact driver', 'milwaukee m18 grinder',
-  'milwaukee m18 circular saw', 'milwaukee m18 multi tool', 'milwaukee m18 jigsaw',
-  'milwaukee m18 reciprocating saw', 'milwaukee m18 kit', 'milwaukee m12',
+  'milwaukee m18 circular saw', 'milwaukee m18 jigsaw', 'milwaukee m18 multi tool',
+  'milwaukee m18 reciprocating saw', 'milwaukee m18 kit', 'milwaukee m18 fuel',
+  'milwaukee m12', 'milwaukee packout',
+
+  // ── DeWalt ───────────────────────────────────────────────
   'dewalt 18v drill', 'dewalt 18v impact driver', 'dewalt 18v grinder',
-  'dewalt 18v circular saw', 'dewalt xr kit',
+  'dewalt 18v circular saw', 'dewalt xr kit', 'dewalt flexvolt',
+
+  // ── Makita ───────────────────────────────────────────────
   'makita 18v drill', 'makita 18v impact driver', 'makita 18v grinder',
   'makita 18v circular saw', 'makita combo kit',
-  'ryobi 18v drill', 'ryobi 18v kit', 'ryobi one plus',
-  'bosch 18v drill', 'hikoki drill', 'festool sander', 'festool track saw',
-  'air compressor', 'bench grinder', 'angle grinder', 'drop saw',
-  'table saw', 'thicknesser', 'router table', 'laser level',
 
-  // ── Outdoor & Garden ─────────────────────────────────────
-  'husqvarna mower', 'honda mower', 'ride on mower', 'zero turn mower',
-  'ego lawn mower', 'greenworks mower', 'lawn mower petrol',
-  'husqvarna chainsaw', 'stihl chainsaw', 'echo chainsaw',
-  'pressure washer', 'karcher pressure washer', 'leaf blower',
-  'garden trailer', 'wood chipper', 'post hole digger',
+  // ── Festool — elite tier, holds value like nothing else ──
+  'festool track saw', 'festool sander', 'festool router', 'festool drill',
 
-  // ── Camping & Outdoors ────────────────────────────────────
+  // ── Other high-value tools ───────────────────────────────
+  'air compressor', 'drop saw', 'table saw', 'thicknesser', 'laser level',
+  'snap on tool box', 'mac tools', 'hilti drill',
+
+  // ── Outdoor power — great margins ────────────────────────
+  'husqvarna chainsaw', 'stihl chainsaw', 'stihl ms', 'echo chainsaw',
+  'husqvarna mower', 'ride on mower', 'zero turn mower',
+  'karcher pressure washer', 'pressure washer',
+
+  // ── Camping/4WD gear — premium brands only ────────────────
   'engel fridge', 'waeco fridge', 'dometic fridge', 'arb fridge',
-  'camp trailer', 'roof top tent', 'swag', 'camping trailer',
-  'weber bbq', 'traeger bbq', 'bbq grill', 'kamado bbq',
-  'kayak', 'canoe', 'stand up paddle board', 'inflatable kayak',
-  'fishing rod', 'fishing reel', 'fishing kayak',
-  'hiking boots', 'tent', 'sleeping bag',
+  'roof top tent', 'arb awning', 'snorkel patrol', 'snorkel hilux',
+  'camp trailer', 'camper trailer',
 
-  // ── Vehicles ─────────────────────────────────────────────
+  // ── BBQs — Weber/Traeger/Big Green Egg only ───────────────
+  'weber bbq', 'traeger bbq', 'big green egg', 'kamado joe', 'webber genesis',
+
+  // ── Vehicles — high demand makes, quick to flip ───────────
   'toyota hilux', 'toyota landcruiser 200', 'toyota landcruiser 79',
-  'toyota prado', 'toyota rav4', 'toyota camry', 'toyota corolla',
+  'toyota prado', 'toyota rav4',
   'ford ranger', 'ford everest', 'ford mustang',
-  'holden commodore', 'holden colorado',
-  'nissan patrol', 'nissan navara', 'nissan x trail',
-  'mitsubishi triton', 'mitsubishi pajero', 'mitsubishi outlander',
-  'isuzu dmax', 'isuzu mu x',
-  'mazda cx5', 'mazda bt50', 'mazda 3',
-  'subaru forester', 'subaru outback', 'subaru wrx',
-  'hyundai tucson', 'hyundai i30', 'kia sportage',
-  'jeep wrangler', 'jeep gladiator',
-  'bmw 3 series', 'mercedes c class', 'audi a4',
-  'motorcycle', 'dirt bike', 'trail bike', 'enduro bike',
+  'nissan patrol', 'nissan navara',
+  'mitsubishi triton', 'isuzu dmax',
+  'mazda cx5', 'subaru wrx', 'subaru forester',
+  'jeep wrangler', 'holden commodore v8',
+  'bmw m3', 'bmw m4', 'bmw 3 series',
+  'mercedes amg', 'mercedes c class',
+  'audi rs', 'volkswagen golf r',
+
+  // ── Motorcycles ───────────────────────────────────────────
   'honda cbr', 'yamaha r1', 'kawasaki ninja', 'suzuki gsxr',
-  'caravan', 'camper trailer', 'pop top caravan',
+  'ducati', 'bmw gs', 'ktm duke', 'harley davidson',
+  'dirt bike', 'ktm exc', 'husqvarna enduro',
 
-  // ── Vehicles — Parts & Accessories ───────────────────────
-  'bull bar', 'winch', 'lift kit', 'snorkel', 'roof rack',
-  'drawer system', 'dual battery system',
+  // ── 4WD accessories — bolt-on margin ─────────────────────
+  'arb bull bar', 'tjm bull bar', 'warn winch', 'arb winch',
+  'lift kit', 'roof rack', 'drawer system', 'dual battery system',
 
-  // ── Bikes & Scooters ─────────────────────────────────────
-  'mountain bike', 'road bike', 'bmx bike', 'electric bike',
-  'trek bike', 'specialized bike', 'giant bike', 'scott bike',
-  'electric scooter', 'segway ninebot',
+  // ── Premium bikes ─────────────────────────────────────────
+  'trek mountain bike', 'specialized mountain bike', 'santa cruz bike',
+  'yeti bike', 'giant trance', 'scott bike',
+  'trek road bike', 'specialized road bike', 'pinarello', 'cervelo',
+  'electric bike', 'bosch ebike', 'specialized turbo levo',
 
-  // ── Furniture ─────────────────────────────────────────────
-  'couch lounge', 'sectional sofa', 'leather couch', '3 seater lounge',
-  'dining table', 'dining chairs', 'coffee table', 'tv unit',
-  'queen bed frame', 'king bed frame', 'bedside table',
-  'office desk', 'standing desk', 'ergonomic chair', 'office chair',
-  'wardrobe', 'chest of drawers', 'bookshelf',
+  // ── Gym equipment — home gym boom created liquid market ──
+  'squat rack', 'barbell set', 'dumbbells', 'weight plates',
+  'bench press', 'cable machine', 'rogue barbell',
+  'treadmill', 'concept2 rower', 'assault bike', 'peloton',
 
-  // ── Baby & Kids ───────────────────────────────────────────
-  'pram stroller', 'baby cot', 'baby capsule', 'baby carrier',
-  'kids bike', 'trampoline', 'swing set', 'lego',
+  // ── Golf — brand-name clubs flip fast ─────────────────────
+  'callaway driver', 'titleist irons', 'taylormade driver',
+  'ping irons', 'ping driver', 'titleist driver',
+  'scotty cameron putter',
 
-  // ── Sports & Fitness ──────────────────────────────────────
-  'treadmill', 'rowing machine', 'spin bike', 'exercise bike',
-  'bowflex', 'home gym', 'barbell set', 'dumbbells',
-  'squat rack', 'bench press', 'weight plates',
-  'golf clubs', 'callaway driver', 'titleist irons',
-  'surfboard', 'skateboard', 'snowboard',
-  'tennis racket', 'basketball hoop',
+  // ── Cameras — depreciates fast, good flip category ────────
+  'sony a7', 'sony a7iv', 'sony a6700', 'canon eos r5', 'canon eos r6',
+  'nikon z6', 'nikon z8', 'fujifilm xt5', 'fujifilm x100v',
+  'dji mavic 3', 'dji mini 4 pro', 'dji air 3',
+  'gopro hero 12', 'gopro hero 11',
 
-  // ── Musical Instruments ────────────────────────────────────
-  'electric guitar', 'acoustic guitar', 'fender stratocaster', 'gibson les paul',
-  'fender telecaster', 'marshall amp', 'fender amp',
-  'drum kit', 'electronic drums', 'keyboard piano', 'yamaha keyboard',
-  'bass guitar', 'ukulele',
+  // ── Appliances with actual resale value ───────────────────
+  'thermomix tm6', 'thermomix tm5', 'kitchenaid mixer',
+  'breville barista express', 'breville oracle touch',
+  'delonghi dinamica', 'jura coffee machine',
+  'dyson v15', 'dyson v12', 'dyson v11',
 
-  // ── Photography ───────────────────────────────────────────
-  'sony a7', 'sony a6', 'canon eos r', 'canon 5d', 'nikon z6', 'nikon d750',
-  'fujifilm xt', 'fujifilm x100', 'drone dji', 'dji mini', 'dji mavic',
-  'camera lens', 'gopro',
+  // ── Watches — serious money ───────────────────────────────
+  'rolex submariner', 'rolex datejust', 'omega seamaster',
+  'omega speedmaster', 'tag heuer', 'ap royal oak',
+  'seiko prospex', 'seiko presage', 'grand seiko',
 
-  // ── Appliances ─────────────────────────────────────────────
-  'thermomix', 'kitchenaid mixer', 'breville coffee machine',
-  'delonghi coffee machine', 'nespresso machine', 'coffee grinder',
-  'dyson vacuum', 'roomba', 'dyson v11', 'dyson v12', 'dyson v15',
-  'washing machine', 'dryer', 'dishwasher', 'fridge freezer',
-  'air fryer', 'instant pot', 'ninja foodi',
+  // ── Sneakers — clean resale market ────────────────────────
+  'nike air jordan 1', 'jordan 4', 'jordan 11',
+  'adidas yeezy 350', 'adidas yeezy 700',
+  'nike dunk low', 'nike air max 1', 'new balance 550',
 
-  // ── Tech Accessories ──────────────────────────────────────
-  'monitor 27 inch', 'monitor 32 inch', 'ultrawide monitor',
-  'mechanical keyboard', 'logitech mx keys',
-  'standing desk converter', 'webcam',
-
-  // ── Collectibles & Fashion ────────────────────────────────
-  'vintage levi jeans', 'vintage adidas', 'nike air jordan',
-  'rolex watch', 'omega watch', 'seiko watch',
-  'vintage camera', 'vinyl records', 'trading cards',
-
-  // ── Trade & Industrial ────────────────────────────────────
-  'generator', 'inverter generator', 'honda generator', 'yamaha generator',
-  'welder', 'mig welder', 'tig welder',
-  'scaffolding', 'trailer', 'box trailer', 'car trailer', 'boat trailer',
-  'forklift', 'pallet jack', 'scissor lift',
+  // ── Generators & trade gear ───────────────────────────────
+  'honda generator', 'yamaha generator', 'inverter generator',
+  'mig welder', 'tig welder', 'lincoln welder',
+  'trailer', 'box trailer', 'car trailer',
 ];
 
-// How many keywords per batch — spread evenly across 6 hourly slots
+// How many keywords per batch// How many keywords per batch — spread evenly across 6 hourly slots
 const SEED_BATCH_SIZE = Math.ceil(SEED_KEYWORDS.length / 6);
 let _seedBatchIndex = 0;
 
@@ -4225,7 +4152,7 @@ async function runSeedBatch() {
 // One-time full scan on boot — scans all seed keywords once, then stops.
 // Re-deploy to trigger again. No recurring cron.
 async function runFullSeedScanOnce() {
-  const SEED_FLAG = 'fr:seed-scan-done-v1';
+  const SEED_FLAG = 'fr:seed-scan-done-v3'; // v3 = flipper-focused keywords
   const alreadyDone = await redisGet(SEED_FLAG);
   if (alreadyDone) {
     console.log('[SeedScan] Already completed — skipping. Delete fr:seed-scan-done-v1 in Redis to re-run.');
@@ -4445,13 +4372,13 @@ Look at the photo and return ONLY this JSON (no markdown):
 
 Only mark matches_keyword false if it is clearly a DIFFERENT type of product.`;
 
-    const geminiRes = await geminiPost(
+    const geminiRes = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: [
         { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
         { text: prompt }
       ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-      { timeout: 15000 }
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
     );
 
     const raw = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -5082,17 +5009,18 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
       '- Vague description (one line, no detail) → seller is hiding something, flag it',
       '',
       'CRITICAL — WHAT THINGS ACTUALLY SELL FOR IN AU (not asking price):',
-      'The market median shown above is what sellers are ASKING. What things actually SELL for is different.',
-      'In Australian FB Marketplace, most items sell for 10–20% below the asking median.',
-      'Your estimatedResellLow must be what a buyer will realistically pay — not what you hope to get.',
-      'Price it to sell in 1–2 weeks. If it would take longer, the price is too high.',
+      'The market median shown above is what comparable listings are ASKING. Actual sale prices are lower.',
+      `Category: ${kwToSellCategory(keyword)} — typical FB Marketplace sell discount off asking median: ${Math.round((CATEGORY_SELL_RATES[kwToSellCategory(keyword)] || CATEGORY_SELL_RATES._default).sellDiscount * 100)}%`,
+      `Typical flip costs for this category: $${(CATEGORY_SELL_RATES[kwToSellCategory(keyword)] || CATEGORY_SELL_RATES._default).flipCostLow}–$${(CATEGORY_SELL_RATES[kwToSellCategory(keyword)] || CATEGORY_SELL_RATES._default).flipCostHigh} (cleaning, listing, time, meeting buyer)`,
+      'Your estimatedResellLow = market median minus the category sell discount above.',
+      'Your estimatedResellHigh = market median minus 2% (best case — perfect condition, patient seller).',
       '',
       'CALCULATE PROFIT STEP BY STEP — show your working in whyItsWorth:',
-      'Step 1 — Realistic sell price: take market median, subtract 12% (AU market discount off asking)',
-      'Step 2 — Detailing/clean: $200 minimum, $400 if condition is average or unknown',
-      'Step 3 — Minor repairs: $0 if genuinely perfect, $300–800 if any issues mentioned or kms are high',
-      'Step 4 — Rego/RWC if unregistered or interstate: add $400–800',
-      'Step 5 — Your time: minimum 2 hours to list, negotiate, show, sell — factor it in',
+      `Step 1 — Realistic sell price: market median × ${1 - (CATEGORY_SELL_RATES[kwToSellCategory(keyword)] || CATEGORY_SELL_RATES._default).sellDiscount} (category discount)`,
+      `Step 2 — Flip costs: $${(CATEGORY_SELL_RATES[kwToSellCategory(keyword)] || CATEGORY_SELL_RATES._default).flipCostLow}–$${(CATEGORY_SELL_RATES[kwToSellCategory(keyword)] || CATEGORY_SELL_RATES._default).flipCostHigh} for this category (use midpoint unless condition is poor — then upper end)`,
+      'Step 3 — Repairs if needed: $0 if perfect, otherwise estimate based on what description says',
+      'Step 4 — Rego/RWC if vehicle is unregistered or interstate: add $400–800',
+      'Step 5 — Your time: factor in 2+ hours for listing, negotiation, meetup',
       'Step 6 — estimatedProfit = realistic sell price MINUS buy price MINUS steps 2–4',
       'Step 7 — roiPercent = estimatedProfit divided by buy price, expressed as percentage',
       '',
@@ -5167,17 +5095,17 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
         } catch (_) {}
       }
       parts.push({ text: prompt });
-      const geminiRes = await geminiPost(
+      const geminiRes = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { timeout: 30000 }
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
       );
       text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else if (GEMINI_API_KEY) {
-      const geminiRes = await geminiPost(
+      const geminiRes = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { timeout: 30000 }
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
       );
       text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else {
@@ -5198,35 +5126,40 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
 
     if (parsed) {
       if (dbPreferred) {
-        // DB is fully trusted — lock the price fields
-        // AI still owns: verdict rationale, flags, negotiation script, inspection checklist
-        parsed.estimatedMarketValue = dbResult.marketMedian;
-        parsed.estimatedResellLow   = dbResult.marketLow;
-        parsed.estimatedResellHigh  = dbResult.marketHigh;
-        parsed.low                  = dbResult.marketLow;
-        parsed.median               = dbResult.marketMedian;
-        parsed.high                 = dbResult.marketHigh;
-        // Realistic sell price = 10% below median (priced to actually sell, not sit)
-        const realisticSellPrice = Math.round(dbResult.marketMedian * 0.90);
-        // Realistic costs: detailing + minor prep (conservative estimate)
-        const flipCosts = listingPrice < 5000 ? 300 : listingPrice < 15000 ? 500 : 800;
+        // DB is fully trusted — lock the price fields to real market data.
+        // Use category-aware sell discount so a PS5 and a treadmill aren't
+        // treated identically — they have very different sell dynamics.
+        const sellCat   = kwToSellCategory(keyword);
+        const sellRates = CATEGORY_SELL_RATES[sellCat] || CATEGORY_SELL_RATES._default;
+
+        // Realistic sell price: median minus category-specific FB Marketplace discount
+        const realisticSellPrice = Math.round(dbResult.marketMedian * (1 - sellRates.sellDiscount));
+
+        // Flip costs: use midpoint of category range as base estimate
+        // Condition info from image analysis can refine this (if available)
+        const conditionModifier = (condition === 'poor' || condition === 'fair') ? 1.5 : 1.0;
+        const flipCosts = Math.round(
+          ((sellRates.flipCostLow + sellRates.flipCostHigh) / 2) * conditionModifier
+        );
+
         const realisticProfit = realisticSellPrice - listingPrice - flipCosts;
 
-        parsed.estimatedResellLow   = realisticSellPrice;
-        parsed.estimatedResellHigh  = Math.round(dbResult.marketMedian * 0.97); // best case just under median
         parsed.estimatedMarketValue = dbResult.marketMedian;
+        parsed.estimatedResellLow   = realisticSellPrice;
+        // Best case = sell at median with no discount (patient seller, great condition)
+        parsed.estimatedResellHigh  = Math.round(dbResult.marketMedian * 0.98);
         parsed.low                  = dbResult.marketLow;
         parsed.median               = dbResult.marketMedian;
         parsed.high                 = dbResult.marketHigh;
+
         if (realisticProfit <= 0) {
-          // Negative flip — set resell to around what was paid, profit to 0
           parsed.estimatedProfit      = 0;
           parsed.roiPercent           = 0;
           parsed.estimatedResellLow   = listingPrice;
-          parsed.estimatedResellHigh  = Math.round(listingPrice * 1.04);
+          parsed.estimatedResellHigh  = Math.round(listingPrice * (1 + sellRates.sellDiscount * 0.5));
         } else {
-          parsed.estimatedProfit      = Math.round(realisticProfit);
-          parsed.roiPercent           = Math.round((realisticProfit / listingPrice) * 100);
+          parsed.estimatedProfit = Math.round(realisticProfit);
+          parsed.roiPercent      = Math.round((realisticProfit / listingPrice) * 100);
         }
 
         // Verdict anchored to realistic ROI after all costs
@@ -5271,7 +5204,8 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await geminiPost(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
+      headers: { 'Content-Type': 'application/json' },
       timeout: 30000,
     });
     const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -5391,10 +5325,10 @@ Return ONLY JSON (no markdown):
 
     if (imgData) identifyParts.unshift({ inline_data: imgData });
 
-    const identRes = await geminiPost(
+    const identRes = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: identifyParts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-      { timeout: 15000 }
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
     );
     const identText = identRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     const identMatch = identText.match(/\{[\s\S]*\}/);
@@ -5468,10 +5402,10 @@ CRITICAL PRICING RULES:
     const appraisalParts = [{ text: appraisalPrompt }];
     if (imgData) appraisalParts.unshift({ inline_data: imgData });
 
-    const appraisalRes = await geminiPost(
+    const appraisalRes = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: appraisalParts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-      { timeout: 30000 }
+      { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
     );
 
     const text = appraisalRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -5550,7 +5484,7 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
            WHERE LOWER(display_name) LIKE LOWER($1)
            ORDER BY sample_count DESC LIMIT 1`, [`%${words}%`]
         );
-        if (prodRows[0]?.median_price && prodRows[0].sample_count >= 8) {
+        if (prodRows[0]?.median_price && prodRows[0].sample_count >= 4) {
           dbMedian  = prodRows[0].median_price;
           dbP25     = prodRows[0].p25_price;
           dbP75     = prodRows[0].p75_price;
@@ -5604,22 +5538,22 @@ ${lines}
 Reply ONLY as JSON array: [{"idx":0,"rating":"yellow","reason":"Fair for 210k km 2005","relevant":true}]
 Max 8 words per reason. Be specific about year/km impact on value.`;
 
-    const useAnthropic = !!ANTHROPIC_API_KEY;
+    const useGemini = !!GEMINI_API_KEY;
     let text = '';
 
-    if (useAnthropic) {
+    if (useGemini) {
+      const r = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1 } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 25000 }
+      );
+      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else if (ANTHROPIC_API_KEY) {
       const r = await axios.post('https://api.anthropic.com/v1/messages', {
         model: 'claude-haiku-4-5-20251001', max_tokens: 1000,
         messages: [{ role: 'user', content: prompt }],
       }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 20000 });
       text = r.data?.content?.[0]?.text || '';
-    } else if (GEMINI_API_KEY) {
-      const r = await geminiPost(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1 } },
-        { timeout: 25000 }
-      );
-      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     }
 
     res.json({ text });
@@ -5664,7 +5598,8 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
     }
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await geminiPost(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
+    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
+      headers: { 'Content-Type': 'application/json' },
       timeout: 30000,
     });
     const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -5789,9 +5724,9 @@ async function aiEstimateVehicle(target) {
   try {
     let text = '';
     if (GEMINI_API_KEY) {
-      const r = await geminiPost(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      const r = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         {contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},
-        {timeout:10000});
+        {headers:{'Content-Type':'application/json'},timeout:10000});
       text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';
     } else {
       const r = await axios.post('https://api.anthropic.com/v1/messages',
@@ -5882,26 +5817,106 @@ function normalizeGeneralProduct(listing){
 // ── Keyword price anchor (AI ballpark for the real product) ──────────
 const BROAD_KEYWORD_STOPLIST=new Set(['bmw','mercedes','audi','toyota','ford','holden','honda','nissan','mazda','mitsubishi','hyundai','kia','subaru','volkswagen','vw','jeep','lexus','volvo','car','cars','ute','van','truck','phone','laptop','tv','furniture','tools','desk','chair','table','couch','sofa']);
 function isBroadKeyword(kw){return BROAD_KEYWORD_STOPLIST.has(String(kw||'').toLowerCase().trim());}
-async function getKeywordPriceAnchor(keyword,sampleTitles=[]){
-  const cacheKey=`anchor:${_slug(keyword).slice(0,60)}`;
-  const cached=await redisGet(cacheKey);if(cached&&cached.anchor)return cached.anchor;
-  if(!GEMINI_API_KEY&&!ANTHROPIC_API_KEY)return null;
-  const prompt=['You estimate the typical USED resale price in AUD on Australian Facebook Marketplace.',`Product keyword: "${keyword}"`,sampleTitles.length?`Example titles:\n- ${sampleTitles.slice(0,6).join('\n- ')}`:'','Give ONE rough typical price for the MAIN product in good used condition (NOT accessories/parts).','Return ONLY JSON: { "anchor_aud": number }'].filter(Boolean).join('\n');
-  try{
-    let text='';
-    if(GEMINI_API_KEY){const r=await geminiPost(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,{contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},{timeout:10000});text=r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';}
-    else{const r=await axios.post('https://api.anthropic.com/v1/messages',{model:'claude-haiku-4-5-20251001',max_tokens:100,messages:[{role:'user',content:prompt}]},{headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},timeout:10000});text=r.data?.content?.[0]?.text||'';}
-    const m=text.match(/\{[\s\S]*\}/);const anchor=m?Math.round(JSON.parse(m[0]).anchor_aud):null;
-    if(anchor&&anchor>0){await redisSet(cacheKey,{anchor},30*24*3600);return anchor;}
-  }catch(e){console.error('[Anchor]',keyword,e.message);}
+async function getKeywordPriceAnchor(keyword, sampleTitles = []) {
+  const cacheKey = `anchor2:${_slug(keyword).slice(0, 60)}`; // v2 key — returns object not scalar
+  const cached   = await redisGet(cacheKey);
+  if (cached && cached.asking_median) return cached;
+  if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
+
+  const cat      = kwToSellCategory(keyword);
+  const rates    = CATEGORY_SELL_RATES[cat] || CATEGORY_SELL_RATES._default;
+  const discPct  = Math.round(rates.sellDiscount * 100);
+
+  const prompt = [
+    'You are an Australian Facebook Marketplace second-hand pricing expert.',
+    `Product keyword: "${keyword}"`,
+    sampleTitles.length ? `Example listing titles from real AU FB Marketplace:
+- ${sampleTitles.slice(0, 6).join('
+- ')}` : '',
+    '',
+    'Give pricing for the MAIN product in good used condition (not accessories, not broken).',
+    'All prices in AUD.',
+    '',
+    'Return ONLY valid JSON:',
+    '{',
+    '  "asking_median": <typical asking price on AU FB Marketplace>,',
+    `  "sell_price": <what it ACTUALLY sells for — typically ${discPct}% below asking on FB Marketplace>,`,
+    '  "price_low": <bottom 25% of market — worn/old/high-kms>,',
+    '  "price_high": <top 25% — near-new, low-use, great condition>',
+    '}',
+  ].filter(Boolean).join('
+');
+
+  try {
+    let text = '';
+    if (GEMINI_API_KEY) {
+      const r = await geminiPost(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { timeout: 10000 }
+      );
+      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else {
+      const r = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001', max_tokens: 150,
+        messages: [{ role: 'user', content: prompt }],
+      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 10000 });
+      text = r.data?.content?.[0]?.text || '';
+    }
+
+    const m      = text.match(/\{[\s\S]*\}/);
+    const result = m ? JSON.parse(m[0]) : null;
+    if (result && result.asking_median > 0) {
+      // Sanity check — sell price shouldn't be more than 5% above asking
+      if (!result.sell_price || result.sell_price > result.asking_median * 1.05) {
+        result.sell_price = Math.round(result.asking_median * (1 - rates.sellDiscount));
+      }
+      const toCache = {
+        asking_median: Math.round(result.asking_median),
+        sell_price:    Math.round(result.sell_price),
+        price_low:     Math.round(result.price_low  || result.asking_median * 0.70),
+        price_high:    Math.round(result.price_high || result.asking_median * 1.10),
+        category:      cat,
+      };
+      await redisSet(cacheKey, toCache, 30 * 24 * 3600); // cache 30 days
+      return toCache;
+    }
+  } catch (e) {
+    console.error('[Anchor]', keyword, e.message);
+  }
   return null;
 }
-async function refreshKeywordAnchors(){
-  try{
-    const{rows}=await pool.query(`SELECT keyword,COUNT(*)::INT AS n,(ARRAY_AGG(title ORDER BY scraped_at DESC))[1:6] AS sample_titles FROM listings WHERE keyword IS NOT NULL AND category!='vehicle' AND price>0 AND is_active=TRUE GROUP BY keyword HAVING COUNT(*)>=8`);
-    for(const r of rows){if(isBroadKeyword(r.keyword))continue;const anchor=await getKeywordPriceAnchor(r.keyword,r.sample_titles||[]);if(anchor){await pool.query(`INSERT INTO keyword_anchors(keyword,anchor_price,updated_at)VALUES($1,$2,NOW())ON CONFLICT(keyword)DO UPDATE SET anchor_price=EXCLUDED.anchor_price,updated_at=NOW()`,[r.keyword,anchor]);}await new Promise(res=>setTimeout(res,200));}
+async function refreshKeywordAnchors() {
+  try {
+    const { rows } = await pool.query(`
+      SELECT keyword, COUNT(*)::INT AS n,
+        (ARRAY_AGG(title ORDER BY scraped_at DESC))[1:6] AS sample_titles
+      FROM listings
+      WHERE keyword IS NOT NULL
+        AND category != 'vehicle'
+        AND price > 0
+        AND is_active = TRUE
+      GROUP BY keyword
+      HAVING COUNT(*) >= 4
+    `);
+    for (const r of rows) {
+      if (isBroadKeyword(r.keyword)) continue;
+      const anchor = await getKeywordPriceAnchor(r.keyword, r.sample_titles || []);
+      if (anchor && anchor.asking_median) {
+        // Store the asking_median as the anchor price (used for IQR fence gating)
+        await pool.query(
+          `INSERT INTO keyword_anchors(keyword, anchor_price, updated_at)
+           VALUES($1, $2, NOW())
+           ON CONFLICT(keyword) DO UPDATE SET anchor_price = EXCLUDED.anchor_price, updated_at = NOW()`,
+          [r.keyword, anchor.asking_median]
+        );
+      }
+      await new Promise(res => setTimeout(res, 200));
+    }
     console.log(`[Anchor] refreshed ${rows.length} keyword anchors`);
-  }catch(e){console.error('[Anchor] refresh error:',e.message);}
+  } catch (e) {
+    console.error('[Anchor] refresh error:', e.message);
+  }
 }
 
 const PORT = process.env.PORT || 3000;
@@ -5917,7 +5932,7 @@ app.listen(PORT, async () => {
   // Runs once per deploy via a flag in Redis. Clears polluted price stats
   // and resets price pool flags so tonight's nightly rebuilds everything
   // cleanly with the anchor gate in place.
-  const RESET_FLAG = 'fr:migration:anchor-reset-v1';
+  const RESET_FLAG = 'fr:migration:anchor-reset-v2'; // v2 = after keyword overhaul
   const alreadyReset = await redisGet(RESET_FLAG);
   if (!alreadyReset) {
     try {
