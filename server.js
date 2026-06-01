@@ -3871,84 +3871,90 @@ async function rebuildGlobalDeals() {
       if (!filteredBatch.length) continue;
 
       // Re-index after filter
-      const lines = filteredBatch.map((r, idx) => {
-        const specParts = [
-          r.year    ? r.year               : null,
-          r.mileage ? `${Number(r.mileage).toLocaleString()}km` : null,
-          r.make    ? r.make               : null,
-        ].filter(Boolean);
-        const specStr = specParts.length ? ` (${specParts.join(', ')})` : '';
-        const priceStr = r.price ? `AUD $${r.price}` : 'price not listed';
-        return `${idx}. "${(r.title||'').slice(0,100)}"${specStr} listed ${priceStr}`;
-      }).join(' | ');
+      // Score each listing individually with its photo — one Gemini call per listing
+      // This is the only reliable way to catch mismatches like a rusted wreck
+      // being titled "Classic BMW, significantly underpriced"
+      for (const row of filteredBatch) {
+        try {
+          const t = (row.title||'').toLowerCase();
+          const isBroken = /\b(broken|faulty|not working|dead|cracked|smashed|parts only|as is|for parts|damaged|needs work|spares|repair)\b/.test(t);
+          const specParts = [
+            row.year    ? row.year                                    : null,
+            row.mileage ? `${Number(row.mileage).toLocaleString()}km` : null,
+            row.make    ? row.make                                    : null,
+          ].filter(Boolean);
+          const specStr  = specParts.length ? ` (${specParts.join(', ')})` : '';
+          const priceStr = row.price ? `AUD $${row.price}` : 'price not listed';
 
-      const isBrokenBatch = batch.some(r => {
-        const t = (r.title||'').toLowerCase();
-        return /\b(broken|faulty|not working|dead|cracked|smashed|parts only|as is|for parts|damaged|needs work|spares|repair)\b/.test(t);
-      });
+          const textPrompt = `You are an expert Australian Facebook Marketplace flipper. Evaluate this single listing as a flip opportunity.
 
-      const brokenSection = isBrokenBatch ? `THIS BATCH CONTAINS BROKEN/FIXABLE ITEMS — apply special broken-item scoring:
-- A broken iPhone with cracked screen listed at $100 that sells for $400 working = great flip
-- A broken PS5 HDMI port listed at $150 that costs $30 to fix and sells for $450 = rainbow
-- DO include broken items if: repair is simple, parts are cheap, demand for working version is high
-- DO NOT include if: repair is complex/expensive, parts are rare, or working version is not worth much more
-` : '';
+Listing: "${(row.title||'').slice(0,120)}"${specStr}
+Price: ${priceStr}
+${isBroken ? 'NOTE: Title suggests this may be broken/damaged.' : ''}
 
-      const prompt = `You are an experienced Australian marketplace flipper who specialises in buying cheap and reselling for profit. You are ruthlessly selective.
-
-${brokenSection}
-WHAT MAKES A GOOD FLIP (working items):
-- Clear undervalue vs what it realistically resells for on AU Facebook Marketplace
-- Minimum $150 net profit after all costs (buy, fix if needed, relist, 8% fees, time)
-- High demand — sells within 1-2 weeks
-- Specific branded items people search for: iPhones, Milwaukee/Dewalt/Makita tools, gaming consoles, MacBooks, camping fridges, quality bikes, cameras, audio gear
-
-WHAT MAKES A GOOD BROKEN FLIP:
-- Simple fixable issue (screen, battery, charging port, HDMI port, buttons)
-- Cheap repair parts (under $50 for parts)
-- Big resale upside when fixed (phones, consoles, laptops, power tools)
-- Price listed well below even broken/parts value
+${isBroken ? `BROKEN ITEM SCORING:
+- Only approve if repair is simple (screen, battery, port, buttons) with cheap parts (<$50)
+- Must have clear resale upside when fixed (phones, consoles, laptops, power tools)
+- Reject if: complex repair, rare parts, poor condition beyond simple fix, or rusted/structural damage
+` : `WORKING ITEM SCORING:
+- Only approve if clearly undervalued vs AU Facebook Marketplace second-hand prices
+- Minimum $150 net profit after all costs (buy, relist, 8% fees, time)
+- Must be high demand and sell within 1-2 weeks
+`}
+PHOTO ANALYSIS IS CRITICAL:
+- Look at the actual condition in the photo — does it match the title?
+- Reject if photo shows heavy rust, major damage, stripped parts, or derelict condition
+- Reject if photo doesn't match what the title claims to be selling
+- A "Classic BMW" that is a rusted wreck in a paddock = REJECT regardless of price
+- A phone with a cracked screen = OK if priced right for parts/repair
+- Stock photos or missing photos = use title judgment only
 
 AUTOMATIC REJECT:
-- Hire or rental listings
-- Services or non-physical items  
-- Items at or above market value (no margin)
-- Vague titles with no specific product
-- Old high-km vehicles unless genuinely exceptional price
-- Generic furniture, baby items without brand value
-- Anything that won't sell within 2 weeks
+- Hire/rental listings
+- Condition far worse than title suggests
+- No realistic profit margin for a flipper
+- Item nobody would search for on Facebook Marketplace
 
-NOTE ON PRICE: Do not reject based on low price alone. A $25 broken Dewalt battery, a $40 cracked iPhone, or a $60 faulty PS5 controller can all be excellent flips. Judge by the title and realistic fixed/working resale value.
+Reply ONLY as JSON (single object, not array):
+{"rating":"green"|"rainbow"|"pass","reason":"brief reason max 10 words","relevant":true|false}
 
-Listings (price, year, km in brackets where relevant):
-${lines}
+rating: rainbow=exceptional steal $500+ margin, green=solid flip $150+ margin, pass=not worth it`;
 
-Be STRICT on working items. Be OPPORTUNISTIC on broken items with clear fix potential.
-Omit everything that isn't a genuine flip opportunity.
+          // Try to fetch image while URL might still be live
+          const parts = [];
+          if (row.image_url) {
+            try {
+              const imgRes = await axios.get(row.image_url, {
+                responseType: 'arraybuffer', timeout: 8000,
+                headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+              });
+              const b64  = Buffer.from(imgRes.data).toString('base64');
+              const mime = imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg';
+              parts.push({ inline_data: { mime_type: mime, data: b64 } });
+            } catch (_) { /* image expired — text-only fallback */ }
+          }
+          parts.push({ text: textPrompt });
 
-Reply ONLY as JSON array with ONLY deals worth buying:
-[{"idx":0,"rating":"green","reason":"Milwaukee M18 kit $200 below market","relevant":true}]
+          const gemResp = await axios.post(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+            { contents: [{ parts }], generationConfig: { temperature: 0.1 } },
+            { headers: { 'Content-Type': 'application/json' }, timeout: 25000 }
+          );
+          const text   = gemResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          const match  = text.match(/\{[\s\S]*\}/);
+          if (!match) { await new Promise(r => setTimeout(r, 300)); continue; }
 
-Ratings:
-- rainbow = steal — resell same day, $500+ net margin OR broken item with massive upside
-- green = solid flip — $150+ net margin, high demand, sells fast
-Max 10 words per reason. Be specific: name the product and why it's undervalued.`;
+          const rating = JSON.parse(match[0]);
+          if (!rating.relevant || rating.rating === 'pass') {
+            await new Promise(r => setTimeout(r, 300));
+            continue;
+          }
+          if (rating.rating !== 'green' && rating.rating !== 'rainbow') {
+            await new Promise(r => setTimeout(r, 300));
+            continue;
+          }
 
-      try {
-        const r = await axios.post(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-          { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1 } },
-          { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
-        );
-        const text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        const match = text.match(/\[[\s\S]*\]/);
-        if (!match) continue;
-        const ratings = JSON.parse(match[0]);
-        ratings.forEach(rating => {
-          if (!rating.relevant) return;
-          if (rating.rating !== 'green' && rating.rating !== 'rainbow') return;
-          const row = filteredBatch[rating.idx];
-          if (!row) return;
+          // Approved — add to cache
           approved.push({
             id:           row.listing_id,
             title:        row.title,
@@ -3968,21 +3974,23 @@ Max 10 words per reason. Be specific: name the product and why it's undervalued.
             listedAt:     row.listedAt ? row.listedAt.toISOString() : null,
             imgCondition: row.img_condition || null,
             flipScore:    row.flip_score || null,
-            dealType:     row.flip_deal_type || null,
+            dealType:     isBroken ? 'broken_fixable' : (row.flip_deal_type || null),
             demand:       row.flip_demand || null,
             estResale:    row.flip_estimated_resale || null,
             estMargin:    row.flip_estimated_margin || null,
             fixCost:      row.flip_fix_cost || null,
             reasoning:    row.flip_reasoning || null,
-            tint:         rating.rating,   // 'green' or 'rainbow' from Gemini
+            tint:         rating.rating,
             geminiReason: rating.reason || null,
           });
-        });
-        console.log(`[Deals] Batch ${Math.floor(i/BATCH)+1}: ${ratings.filter(r=>r.rating==='green'||r.rating==='rainbow').length}/${batch.length} approved`);
-        await new Promise(res => setTimeout(res, 500));
-      } catch (e) {
-        console.error(`[Deals] Batch ${Math.floor(i/BATCH)+1} error:`, e.message);
+          console.log(`[Deals] ✅ "${(row.title||'').slice(0,50)}" — ${rating.rating}: ${rating.reason}`);
+          await new Promise(r => setTimeout(r, 400));
+        } catch (e) {
+          console.error(`[Deals] Error on "${(row.title||'').slice(0,40)}":`, e.message);
+          await new Promise(r => setTimeout(r, 400));
+        }
       }
+      console.log(`[Deals] Batch ${Math.floor(i/BATCH)+1} done — ${approved.length} approved so far`);
     }
 
     await redisSet('deals:global', { deals: approved, builtAt: new Date().toISOString() }, 6000);
