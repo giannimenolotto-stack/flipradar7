@@ -507,6 +507,31 @@ function scoreListingQuality(listing) {
   return { flags, quality, inPricePool };
 }
 
+// ── Gemini call with exponential backoff on 503/429 ─────────────────────────
+// Drop-in replacement for axios.post(...) on Gemini endpoints.
+// Retries up to 4 times with doubling delay (2s → 4s → 8s → 16s, capped 30s).
+async function geminiPost(url, body, opts = {}) {
+  const MAX_RETRIES = 4;
+  let delay = 2000;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await axios.post(url, body, {
+        timeout: 25000,
+        ...opts,
+      });
+    } catch (e) {
+      const status = e.response?.status;
+      if ((status === 503 || status === 429) && attempt < MAX_RETRIES) {
+        console.warn(`[Gemini] ${status} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        await new Promise(r => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 30000);
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 // ── Quick Gemini photo check — runs async at upsert time ────────────────────
 // Fires immediately when a new listing lands. Non-blocking — upsert doesn't
 // wait for it. Updates the DB row once the result comes back.
@@ -552,13 +577,13 @@ Look at the photo and return ONLY this JSON (no markdown):
 
 Be strict on matches_keyword — only false if the item in the photo is clearly a DIFFERENT type of product. Minor brand differences are fine.`;
 
-    const res = await axios.post(
+    const res = await geminiPost(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: [
         { inline_data: { mime_type: imgMime, data: imgBase64 } },
         { text: prompt }
       ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+      { timeout: 15000 }
     );
 
     const raw = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -1231,10 +1256,10 @@ async function aiExtractVehicleFields(title, keyword, description = '') {
 
     let text = '';
     if (GEMINI_API_KEY) {
-      const res = await axios.post(
+      const res = await geminiPost(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
+        { timeout: 10000 }
       );
       text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else {
@@ -2912,10 +2937,10 @@ Scoring guide:
               }});
             } catch (_) {}
           }
-          const res = await axios.post(
+          const res = await geminiPost(
             `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
             { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-            { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+            { timeout: 20000 }
           );
           text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         } else {
@@ -3040,13 +3065,13 @@ Return ONLY valid JSON (no markdown):
 
 Be strict on matches_keyword — only mark false if the item in the photo is clearly a DIFFERENT type of product than the keyword describes. Minor brand/model differences are fine.`;
 
-        const geminiRes = await axios.post(
+        const geminiRes = await geminiPost(
           `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
           { contents: [{ parts: [
             { inline_data: { mime_type: imgMime, data: imgBase64 } },
             { text: prompt }
           ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-          { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+          { timeout: 20000 }
         );
 
         const raw = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -3831,7 +3856,7 @@ async function rebuildGlobalDeals() {
         AND l.scraped_at > NOW() - INTERVAL '3 days'
         AND l.keyword = ANY($1)
       ORDER BY l.scraped_at DESC
-      LIMIT 1000
+      LIMIT 300
     `, [SEED_KEYWORDS]);
 
     if (!rows.length) {
@@ -3932,22 +3957,22 @@ rating: rainbow=exceptional steal $500+ margin, green=solid flip $150+ margin, p
           }
           parts.push({ text: textPrompt });
 
-          const gemResp = await axios.post(
+          const gemResp = await geminiPost(
             `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
             { contents: [{ parts }], generationConfig: { temperature: 0.1 } },
-            { headers: { 'Content-Type': 'application/json' }, timeout: 25000 }
+            { timeout: 25000 }
           );
           const text   = gemResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
           const match  = text.match(/\{[\s\S]*\}/);
-          if (!match) { await new Promise(r => setTimeout(r, 300)); continue; }
+          if (!match) { await new Promise(r => setTimeout(r, 800)); continue; }
 
           const rating = JSON.parse(match[0]);
           if (!rating.relevant || rating.rating === 'pass') {
-            await new Promise(r => setTimeout(r, 300));
+            await new Promise(r => setTimeout(r, 800));
             continue;
           }
           if (rating.rating !== 'green' && rating.rating !== 'rainbow') {
-            await new Promise(r => setTimeout(r, 300));
+            await new Promise(r => setTimeout(r, 800));
             continue;
           }
 
@@ -3981,10 +4006,10 @@ rating: rainbow=exceptional steal $500+ margin, green=solid flip $150+ margin, p
             geminiReason: rating.reason || null,
           });
           console.log(`[Deals] ✅ "${(row.title||'').slice(0,50)}" — ${rating.rating}: ${rating.reason}`);
-          await new Promise(r => setTimeout(r, 400));
+          await new Promise(r => setTimeout(r, 1000));
         } catch (e) {
           console.error(`[Deals] Error on "${(row.title||'').slice(0,40)}":`, e.message);
-          await new Promise(r => setTimeout(r, 400));
+          await new Promise(r => setTimeout(r, 1000));
         }
       }
       console.log(`[Deals] Batch ${Math.floor(i/BATCH)+1} done — ${approved.length} approved so far`);
@@ -4508,13 +4533,13 @@ Look at the photo and return ONLY this JSON (no markdown):
 
 Only mark matches_keyword false if it is clearly a DIFFERENT type of product.`;
 
-    const geminiRes = await axios.post(
+    const geminiRes = await geminiPost(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: [
         { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
         { text: prompt }
       ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+      { timeout: 15000 }
     );
 
     const raw = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -5230,17 +5255,17 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
         } catch (_) {}
       }
       parts.push({ text: prompt });
-      const geminiRes = await axios.post(
+      const geminiRes = await geminiPost(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+        { timeout: 30000 }
       );
       text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else if (GEMINI_API_KEY) {
-      const geminiRes = await axios.post(
+      const geminiRes = await geminiPost(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+        { timeout: 30000 }
       );
       text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else {
@@ -5334,8 +5359,7 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
-      headers: { 'Content-Type': 'application/json' },
+    const geminiRes = await geminiPost(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
       timeout: 30000,
     });
     const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -5455,10 +5479,10 @@ Return ONLY JSON (no markdown):
 
     if (imgData) identifyParts.unshift({ inline_data: imgData });
 
-    const identRes = await axios.post(
+    const identRes = await geminiPost(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: identifyParts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+      { timeout: 15000 }
     );
     const identText = identRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     const identMatch = identText.match(/\{[\s\S]*\}/);
@@ -5532,10 +5556,10 @@ CRITICAL PRICING RULES:
     const appraisalParts = [{ text: appraisalPrompt }];
     if (imgData) appraisalParts.unshift({ inline_data: imgData });
 
-    const appraisalRes = await axios.post(
+    const appraisalRes = await geminiPost(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: appraisalParts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+      { timeout: 30000 }
     );
 
     const text = appraisalRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -5672,10 +5696,10 @@ Max 8 words per reason. Be specific about year/km impact on value.`;
     let text = '';
 
     if (useGemini) {
-      const r = await axios.post(
+      const r = await geminiPost(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1 } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 25000 }
+        { timeout: 25000 }
       );
       text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else if (ANTHROPIC_API_KEY) {
@@ -5728,8 +5752,7 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
     }
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
-      headers: { 'Content-Type': 'application/json' },
+    const geminiRes = await geminiPost(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
       timeout: 30000,
     });
     const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -5854,9 +5877,9 @@ async function aiEstimateVehicle(target) {
   try {
     let text = '';
     if (GEMINI_API_KEY) {
-      const r = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      const r = await geminiPost(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         {contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},
-        {headers:{'Content-Type':'application/json'},timeout:10000});
+        {timeout:10000});
       text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';
     } else {
       const r = await axios.post('https://api.anthropic.com/v1/messages',
@@ -5954,7 +5977,7 @@ async function getKeywordPriceAnchor(keyword,sampleTitles=[]){
   const prompt=['You estimate the typical USED resale price in AUD on Australian Facebook Marketplace.',`Product keyword: "${keyword}"`,sampleTitles.length?`Example titles:\n- ${sampleTitles.slice(0,6).join('\n- ')}`:'','Give ONE rough typical price for the MAIN product in good used condition (NOT accessories/parts).','Return ONLY JSON: { "anchor_aud": number }'].filter(Boolean).join('\n');
   try{
     let text='';
-    if(GEMINI_API_KEY){const r=await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,{contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},{headers:{'Content-Type':'application/json'},timeout:10000});text=r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';}
+    if(GEMINI_API_KEY){const r=await geminiPost(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,{contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},{timeout:10000});text=r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';}
     else{const r=await axios.post('https://api.anthropic.com/v1/messages',{model:'claude-haiku-4-5-20251001',max_tokens:100,messages:[{role:'user',content:prompt}]},{headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},timeout:10000});text=r.data?.content?.[0]?.text||'';}
     const m=text.match(/\{[\s\S]*\}/);const anchor=m?Math.round(JSON.parse(m[0]).anchor_aud):null;
     if(anchor&&anchor>0){await redisSet(cacheKey,{anchor},30*24*3600);return anchor;}
