@@ -3863,24 +3863,50 @@ async function rebuildGlobalDeals() {
         return `${idx}. "${(r.title||'').slice(0,100)}"${specStr} listed ${priceStr}`;
       }).join(' | ');
 
-      const prompt = `You are an expert Australian Facebook Marketplace flipper rating listings for deal quality.
+      const prompt = `You are an experienced Australian marketplace flipper who buys and resells items for profit on Facebook Marketplace. You are ruthlessly selective — you only highlight items that a real flipper would actually want to buy today.
 
-RULES:
-- Rate based on USED second-hand AU Facebook Marketplace prices only — NOT RRP, NOT retail
-- VEHICLES: always price for the specific year and km shown — never use an all-year average
-- Only rate green or rainbow if there is REAL profit margin after all costs (buy price, selling fees ~8%, time)
-- High mileage (150k+) and old age (15+ years) significantly reduce value
-- rainbow = exceptional flip opportunity, clear undervalue, high demand, easy resell
-- green = solid deal, good margin, worth buying
-- yellow/red = fair or overpriced — do NOT include these in your response, just omit them
-- relevant:false = spam, wrong item, no realistic profit
+WHAT MAKES A GOOD FLIP:
+- High demand items that sell within 1-2 weeks (phones, tools, gaming, vehicles, bikes, camping gear)
+- Clear undervalue — listed well below what it would realistically resell for on AU Facebook Marketplace
+- Minimum $150 net profit after buying, cleaning up, relisting, and 8% selling fees
+- Good condition OR fixable for well under the resale upside
+- Items people search for constantly — not niche, not seasonal, not hard to move
 
-Listings:
+AUTOMATIC REJECT — mark relevant:false for ANY of these:
+- Hire or rental listings ("hire", "for hire", "per day", "per week")
+- Services, not physical items
+- Anything priced at market value or above — no flip margin
+- High mileage vehicles (200k+km) unless extremely cheap and fixable
+- Very old items (20+ years) unless genuinely collectible with real demand
+- Furniture that is bulky, old, or generic — almost never worth the effort
+- Baby/kids items unless exceptional condition and clear brand value
+- Vague titles with no specific product ("tools", "stuff", "items", "electronics")  
+- Make Offer listings with no price
+- Anything where you'd struggle to find a buyer within 2 weeks
+
+REALISTIC PROFIT ASSESSMENT:
+- Check if the listed price is genuinely below what this specific item (year, condition, km) sells for on AU Facebook Marketplace
+- Account for the flipper's time — if margin is under $150 net, not worth it
+- For vehicles: a 2005 model with 200,000km is NOT a deal just because newer models cost more
+- For phones: check the specific model and storage — an iPhone 13 128GB has a very different value to a 256GB Pro Max
+
+CATEGORIES THAT FLIP WELL IN AUSTRALIA:
+Phones (iPhone, Samsung flagships), power tools (Milwaukee, Dewalt, Makita), gaming consoles and gear, vehicles (genuine undervalue only), electric bikes and scooters, camping fridges (Engel, Waeco, Dometic), quality bikes (Trek, Specialized), MacBooks and laptops, DJ/music gear, photography equipment (Sony, Canon, Nikon), gym equipment (commercial grade only), quality audio (Sonos, Bose, JBL larger speakers)
+
+CATEGORIES TO BE VERY SELECTIVE ON:
+General furniture, baby gear, books, clothing, garden tools under $200, anything that needs significant repair without clear margin
+
+Listings (price, year, km in brackets):
 ${lines}
 
-Reply ONLY as JSON array with ONLY the green/rainbow deals (omit yellow/red entirely):
-[{"idx":0,"rating":"green","reason":"Good margin, fast seller","relevant":true}]
-Max 8 words per reason.`;
+Be STRICT. Most listings should be omitted. Only include genuine flip opportunities.
+Reply ONLY as JSON array with ONLY the green/rainbow deals — omit everything else:
+[{"idx":0,"rating":"green","reason":"Milwaukee M18 kit, $200 below market","relevant":true}]
+
+rating guide:
+- rainbow = exceptional — clear steal, sell same day, $500+ margin
+- green = solid flip — $150-500 margin, sells within a week
+Max 10 words per reason. Be specific about WHY it's a deal.`;
 
       try {
         const r = await axios.post(
