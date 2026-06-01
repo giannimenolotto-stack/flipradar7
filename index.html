@@ -1555,7 +1555,7 @@ function go() {
           header.style = 'margin-bottom:16px;border-radius:14px;overflow:hidden;border:1px solid var(--bd)';
           var inner = '';
           if (window._currentListingImage) {
-            inner += '<div style="width:100%;height:260px;position:relative;overflow:hidden"><img src="' + window._currentListingImage + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(16px) brightness(0.45);transform:scale(1.1)"><img src="' + window._currentListingImage + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain"></div>';
+            inner += '<div style="width:100%;height:260px;position:relative;overflow:hidden"><img src="' + imgSrc(window._currentListingImage) + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(16px) brightness(0.45);transform:scale(1.1)"><img src="' + imgSrc(window._currentListingImage) + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain"></div>';
           }
           if (window._currentListingUrl) {
             inner += '<a href="' + window._currentListingUrl + '" target="_blank" style="display:block;padding:12px;background:rgba(0,255,136,.12);border-top:1px solid rgba(0,255,136,.2);color:var(--g);text-align:center;font-weight:700;font-size:14px;text-decoration:none">&#x1F517; View on Facebook Marketplace</a>';
@@ -3744,7 +3744,7 @@ function appraiseListing(listing) {
       header.style = 'margin-bottom:16px;border-radius:14px;overflow:hidden;border:1px solid var(--bd)';
       var inner = '';
       if (window._currentListingImage) {
-        inner += '<div style="width:100%;height:260px;position:relative;overflow:hidden"><img src="' + window._currentListingImage + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(16px) brightness(0.45);transform:scale(1.1)"><img src="' + window._currentListingImage + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain"></div>';
+        inner += '<div style="width:100%;height:260px;position:relative;overflow:hidden"><img src="' + imgSrc(window._currentListingImage) + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(16px) brightness(0.45);transform:scale(1.1)"><img src="' + imgSrc(window._currentListingImage) + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain"></div>';
       }
       if (window._currentListingUrl) {
         inner += '<a href="' + window._currentListingUrl + '" target="_blank" style="display:block;padding:12px;background:rgba(0,255,136,.12);border-top:1px solid rgba(0,255,136,.2);color:var(--g);text-align:center;font-weight:700;font-size:14px;text-decoration:none">&#x1F517; View on Facebook Marketplace</a>';
