@@ -4804,8 +4804,8 @@ app.get('/deals', authMiddleware, async (req, res) => {
 
     res.json({ deals, builtAt: cached.builtAt });
   } catch (e) {
-    console.error('[Deals]', e.message);
-    res.status(500).json({ error: 'Server error' });
+    console.error('[Deals] Error:', e.message, e.stack?.split('\n')[1]);
+    res.status(500).json({ error: 'Server error', detail: e.message });
   }
 });
 
