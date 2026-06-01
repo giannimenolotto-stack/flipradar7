@@ -3829,7 +3829,7 @@ async function rebuildGlobalDeals() {
         AND l.price > 0
         AND l.price_quality NOT IN ('spam','swap','accessory')
         AND (l.is_bulk_lot IS NULL OR l.is_bulk_lot = FALSE)
-        AND l.img_matches_keyword IS NOT FALSE
+        AND (l.img_matches_keyword IS NULL OR l.img_matches_keyword = TRUE)
         AND l.scraped_at > NOW() - INTERVAL '3 days'
         AND l.keyword = ANY($1)
         AND l.title NOT ~* '(hire|for hire|per day|per week|hourly rate|daily rate|wanted|wtb|wtt)'
@@ -4075,12 +4075,12 @@ cron.schedule('0 */2 * * *', () => rebuildGlobalDeals().catch(e => console.error
 async function runFullBootSequence() {
   console.log('[Boot] Starting full boot sequence...');
   try {
-    // Step 1: Seed scan — runs in background, doesn't block
+    // Step 1: Seed scan — fills DB with fresh listings across all 332 keywords
+    // This runs in background and doesn't block the rest of the sequence
     console.log('[Boot] Step 1 — Starting seed scan in background...');
     runFullSeedScanOnce().catch(e => console.error('[Boot] Seed scan error:', e.message));
 
-    // Step 2: Rebuild deals immediately from existing data — no waiting
-    // Anchor refresh and full stats rebuild happen in the nightly 2am cron
+    // Step 2: Rebuild deals immediately from existing data
     console.log('[Boot] Step 2 — Rebuilding deals from existing listings...');
     await redisSet('deals:global', null);
     await rebuildGlobalDeals();
@@ -4768,8 +4768,8 @@ app.get('/deals', authMiddleware, async (req, res) => {
 
     res.json({ deals, builtAt: cached.builtAt });
   } catch (e) {
-    console.error('[Deals] Error:', e.message, e.stack?.split('\n')[1]);
-    res.status(500).json({ error: 'Server error', detail: e.message });
+    console.error('[Deals]', e.message);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
@@ -5594,13 +5594,12 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
       const kw = (l.keyword || keyword || '').toLowerCase().trim();
       let dbMedian = null, dbSamples = null, dbP25 = null, dbP75 = null;
 
-      // 1. Try keyword_price_stats directly — exact keyword match is more reliable
-      // than fuzzy title matching which can return wrong products
+      // 1. Exact keyword match against keyword_price_stats (most reliable)
       if (kw) {
-        const { rows: kwExact } = await pool.query(`
-          SELECT median_price, p25_price, p75_price, sample_count, is_broad
-          FROM keyword_price_stats WHERE keyword = $1
-        `, [kw]);
+        const { rows: kwExact } = await pool.query(
+          `SELECT median_price, p25_price, p75_price, sample_count, is_broad
+           FROM keyword_price_stats WHERE keyword = $1`, [kw]
+        );
         if (kwExact[0]?.median_price && !kwExact[0].is_broad) {
           dbMedian  = kwExact[0].median_price;
           dbP25     = kwExact[0].p25_price;
@@ -5609,15 +5608,15 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
         }
       }
 
-      // 2. Try product_price_stats as secondary (fuzzy match on extracted product names)
+      // 2. Fallback: product_price_stats fuzzy match (requires 8+ samples)
       if (!dbMedian && l.title) {
         const words = l.title.split(' ').filter(w => w.length > 2).slice(0, 3).join('%');
-        const { rows: prodRows } = await pool.query(`
-          SELECT median_price, p25_price, p75_price, sample_count
-          FROM product_price_stats
-          WHERE LOWER(display_name) LIKE LOWER($1)
-          ORDER BY sample_count DESC LIMIT 1
-        `, [`%${words}%`]);
+        const { rows: prodRows } = await pool.query(
+          `SELECT median_price, p25_price, p75_price, sample_count
+           FROM product_price_stats
+           WHERE LOWER(display_name) LIKE LOWER($1)
+           ORDER BY sample_count DESC LIMIT 1`, [`%${words}%`]
+        );
         if (prodRows[0]?.median_price && prodRows[0].sample_count >= 8) {
           dbMedian  = prodRows[0].median_price;
           dbP25     = prodRows[0].p25_price;
