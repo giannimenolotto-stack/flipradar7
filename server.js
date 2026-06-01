@@ -12,7 +12,8 @@ const { Pool } = require('pg');
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
+app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 
 // ── PostgreSQL (Neon) ─────────────────────────────────────
