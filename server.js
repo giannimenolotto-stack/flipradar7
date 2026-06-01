@@ -3817,9 +3817,10 @@ app.post('/scan/test', async (req, res) => {
 // filters to active + real-price, scores by discount depth, adds small jitter.
 
 async function rebuildGlobalDeals() {
-  console.log('[Deals] Rebuilding deals:global cache via DB flip_score pass...');
+  console.log('[Deals] Rebuilding deals:global cache via DB pass...');
   try {
-    // Uses pre-computed flip_score from nightly AI pass — no Gemini calls.
+    // Pull recent listings — prefer flip_score ranked first, unscored listings also included
+    // so the deals feed is never empty while nightly scoring catches up.
     const { rows } = await pool.query(`
       SELECT
         l.listing_id,
@@ -3846,26 +3847,27 @@ async function rebuildGlobalDeals() {
         l.flip_estimated_resale,
         l.flip_estimated_margin,
         l.flip_fix_cost,
-        l.flip_reasoning
+        l.flip_reasoning,
+        k.median_price  AS kw_median,
+        k.p25_price     AS kw_p25
       FROM listings l
+      LEFT JOIN keyword_price_stats k ON k.keyword = l.keyword
       WHERE l.is_active = TRUE
         AND l.is_offer_price = FALSE
         AND l.price > 0
         AND l.price_quality NOT IN ('spam','swap','accessory')
         AND l.scraped_at > NOW() - INTERVAL '3 days'
-        AND l.flip_score IS NOT NULL
-        AND l.flip_score >= 55
         AND l.keyword = ANY($1)
-      ORDER BY l.flip_score DESC, l.scraped_at DESC
-      LIMIT 300
+      ORDER BY l.flip_score DESC NULLS LAST, l.scraped_at DESC
+      LIMIT 500
     `, [SEED_KEYWORDS]);
 
     if (!rows.length) {
-      console.log('[Deals] No scored listings found — cache unchanged');
+      console.log('[Deals] No listings found — cache unchanged');
       return;
     }
 
-    console.log(`[Deals] Pulled ${rows.length} pre-scored candidates — applying deal filter...`);
+    console.log(`[Deals] Pulled ${rows.length} candidates — applying deal filter...`);
 
     const approved = [];
 
@@ -3874,13 +3876,23 @@ async function rebuildGlobalDeals() {
       if (/\b(hire|rental|for hire|per day|per week|hourly|service|installation|wanted|wtb|wtt)\b/.test(t)) continue;
       if (/^(tools?|stuff|items?|electronics?|misc|other|various|assorted|junk|lot)\s*$/.test(t)) continue;
 
-      const score  = row.flip_score || 0;
-      const margin = row.flip_estimated_margin || 0;
       const isBroken = /\b(broken|faulty|not working|dead|cracked|smashed|parts only|as is|for parts|damaged|needs work|spares|repair)\b/.test(t);
 
       let tint = null;
-      if (score >= 75 || margin >= 500) tint = 'rainbow';
-      else if (score >= 55 || margin >= 150) tint = 'green';
+      const score  = row.flip_score  || 0;
+      const margin = row.flip_estimated_margin || 0;
+
+      if (row.flip_score !== null) {
+        // Path A: nightly AI score is available — use it directly
+        if (score >= 75 || margin >= 500) tint = 'rainbow';
+        else if (score >= 55 || margin >= 150) tint = 'green';
+      } else if (row.kw_median && row.price) {
+        // Path B: no AI score yet — use discount depth vs keyword median
+        const pctOff = (row.kw_median - row.price) / row.kw_median;
+        if (pctOff >= 0.40) tint = 'rainbow';
+        else if (pctOff >= 0.20) tint = 'green';
+      }
+
       if (!tint) continue;
 
       approved.push({
@@ -3915,7 +3927,7 @@ async function rebuildGlobalDeals() {
     }
 
     await redisSet('deals:global', { deals: approved, builtAt: new Date().toISOString() }, 6000);
-    console.log(`[Deals] ✅ Rebuilt deals:global — ${approved.length} deals from ${rows.length} pre-scored candidates`);
+    console.log(`[Deals] ✅ Rebuilt deals:global — ${approved.length} deals from ${rows.length} candidates`);
   } catch (e) {
     console.error('[Deals] Rebuild failed:', e.message, '|', e.detail || '', '| position:', e.position || '');
   }
@@ -5592,22 +5604,22 @@ ${lines}
 Reply ONLY as JSON array: [{"idx":0,"rating":"yellow","reason":"Fair for 210k km 2005","relevant":true}]
 Max 8 words per reason. Be specific about year/km impact on value.`;
 
-    const useGemini = !!GEMINI_API_KEY;
+    const useAnthropic = !!ANTHROPIC_API_KEY;
     let text = '';
 
-    if (useGemini) {
+    if (useAnthropic) {
+      const r = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001', max_tokens: 1000,
+        messages: [{ role: 'user', content: prompt }],
+      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 20000 });
+      text = r.data?.content?.[0]?.text || '';
+    } else if (GEMINI_API_KEY) {
       const r = await geminiPost(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1 } },
         { timeout: 25000 }
       );
       text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    } else if (ANTHROPIC_API_KEY) {
-      const r = await axios.post('https://api.anthropic.com/v1/messages', {
-        model: 'claude-haiku-4-5-20251001', max_tokens: 1000,
-        messages: [{ role: 'user', content: prompt }],
-      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 20000 });
-      text = r.data?.content?.[0]?.text || '';
     }
 
     res.json({ text });
