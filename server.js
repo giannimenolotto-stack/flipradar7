@@ -3828,11 +3828,8 @@ async function rebuildGlobalDeals() {
         AND l.is_offer_price = FALSE
         AND l.price > 0
         AND l.price_quality NOT IN ('spam','swap','accessory')
-        AND (l.is_bulk_lot IS NULL OR l.is_bulk_lot = FALSE)
-        AND (l.img_matches_keyword IS NULL OR l.img_matches_keyword = TRUE)
         AND l.scraped_at > NOW() - INTERVAL '3 days'
         AND l.keyword = ANY($1)
-        AND l.title NOT ~* '(hire|for hire|per day|per week|hourly rate|daily rate|wanted|wtb|wtt)'
       ORDER BY l.scraped_at DESC
       LIMIT 1000
     `, [SEED_KEYWORDS]);
@@ -3996,7 +3993,7 @@ rating: rainbow=exceptional steal $500+ margin, green=solid flip $150+ margin, p
     await redisSet('deals:global', { deals: approved, builtAt: new Date().toISOString() }, 6000);
     console.log(`[Deals] ✅ Rebuilt deals:global — ${approved.length} Gemini-approved deals from ${rows.length} candidates`);
   } catch (e) {
-    console.error('[Deals] Rebuild failed:', e.message);
+    console.error('[Deals] Rebuild failed:', e.message, '|', e.detail || '', '| position:', e.position || '');
   }
 }
 
