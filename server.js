@@ -3827,14 +3827,14 @@ async function rebuildGlobalDeals() {
       WHERE l.is_active = TRUE
         AND l.is_offer_price = FALSE
         AND l.price > 0
-        AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+        AND l.price_quality NOT IN ('spam','swap','accessory')
         AND (l.is_bulk_lot IS NULL OR l.is_bulk_lot = FALSE)
         AND l.img_matches_keyword IS NOT FALSE
         AND l.scraped_at > NOW() - INTERVAL '3 days'
         AND l.keyword = ANY($1)
-        AND l.title NOT ~* '\\y(hire|rental|rent|for hire|hire only|per day|per week|hourly rate|daily rate)\\y'
+        AND l.title NOT ~* '(hire|for hire|per day|per week|hourly rate|daily rate|wanted|wtb|wtt)'
       ORDER BY l.scraped_at DESC
-      LIMIT 800
+      LIMIT 1000
     `, [SEED_KEYWORDS]);
 
     if (!rows.length) {
@@ -3853,7 +3853,25 @@ async function rebuildGlobalDeals() {
       const batch = rows.slice(i, i + BATCH);
       const keyword = batch[0]?.keyword || '';
 
-      const lines = batch.map((r, idx) => {
+      // Pre-filter — skip obvious non-flips before hitting Gemini
+      const filteredBatch = batch.filter(r => {
+        const t = (r.title || '').toLowerCase();
+        // Skip hire/rental
+        if (/\b(hire|rental|for hire|per day|per week|hourly)\b/.test(t)) return false;
+        // Skip services (not physical items)
+        if (/\b(service|installation|delivery only|pickup only|wanted|wtb|wtt)\b/.test(t)) return false;
+        // Skip completely vague titles
+        if (/^(tools?|stuff|items?|electronics?|misc|other|various|assorted|junk|lot)\s*$/.test(t)) return false;
+        // Skip make offer with no price
+        if (!r.price || r.price === 0) return false;
+        // Note: NO price floor — a $20 broken iPhone or $35 Dewalt battery
+        // could be worth $200 fixed. Gemini decides based on the title.
+        return true;
+      });
+      if (!filteredBatch.length) continue;
+
+      // Re-index after filter
+      const lines = filteredBatch.map((r, idx) => {
         const specParts = [
           r.year    ? r.year               : null,
           r.mileage ? `${Number(r.mileage).toLocaleString()}km` : null,
@@ -3864,56 +3882,63 @@ async function rebuildGlobalDeals() {
         return `${idx}. "${(r.title||'').slice(0,100)}"${specStr} listed ${priceStr}`;
       }).join(' | ');
 
-      const prompt = `You are an experienced Australian marketplace flipper who buys and resells items for profit on Facebook Marketplace. You are ruthlessly selective — you only highlight items that a real flipper would actually want to buy today.
+      const isBrokenBatch = batch.some(r => {
+        const t = (r.title||'').toLowerCase();
+        return /\b(broken|faulty|not working|dead|cracked|smashed|parts only|as is|for parts|damaged|needs work|spares|repair)\b/.test(t);
+      });
 
-WHAT MAKES A GOOD FLIP:
-- High demand items that sell within 1-2 weeks (phones, tools, gaming, vehicles, bikes, camping gear)
-- Clear undervalue — listed well below what it would realistically resell for on AU Facebook Marketplace
-- Minimum $150 net profit after buying, cleaning up, relisting, and 8% selling fees
-- Good condition OR fixable for well under the resale upside
-- Items people search for constantly — not niche, not seasonal, not hard to move
+      const brokenSection = isBrokenBatch ? `THIS BATCH CONTAINS BROKEN/FIXABLE ITEMS — apply special broken-item scoring:
+- A broken iPhone with cracked screen listed at $100 that sells for $400 working = great flip
+- A broken PS5 HDMI port listed at $150 that costs $30 to fix and sells for $450 = rainbow
+- DO include broken items if: repair is simple, parts are cheap, demand for working version is high
+- DO NOT include if: repair is complex/expensive, parts are rare, or working version is not worth much more
+` : '';
 
-AUTOMATIC REJECT — mark relevant:false for ANY of these:
-- Hire or rental listings ("hire", "for hire", "per day", "per week")
-- Services, not physical items
-- Anything priced at market value or above — no flip margin
-- High mileage vehicles (200k+km) unless extremely cheap and fixable
-- Very old items (20+ years) unless genuinely collectible with real demand
-- Furniture that is bulky, old, or generic — almost never worth the effort
-- Baby/kids items unless exceptional condition and clear brand value
-- Vague titles with no specific product ("tools", "stuff", "items", "electronics")  
-- Make Offer listings with no price
-- Anything where you'd struggle to find a buyer within 2 weeks
+      const prompt = `You are an experienced Australian marketplace flipper who specialises in buying cheap and reselling for profit. You are ruthlessly selective.
 
-REALISTIC PROFIT ASSESSMENT:
-- Check if the listed price is genuinely below what this specific item (year, condition, km) sells for on AU Facebook Marketplace
-- Account for the flipper's time — if margin is under $150 net, not worth it
-- For vehicles: a 2005 model with 200,000km is NOT a deal just because newer models cost more
-- For phones: check the specific model and storage — an iPhone 13 128GB has a very different value to a 256GB Pro Max
+${brokenSection}
+WHAT MAKES A GOOD FLIP (working items):
+- Clear undervalue vs what it realistically resells for on AU Facebook Marketplace
+- Minimum $150 net profit after all costs (buy, fix if needed, relist, 8% fees, time)
+- High demand — sells within 1-2 weeks
+- Specific branded items people search for: iPhones, Milwaukee/Dewalt/Makita tools, gaming consoles, MacBooks, camping fridges, quality bikes, cameras, audio gear
 
-CATEGORIES THAT FLIP WELL IN AUSTRALIA:
-Phones (iPhone, Samsung flagships), power tools (Milwaukee, Dewalt, Makita), gaming consoles and gear, vehicles (genuine undervalue only), electric bikes and scooters, camping fridges (Engel, Waeco, Dometic), quality bikes (Trek, Specialized), MacBooks and laptops, DJ/music gear, photography equipment (Sony, Canon, Nikon), gym equipment (commercial grade only), quality audio (Sonos, Bose, JBL larger speakers)
+WHAT MAKES A GOOD BROKEN FLIP:
+- Simple fixable issue (screen, battery, charging port, HDMI port, buttons)
+- Cheap repair parts (under $50 for parts)
+- Big resale upside when fixed (phones, consoles, laptops, power tools)
+- Price listed well below even broken/parts value
 
-CATEGORIES TO BE VERY SELECTIVE ON:
-General furniture, baby gear, books, clothing, garden tools under $200, anything that needs significant repair without clear margin
+AUTOMATIC REJECT:
+- Hire or rental listings
+- Services or non-physical items  
+- Items at or above market value (no margin)
+- Vague titles with no specific product
+- Old high-km vehicles unless genuinely exceptional price
+- Generic furniture, baby items without brand value
+- Anything that won't sell within 2 weeks
 
-Listings (price, year, km in brackets):
+NOTE ON PRICE: Do not reject based on low price alone. A $25 broken Dewalt battery, a $40 cracked iPhone, or a $60 faulty PS5 controller can all be excellent flips. Judge by the title and realistic fixed/working resale value.
+
+Listings (price, year, km in brackets where relevant):
 ${lines}
 
-Be STRICT. Most listings should be omitted. Only include genuine flip opportunities.
-Reply ONLY as JSON array with ONLY the green/rainbow deals — omit everything else:
-[{"idx":0,"rating":"green","reason":"Milwaukee M18 kit, $200 below market","relevant":true}]
+Be STRICT on working items. Be OPPORTUNISTIC on broken items with clear fix potential.
+Omit everything that isn't a genuine flip opportunity.
 
-rating guide:
-- rainbow = exceptional — clear steal, sell same day, $500+ margin
-- green = solid flip — $150-500 margin, sells within a week
-Max 10 words per reason. Be specific about WHY it's a deal.`;
+Reply ONLY as JSON array with ONLY deals worth buying:
+[{"idx":0,"rating":"green","reason":"Milwaukee M18 kit $200 below market","relevant":true}]
+
+Ratings:
+- rainbow = steal — resell same day, $500+ net margin OR broken item with massive upside
+- green = solid flip — $150+ net margin, high demand, sells fast
+Max 10 words per reason. Be specific: name the product and why it's undervalued.`;
 
       try {
         const r = await axios.post(
           `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-          { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-          { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+          { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1 } },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
         );
         const text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         const match = text.match(/\[[\s\S]*\]/);
@@ -3922,7 +3947,7 @@ Max 10 words per reason. Be specific about WHY it's a deal.`;
         ratings.forEach(rating => {
           if (!rating.relevant) return;
           if (rating.rating !== 'green' && rating.rating !== 'rainbow') return;
-          const row = batch[rating.idx];
+          const row = filteredBatch[rating.idx];
           if (!row) return;
           approved.push({
             id:           row.listing_id,
@@ -4087,9 +4112,9 @@ async function runFullBootSequence() {
     await scoreDealsWithAINightly();
 
     // Step 9: Final deals rebuild with all fresh data
-    // Always force-rebuild deals cache on boot so new logic takes effect immediately
-    console.log('[Boot] Step 9 — Final deals rebuild...');
-    await redisSet('deals:global', null); // clear stale cache first
+    // Always clear deals cache on boot — ensures new Gemini prompt takes effect immediately
+    // Remove this line once deal quality is satisfactory
+    await redisSet('deals:global', null);
     await rebuildGlobalDeals();
 
     console.log('[Boot] ✅ Full boot sequence complete — everything is live');
