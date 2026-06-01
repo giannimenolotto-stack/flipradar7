@@ -3789,165 +3789,154 @@ app.post('/scan/test', async (req, res) => {
 // filters to active + real-price, scores by discount depth, adds small jitter.
 
 async function rebuildGlobalDeals() {
-  console.log('[Deals] Rebuilding deals:global cache...');
+  console.log('[Deals] Rebuilding deals:global cache via Gemini quality pass...');
   try {
-    // Pull recent listings with a known keyword median so we can compute % off.
-    // Only real prices, active, not spam/damage, scraped within 14 days.
-    // ── Step 1: try to get deals using keyword_price_stats (IQR-cleaned medians) ──
-    // Falls back to a live per-keyword median if stats table isn't populated yet.
-    let rows;
-    const statsCheck = await pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats');
-    const hasStats = statsCheck.rows[0].cnt >= 5;
+    // Pull a broad sample of recent listings across all seed keywords.
+    // No discount math — Gemini decides what's a good deal.
+    const { rows } = await pool.query(`
+      SELECT
+        l.listing_id,
+        l.title,
+        l.price,
+        l.image_url,
+        l.url,
+        l.location,
+        l.state,
+        l.keyword,
+        l.category,
+        l.make,
+        l.model,
+        l.year,
+        l.kms         AS mileage,
+        l.transmission,
+        l.fuel_type   AS "fuelType",
+        l.listed_at   AS "listedAt",
+        l.img_condition,
+        l.img_matches_keyword,
+        l.flip_score,
+        l.flip_deal_type,
+        l.flip_demand,
+        l.flip_estimated_resale,
+        l.flip_estimated_margin,
+        l.flip_fix_cost,
+        l.flip_reasoning
+      FROM listings l
+      WHERE l.is_active = TRUE
+        AND l.is_offer_price = FALSE
+        AND l.price > 0
+        AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
+        AND (l.is_bulk_lot IS NULL OR l.is_bulk_lot = FALSE)
+        AND l.img_matches_keyword IS NOT FALSE
+        AND l.scraped_at > NOW() - INTERVAL '3 days'
+        AND l.keyword = ANY($1)
+      ORDER BY l.scraped_at DESC
+      LIMIT 800
+    `, [SEED_KEYWORDS]);
 
-    if (hasStats) {
-      // Normal path — join against pre-built stats table
-      ({ rows } = await pool.query(`
-        SELECT
-          l.listing_id,
-          l.title,
-          l.price,
-          l.image_url,
-          l.url,
-          l.location,
-          l.state,
-          l.keyword,
-          l.category,
-          l.make,
-          l.model,
-          l.year,
-          l.kms       AS mileage,
-          l.transmission,
-          l.fuel_type AS "fuelType",
-          l.listed_at AS "listedAt",
-          l.img_condition,
-          l.img_matches_keyword,
-          k.median_price AS median
-        FROM listings l
-        JOIN keyword_price_stats k ON k.keyword = l.keyword
-        WHERE l.is_active = TRUE
-          AND l.is_offer_price = FALSE
-          AND l.price > 0
-          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
-          AND l.scraped_at > NOW() - INTERVAL '30 days'
-          AND k.median_price > 0
-          AND k.sample_count >= 4
-          AND (k.is_broad IS NULL OR k.is_broad = FALSE)
-          AND (l.is_bulk_lot IS NULL OR l.is_bulk_lot = FALSE)
-          AND l.price < k.median_price * 0.92
-          AND (k.median_price - l.price) >= 100
-        ORDER BY (k.median_price - l.price)::float / k.median_price DESC
-        LIMIT 500
-      `));
-    } else {
-      // Fallback — compute live medians on the fly per keyword so deals work
-      // immediately after seed scan before nightly cron has run
-      console.log('[Deals] keyword_price_stats not ready — using live medians');
-      ({ rows } = await pool.query(`
-        WITH kmedians AS (
-          SELECT
-            keyword,
-            COUNT(*)::INT AS cnt,
-            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::INT AS median_price
-          FROM listings
-          WHERE price > 0
-            AND is_offer_price = FALSE
-            AND is_active = TRUE
-            AND scraped_at > NOW() - INTERVAL '30 days'
-            AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
-            AND (is_bulk_lot IS NULL OR is_bulk_lot = FALSE)
-          GROUP BY keyword
-          HAVING COUNT(*) >= 4
-        )
-        SELECT
-          l.listing_id,
-          l.title,
-          l.price,
-          l.image_url,
-          l.url,
-          l.location,
-          l.state,
-          l.keyword,
-          l.category,
-          l.make,
-          l.model,
-          l.year,
-          l.kms       AS mileage,
-          l.transmission,
-          l.fuel_type AS "fuelType",
-          l.listed_at AS "listedAt",
-          l.img_condition,
-          l.img_matches_keyword,
-          k.median_price AS median
-        FROM listings l
-        JOIN kmedians k ON k.keyword = l.keyword
-        WHERE l.is_active = TRUE
-          AND l.is_offer_price = FALSE
-          AND l.price > 0
-          AND l.price_quality NOT IN ('spam','damage','broken','swap','accessory')
-          AND l.scraped_at > NOW() - INTERVAL '30 days'
-          AND l.price < k.median_price * 0.92
-          AND (k.median_price - l.price) >= 100
-        ORDER BY (k.median_price - l.price)::float / k.median_price DESC
-        LIMIT 500
-      `));
+    if (!rows.length) {
+      console.log('[Deals] No recent listings found — cache unchanged');
+      return;
     }
 
-    // Compute pctOff and base score
-    const deals = rows.map(r => {
-      const pctOff   = Math.round(((r.median - r.price) / r.median) * 100);
-      // base deal score 0-100 — pure discount depth
-      const baseScore = Math.min(100, pctOff * 1.8);
-      return {
-        id:           r.listing_id,
-        title:        r.title,
-        price:        r.price,
-        median:       r.median,
-        pctOff,
-        image:        r.image_url || null,
-        url:          r.url || null,
-        location:     r.location || null,
-        state:        r.state || null,
-        keyword:      r.keyword || null,
-        category:     r.category || 'general',
-        make:         r.make || null,
-        model:        r.model || null,
-        year:         r.year || null,
-        mileage:      r.mileage || null,
-        transmission: r.transmission || null,
-        fuelType:     r.fuelType || null,
-        listedAt:     r.listedAt ? r.listedAt.toISOString() : null,
-        imgCondition:   r.img_condition || null,
-        imgVerified:    r.img_matches_keyword !== false,
-        flipScore:      r.flip_score || null,
-        dealType:       r.flip_deal_type || null,
-        demand:         r.flip_demand || null,
-        estResale:      r.flip_estimated_resale || null,
-        estMargin:      r.flip_estimated_margin || null,
-        fixCost:        r.flip_fix_cost || null,
-        reasoning:      r.flip_reasoning || null,
-        baseScore,
-        tint: (() => {
-          const saving = r.median - r.price;
-          const isDamaged = r.img_condition === 'damaged' || r.img_condition === 'poor';
-          const score = r.flip_score;
-          const raw = score != null
-            ? (score >= 85 ? 'rainbow' : score >= 65 ? 'green' : score >= 45 ? 'yellow' : 'grey')
-            : (saving >= 500 && pctOff >= 20 ? 'rainbow'
-             : saving >= 200 && pctOff >= 15 ? 'green'
-             : saving >= 100 ? 'yellow' : 'grey');
-          return isDamaged && raw === 'rainbow' ? 'green'
-               : isDamaged && raw === 'green'   ? 'yellow'
-               : raw;
-        })(),
-      };
-    });
+    console.log(`[Deals] Pulled ${rows.length} candidates — running Gemini quality pass...`);
 
-    await redisSet('deals:global', { deals, builtAt: new Date().toISOString() }, 6000); // 100 min TTL
-    console.log(`[Deals] Rebuilt deals:global — ${deals.length} deals`);
+    // Run Gemini batch rating — same as /ai/rate-batch
+    // Only keep green and rainbow rated listings
+    const BATCH = 15;
+    const approved = [];
+
+    for (let i = 0; i < rows.length; i += BATCH) {
+      const batch = rows.slice(i, i + BATCH);
+      const keyword = batch[0]?.keyword || '';
+
+      const lines = batch.map((r, idx) => {
+        const specParts = [
+          r.year    ? r.year               : null,
+          r.mileage ? `${Number(r.mileage).toLocaleString()}km` : null,
+          r.make    ? r.make               : null,
+        ].filter(Boolean);
+        const specStr = specParts.length ? ` (${specParts.join(', ')})` : '';
+        const priceStr = r.price ? `AUD $${r.price}` : 'price not listed';
+        return `${idx}. "${(r.title||'').slice(0,100)}"${specStr} listed ${priceStr}`;
+      }).join(' | ');
+
+      const prompt = `You are an expert Australian Facebook Marketplace flipper rating listings for deal quality.
+
+RULES:
+- Rate based on USED second-hand AU Facebook Marketplace prices only — NOT RRP, NOT retail
+- VEHICLES: always price for the specific year and km shown — never use an all-year average
+- Only rate green or rainbow if there is REAL profit margin after all costs (buy price, selling fees ~8%, time)
+- High mileage (150k+) and old age (15+ years) significantly reduce value
+- rainbow = exceptional flip opportunity, clear undervalue, high demand, easy resell
+- green = solid deal, good margin, worth buying
+- yellow/red = fair or overpriced — do NOT include these in your response, just omit them
+- relevant:false = spam, wrong item, no realistic profit
+
+Listings:
+${lines}
+
+Reply ONLY as JSON array with ONLY the green/rainbow deals (omit yellow/red entirely):
+[{"idx":0,"rating":"green","reason":"Good margin, fast seller","relevant":true}]
+Max 8 words per reason.`;
+
+      try {
+        const r = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+          { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+        );
+        const text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const match = text.match(/\[[\s\S]*\]/);
+        if (!match) continue;
+        const ratings = JSON.parse(match[0]);
+        ratings.forEach(rating => {
+          if (!rating.relevant) return;
+          if (rating.rating !== 'green' && rating.rating !== 'rainbow') return;
+          const row = batch[rating.idx];
+          if (!row) return;
+          approved.push({
+            id:           row.listing_id,
+            title:        row.title,
+            price:        row.price,
+            image:        row.image_url || null,
+            url:          row.url || null,
+            location:     row.location || null,
+            state:        row.state || null,
+            keyword:      row.keyword || null,
+            category:     row.category || 'general',
+            make:         row.make || null,
+            model:        row.model || null,
+            year:         row.year || null,
+            mileage:      row.mileage || null,
+            transmission: row.transmission || null,
+            fuelType:     row.fuelType || null,
+            listedAt:     row.listedAt ? row.listedAt.toISOString() : null,
+            imgCondition: row.img_condition || null,
+            flipScore:    row.flip_score || null,
+            dealType:     row.flip_deal_type || null,
+            demand:       row.flip_demand || null,
+            estResale:    row.flip_estimated_resale || null,
+            estMargin:    row.flip_estimated_margin || null,
+            fixCost:      row.flip_fix_cost || null,
+            reasoning:    row.flip_reasoning || null,
+            tint:         rating.rating,   // 'green' or 'rainbow' from Gemini
+            geminiReason: rating.reason || null,
+          });
+        });
+        console.log(`[Deals] Batch ${Math.floor(i/BATCH)+1}: ${ratings.filter(r=>r.rating==='green'||r.rating==='rainbow').length}/${batch.length} approved`);
+        await new Promise(res => setTimeout(res, 500));
+      } catch (e) {
+        console.error(`[Deals] Batch ${Math.floor(i/BATCH)+1} error:`, e.message);
+      }
+    }
+
+    await redisSet('deals:global', { deals: approved, builtAt: new Date().toISOString() }, 6000);
+    console.log(`[Deals] ✅ Rebuilt deals:global — ${approved.length} Gemini-approved deals from ${rows.length} candidates`);
   } catch (e) {
     console.error('[Deals] Rebuild failed:', e.message);
   }
 }
+
 
 // Boot sequence is handled by runFullBootSequence() — see below
 async function quickStatsAndDealsRebuild() {
