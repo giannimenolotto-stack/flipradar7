@@ -3242,7 +3242,7 @@ async function rebuildProductPriceStats() {
           AND is_active = TRUE
           AND scraped_at > NOW() - INTERVAL '90 days'
         GROUP BY product_key, display_name, brand, category, variant
-        HAVING COUNT(*) >= 3
+        HAVING COUNT(*) >= 8
       ),
       fenced AS (
         SELECT
@@ -3263,7 +3263,7 @@ async function rebuildProductPriceStats() {
           AND l.is_active = TRUE
           AND l.scraped_at > NOW() - INTERVAL '90 days'
         GROUP BY b.product_key, b.display_name, b.brand, b.category, b.variant, b.raw_count
-        HAVING COUNT(l.id) >= 3
+        HAVING COUNT(l.id) >= 8
       )
       SELECT product_key, display_name, brand, category, variant,
              clean_count, raw_count, median, p25_clean, p75_clean, low, high, NOW()
@@ -3830,7 +3830,7 @@ async function rebuildGlobalDeals() {
         AND l.price_quality NOT IN ('spam','swap','accessory')
         AND (l.is_bulk_lot IS NULL OR l.is_bulk_lot = FALSE)
         AND l.img_matches_keyword IS NOT FALSE
-        AND l.scraped_at > NOW() - INTERVAL '3 days'
+        AND l.scraped_at > NOW() - INTERVAL '24 hours'
         AND l.keyword = ANY($1)
         AND l.title NOT ~* '(hire|for hire|per day|per week|hourly rate|daily rate|wanted|wtb|wtt)'
       ORDER BY l.scraped_at DESC
@@ -5630,35 +5630,35 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
       const kw = (l.keyword || keyword || '').toLowerCase().trim();
       let dbMedian = null, dbSamples = null, dbP25 = null, dbP75 = null;
 
-      // 1. Try product_price_stats first (most specific)
-      if (l.title) {
-        const words = l.title.split(' ').slice(0, 4).join('%');
+      // 1. Try keyword_price_stats directly — exact keyword match is more reliable
+      // than fuzzy title matching which can return wrong products
+      if (kw) {
+        const { rows: kwExact } = await pool.query(`
+          SELECT median_price, p25_price, p75_price, sample_count, is_broad
+          FROM keyword_price_stats WHERE keyword = $1
+        `, [kw]);
+        if (kwExact[0]?.median_price && !kwExact[0].is_broad) {
+          dbMedian  = kwExact[0].median_price;
+          dbP25     = kwExact[0].p25_price;
+          dbP75     = kwExact[0].p75_price;
+          dbSamples = kwExact[0].sample_count;
+        }
+      }
+
+      // 2. Try product_price_stats as secondary (fuzzy match on extracted product names)
+      if (!dbMedian && l.title) {
+        const words = l.title.split(' ').filter(w => w.length > 2).slice(0, 3).join('%');
         const { rows: prodRows } = await pool.query(`
           SELECT median_price, p25_price, p75_price, sample_count
           FROM product_price_stats
           WHERE LOWER(display_name) LIKE LOWER($1)
           ORDER BY sample_count DESC LIMIT 1
         `, [`%${words}%`]);
-        if (prodRows[0]?.median_price) {
+        if (prodRows[0]?.median_price && prodRows[0].sample_count >= 8) {
           dbMedian  = prodRows[0].median_price;
           dbP25     = prodRows[0].p25_price;
           dbP75     = prodRows[0].p75_price;
           dbSamples = prodRows[0].sample_count;
-        }
-      }
-
-      // 2. Fall back to keyword_price_stats (skip broad keywords)
-      if (!dbMedian && kw) {
-        const { rows: kwRows } = await pool.query(`
-          SELECT median_price, p25_price, p75_price, sample_count, is_broad
-          FROM keyword_price_stats WHERE keyword = $1
-        `, [kw]);
-        const kws = kwRows[0];
-        if (kws?.median_price && !kws.is_broad) {
-          dbMedian  = kws.median_price;
-          dbP25     = kws.p25_price;
-          dbP75     = kws.p75_price;
-          dbSamples = kws.sample_count;
         }
       }
 
@@ -5714,8 +5714,8 @@ Max 8 words per reason. Be specific about year/km impact on value.`;
     if (useGemini) {
       const r = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1 } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 25000 }
       );
       text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else if (ANTHROPIC_API_KEY) {
