@@ -777,22 +777,11 @@ body{font-family:'DM Sans',sans-serif;color:var(--tx);display:flex;flex-directio
 
 </div>
 
-<div class="scr" id="scrDeals">
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-    <div>
-      <div style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:2px;color:#fff">Deals</div>
-      <div id="dealsBuiltAt" style="font-size:11px;color:var(--mu);margin-top:2px"></div>
-    </div>
-    <button onclick="loadDeals(true)" style="padding:6px 12px;background:rgba(255,255,255,.07);border:1px solid var(--bd);border-radius:10px;color:#fff;font-size:12px;cursor:pointer">🔄 Refresh</button>
-  </div>
-  <div id="dealsFeed" style="min-height:200px"></div>
-</div>
 
 <div class="bn">
   <button class="nb" id="nScan" onclick="tab('scan')"><span class="ni">⚡</span><span class="nl2">Scan</span></button>
   <button class="nb" id="nWatch" onclick="tab('watch')"><span class="ni">👁️</span><span class="nl2">Watch</span></button>
   <button class="nb on" id="nFeed" onclick="tab('feed')"><span class="ni">📡</span><span class="nl2">Feed</span></button>
-  <button class="nb" id="nDeals" onclick="tab('deals')"><span class="ni">💎</span><span class="nl2">Deals</span></button>
   <button class="nb" id="nHistory" onclick="tab('history')"><span class="ni">📋</span><span class="nl2">History</span></button>
   <button class="nb" id="nSell" onclick="tab('sell')"><span class="ni">💸</span><span class="nl2">Sell</span></button>
 </div>
@@ -1472,7 +1461,7 @@ function compressImageForAI(file) {
 
 // ── Navigation ───────────────────────────────────────────
 function tab(t) {
-  var tabs = ['scan','watch','feed','deals','history','sell','settings'];
+  var tabs = ['scan','watch','feed','history','sell','settings'];
   for (var i = 0; i < tabs.length; i++) {
     var x = tabs[i];
     var nav = document.getElementById('n' + x.charAt(0).toUpperCase() + x.slice(1));
@@ -1491,7 +1480,6 @@ function tab(t) {
   if (t === 'feed') { renderWatchlistTabs(); refreshListings(); }
   if (t === 'watch') { hideNewWatch(); loadWatchlist(); }
   if (t === 'settings') { loadSettingsInfo(); }
-  if (t === 'deals') { loadDeals(); }
 }
 
 function toast(m, d) {
