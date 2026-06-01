@@ -777,10 +777,22 @@ body{font-family:'DM Sans',sans-serif;color:var(--tx);display:flex;flex-directio
 
 </div>
 
+<div class="scr" id="scrDeals">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+    <div>
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:2px;color:#fff">Deals</div>
+      <div id="dealsBuiltAt" style="font-size:11px;color:var(--mu);margin-top:2px"></div>
+    </div>
+    <button onclick="loadDeals(true)" style="padding:6px 12px;background:rgba(255,255,255,.07);border:1px solid var(--bd);border-radius:10px;color:#fff;font-size:12px;cursor:pointer">🔄 Refresh</button>
+  </div>
+  <div id="dealsFeed" style="min-height:200px"></div>
+</div>
+
 <div class="bn">
   <button class="nb" id="nScan" onclick="tab('scan')"><span class="ni">⚡</span><span class="nl2">Scan</span></button>
   <button class="nb" id="nWatch" onclick="tab('watch')"><span class="ni">👁️</span><span class="nl2">Watch</span></button>
   <button class="nb on" id="nFeed" onclick="tab('feed')"><span class="ni">📡</span><span class="nl2">Feed</span></button>
+  <button class="nb" id="nDeals" onclick="tab('deals')"><span class="ni">💎</span><span class="nl2">Deals</span></button>
   <button class="nb" id="nHistory" onclick="tab('history')"><span class="ni">📋</span><span class="nl2">History</span></button>
   <button class="nb" id="nSell" onclick="tab('sell')"><span class="ni">💸</span><span class="nl2">Sell</span></button>
 </div>
@@ -1460,7 +1472,7 @@ function compressImageForAI(file) {
 
 // ── Navigation ───────────────────────────────────────────
 function tab(t) {
-  var tabs = ['scan','watch','feed','history','sell','settings'];
+  var tabs = ['scan','watch','feed','deals','history','sell','settings'];
   for (var i = 0; i < tabs.length; i++) {
     var x = tabs[i];
     var nav = document.getElementById('n' + x.charAt(0).toUpperCase() + x.slice(1));
@@ -1479,6 +1491,7 @@ function tab(t) {
   if (t === 'feed') { renderWatchlistTabs(); refreshListings(); }
   if (t === 'watch') { hideNewWatch(); loadWatchlist(); }
   if (t === 'settings') { loadSettingsInfo(); }
+  if (t === 'deals') { loadDeals(); }
 }
 
 function toast(m, d) {
@@ -3313,6 +3326,66 @@ function refreshListings() {
 
 function saveLastFetchTime(iso) { try { localStorage.setItem('fr_last_fetch', iso); } catch(e) {} }
 function getLastFetchTime() { try { return localStorage.getItem('fr_last_fetch') || ''; } catch(e) { return ''; } }
+
+var _dealsLoaded = false;
+function loadDeals(force) {
+  var el = document.getElementById('dealsFeed');
+  if (!el) return;
+  if (!force && _dealsLoaded) return;
+  el.innerHTML = '<div style="text-align:center;padding:60px 20px;color:var(--mu)"><div style="font-size:36px;margin-bottom:12px">⏳</div><div>Loading deals...</div></div>';
+  var url = getBackendUrl();
+  if (!url) { el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--mu)">No backend configured.</div>'; return; }
+  fetch(url + '/deals', { headers: authHeaders() })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error === 'premium_required') {
+        el.innerHTML = '<div style="text-align:center;padding:60px 20px;color:var(--mu)"><div style="font-size:48px;margin-bottom:12px">💎</div><div style="font-size:16px;font-weight:700;color:#fff;margin-bottom:8px">Premium Feature</div><div style="font-size:13px">Upgrade to Premium to unlock the Deals feed — AI-curated steals across all categories.</div></div>';
+        return;
+      }
+      var deals = data.deals || [];
+      var builtEl = document.getElementById('dealsBuiltAt');
+      if (builtEl && data.builtAt) builtEl.textContent = 'Updated ' + formatAgo(data.builtAt);
+      if (!deals.length) {
+        el.innerHTML = '<div style="text-align:center;padding:60px 20px;color:var(--mu)"><div style="font-size:48px;margin-bottom:12px">🔍</div><div>No deals found yet — check back soon.</div><div style="font-size:12px;margin-top:8px;color:var(--mu)">Deals are rebuilt every 2 hours from fresh listings.</div></div>';
+        return;
+      }
+      _dealsLoaded = true;
+      var html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">';
+      deals.forEach(function(d) {
+        var isRainbow = d.tint === 'rainbow';
+        var borderColor = isRainbow ? '#ff0000' : '#00ff88';
+        var topBar = borderColor;
+        var badgeHtml = isRainbow
+          ? '<div style="font-size:9px;font-weight:700;letter-spacing:.5px;margin-bottom:3px;background:linear-gradient(90deg,#ff0000,#ff8800,#ffff00,#00ff88,#0088ff,#8800ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text">&#x1F308; ' + (d.geminiReason || 'INCREDIBLE DEAL') + '</div>'
+          : '<div style="font-size:9px;color:#00ff88;font-weight:700;letter-spacing:.5px;margin-bottom:3px">&#x1F7E2; ' + (d.geminiReason || 'SOLID DEAL') + '</div>';
+        var imgHtml = d.image
+          ? '<div style="width:100%;height:160px;position:relative;overflow:hidden;flex-shrink:0">' +
+              '<img src="' + imgSrc(d.image) + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(12px) brightness(0.5);transform:scale(1.1)">' +
+              '<img src="' + imgSrc(d.image) + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain">' +
+            '</div>'
+          : '<div style="width:100%;height:160px;background:var(--s2);display:flex;align-items:center;justify-content:center;font-size:28px;flex-shrink:0">&#x1F3F7;</div>';
+        var priceStr = d.price ? '$' + d.price.toLocaleString() : '—';
+        var marginBadge = d.estMargin ? '<span style="font-size:9px;background:rgba(0,255,136,.15);border:1px solid rgba(0,255,136,.3);border-radius:5px;padding:1px 5px;color:#00ff88">+$' + d.estMargin + ' est.</span>' : '';
+        var timeAgo = d.listedAt ? formatAgo(d.listedAt) : '';
+        var kwTag = d.keyword ? '<span style="font-size:9px;color:var(--mu)">' + d.keyword + '</span>' : '';
+        html += '<div class="' + (isRainbow ? 'rainbow-card' : '') + '" style="position:relative;background:var(--s1);border:3px solid ' + borderColor + ';border-radius:12px;overflow:hidden;display:flex;flex-direction:column;transition:border-color 0.4s" onclick="if(\''+d.url+'\')window.open(\''+d.url+'\',\'_blank\')">';
+        html += '<div style="height:3px;background:' + topBar + ';flex-shrink:0"></div>';
+        html += imgHtml;
+        html += '<div style="padding:8px;flex:1;display:flex;flex-direction:column">';
+        html += badgeHtml;
+        html += '<div style="font-size:12px;font-weight:600;color:#fff;line-height:1.3;margin-bottom:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">' + (d.title || '') + '</div>';
+        html += '<div style="font-family:Bebas Neue,sans-serif;font-size:20px;color:var(--g);line-height:1;margin-bottom:3px">' + priceStr + '</div>';
+        html += '<div style="font-size:10px;color:var(--mu);margin-bottom:4px">' + timeAgo + (d.location ? ' · ' + d.location : '') + '</div>';
+        if (marginBadge || kwTag) html += '<div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">' + marginBadge + kwTag + '</div>';
+        html += '</div></div>';
+      });
+      html += '</div>';
+      el.innerHTML = html;
+    })
+    .catch(function() {
+      el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--mu)"><div style="font-size:36px;margin-bottom:12px">❌</div><div>Could not load deals.</div></div>';
+    });
+}
 
 // Cache listings in localStorage
 function saveCachedListings(items) {
