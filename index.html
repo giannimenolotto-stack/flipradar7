@@ -1893,7 +1893,7 @@ function renderHist() {
     } else {
       l.innerHTML = savedItems.map(function(sl) {
         var priceStr = sl.isOfferPrice ? 'Make Offer' : (sl.price ? '$' + sl.price.toLocaleString() : 'Price unknown');
-        var imgHtml = sl.image ? '<img src="' + sl.image + '" style="width:44px;height:44px;object-fit:cover;border-radius:8px;flex-shrink:0;border:1px solid var(--bd)">' : '<div style="width:44px;height:44px;border-radius:8px;background:var(--s2);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">🏷️</div>';
+        var imgHtml = sl.image ? '<img src="' + imgSrc(sl.image) + '" style="width:44px;height:44px;object-fit:cover;border-radius:8px;flex-shrink:0;border:1px solid var(--bd)">' : '<div style="width:44px;height:44px;border-radius:8px;background:var(--s2);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">🏷️</div>';
         return '<div class="hi" style="gap:10px;align-items:center">' +
           imgHtml +
           '<div style="flex:1;min-width:0">' +
@@ -1954,7 +1954,7 @@ function renderHist() {
       flipBadge = '<span style="font-size:10px;background:rgba(255,200,0,.15);border:1px solid rgba(255,200,0,.3);border-radius:6px;padding:2px 6px;color:#ffc800;margin-left:6px">BOUGHT</span>';
     }
     var imgHtml = e.image
-      ? '<img src="' + e.image + '" style="width:44px;height:44px;object-fit:cover;border-radius:8px;flex-shrink:0;border:1px solid var(--bd)">'
+      ? '<img src="' + imgSrc(e.image) + '" style="width:44px;height:44px;object-fit:cover;border-radius:8px;flex-shrink:0;border:1px solid var(--bd)">'
       : '<div class="hie">' + v.e + '</div>';
     return '<div class="hi" style="flex-direction:column;gap:8px"><div style="display:flex;align-items:center;gap:8px;width:100%" onclick="openMod(' + e.id + ')">' + imgHtml + '<div class="hib"><div class="hit">' + e.title + flipBadge + '</div><div class="him">$' + e.price + ' asking · ' + e.date + '</div></div><div class="hir"><div class="hiv" style="color:' + v.c + '">' + (e.result && e.result.verdict || '—') + '</div></div><span style="color:var(--mu);font-size:18px;margin-left:4px">›</span></div>' +
       '<button onclick="event.stopPropagation();openTrackPanel(' + e.id + ')" style="width:100%;padding:8px;background:rgba(0,255,136,.1);border:1px solid rgba(0,255,136,.25);border-radius:8px;color:var(--g);font-size:12px;font-weight:600;cursor:pointer">' + (flip.soldPrice ? '✅ View Flip' : flip.paidPrice ? '📈 Track Sale' : '💰 Track Flip') + '</button></div>';
@@ -1982,7 +1982,7 @@ function renderHistoryImages(e) {
   if (!imgs.length) return '';
   return '<div style="display:grid;grid-template-columns:repeat(' + Math.min(imgs.length, 3) + ',1fr);gap:6px;margin-bottom:14px">' +
     imgs.map(function(src) {
-      return '<img src="' + src + '" style="width:100%;height:120px;object-fit:cover;border-radius:10px;border:1px solid var(--bd);background:var(--s2)">';
+      return '<img src="' + imgSrc(src) + '" style="width:100%;height:120px;object-fit:cover;border-radius:10px;border:1px solid var(--bd);background:var(--s2)">';
     }).join('') +
   '</div>';
 }
@@ -2288,6 +2288,10 @@ function onAuthReady() {
 
 function getBackendUrl() {
   return 'https://api.flip-radar.app';
+}
+function imgSrc(url) {
+  if (!url || !url.includes('fbcdn')) return url;
+  return 'https://api.flip-radar.app/img?url=' + encodeURIComponent(url);
 }
 function showWErr(m) {
   var e = document.getElementById('wer');
@@ -3569,8 +3573,8 @@ function renderListingsFeed(items, ratingMap) {
     }
     var imgHtml = l.image
       ? '<div style="width:100%;height:180px;position:relative;overflow:hidden;flex-shrink:0">' +
-          '<img src="' + l.image + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(12px) brightness(0.5);transform:scale(1.1)">' +
-          '<img src="' + l.image + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain">' +
+          '<img src="' + imgSrc(l.image) + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(12px) brightness(0.5);transform:scale(1.1)">' +
+          '<img src="' + imgSrc(l.image) + '" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain">' +
         '</div>'
       : '<div style="width:100%;height:180px;background:var(--s2);display:flex;align-items:center;justify-content:center;font-size:32px;flex-shrink:0">&#x1F3F7;</div>';
 
@@ -3869,7 +3873,7 @@ function showBlockedListings() {
         '<div style="font-size:12px;color:#666;margin-bottom:12px">These were filtered out. Tap Restore to add back to your feed.</div>' +
         blocked.map(function(l) {
           return '<div class="blocked-item" style="background:#0d0d1a;border:1px solid #1a1a2e;border-radius:12px;padding:12px;margin-bottom:8px;display:flex;gap:10px;align-items:center">' +
-            (l.image ? '<img src="' + l.image + '" style="width:50px;height:50px;object-fit:cover;border-radius:8px;flex-shrink:0">' : '<div style="width:50px;height:50px;background:#1a1a2e;border-radius:8px;flex-shrink:0"></div>') +
+            (l.image ? '<img src="' + imgSrc(l.image) + '" style="width:50px;height:50px;object-fit:cover;border-radius:8px;flex-shrink:0">' : '<div style="width:50px;height:50px;background:#1a1a2e;border-radius:8px;flex-shrink:0"></div>') +
             '<div style="flex:1;min-width:0">' +
             '<div style="color:#fff;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + (l.title || '—') + '</div>' +
             '<div style="color:#00ff88;font-size:12px">' + (l.price ? '$' + l.price : 'No price') + '</div>' +

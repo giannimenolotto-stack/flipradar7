@@ -3819,6 +3819,24 @@ app.get('/proxy-image', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Streaming image proxy — used by <img src="/img?url=..."> to bypass FB CDN Referer lock
+app.get('/img', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).end();
+  try {
+    const response = await axios.get(url, {
+      responseType: 'arraybuffer', timeout: 10000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
+        'Referer': 'https://www.facebook.com/'
+      }
+    });
+    res.set('Content-Type', response.headers['content-type'] || 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(response.data));
+  } catch (e) { res.status(502).end(); }
+});
+
 app.post('/scan/now', authMiddleware, async (req, res) => {
   res.json({ ok: true, message: 'Scan started' });
   const watches = watchlist.filter(w => w.userId === req.userId && !w.paused);
