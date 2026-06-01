@@ -3863,7 +3863,7 @@ async function rebuildGlobalDeals() {
         AND l.img_matches_keyword IS NOT FALSE
         AND l.scraped_at > NOW() - INTERVAL '3 days'
         AND l.keyword = ANY($1)
-        AND l.title NOT ~* '(hire|for hire|per day|per week|hourly rate|daily rate|wanted|wtb|wtt)'
+        AND l.title !~* '(hire|for hire|per day|per week|hourly rate|daily rate|wanted|wtb|wtt)'
       ORDER BY l.scraped_at DESC
       LIMIT 1000
     `, [SEED_KEYWORDS]);
@@ -4131,7 +4131,7 @@ async function runFullBootSequence() {
       WHERE price_quality = 'unscored'
         AND price > 0
         AND is_offer_price = FALSE
-        AND title NOT ~* '(wanted|wtb|wtt|swap|trade|parts only|wrecking|for parts|not working|broken|faulty|damaged|cracked|smashed|as is|spares|hire|rental|for hire|per day|per week)'
+        AND title !~* '(wanted|wtb|wtt|swap|trade|parts only|wrecking|for parts|not working|broken|faulty|damaged|cracked|smashed|as is|spares|hire|rental|for hire|per day|per week)'
     `);
     console.log('[Boot] Quality pass done');
 
