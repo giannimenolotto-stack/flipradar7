@@ -3817,10 +3817,9 @@ app.post('/scan/test', async (req, res) => {
 // filters to active + real-price, scores by discount depth, adds small jitter.
 
 async function rebuildGlobalDeals() {
-  console.log('[Deals] Rebuilding deals:global cache via Gemini quality pass...');
+  console.log('[Deals] Rebuilding deals:global cache via DB flip_score pass...');
   try {
-    // Pull a broad sample of recent listings across all seed keywords.
-    // No discount math — Gemini decides what's a good deal.
+    // Uses pre-computed flip_score from nightly AI pass — no Gemini calls.
     const { rows } = await pool.query(`
       SELECT
         l.listing_id,
@@ -3854,173 +3853,74 @@ async function rebuildGlobalDeals() {
         AND l.price > 0
         AND l.price_quality NOT IN ('spam','swap','accessory')
         AND l.scraped_at > NOW() - INTERVAL '3 days'
+        AND l.flip_score IS NOT NULL
+        AND l.flip_score >= 55
         AND l.keyword = ANY($1)
-      ORDER BY l.scraped_at DESC
+      ORDER BY l.flip_score DESC, l.scraped_at DESC
       LIMIT 300
     `, [SEED_KEYWORDS]);
 
     if (!rows.length) {
-      console.log('[Deals] No recent listings found — cache unchanged');
+      console.log('[Deals] No scored listings found — cache unchanged');
       return;
     }
 
-    console.log(`[Deals] Pulled ${rows.length} candidates — running Gemini quality pass...`);
+    console.log(`[Deals] Pulled ${rows.length} pre-scored candidates — applying deal filter...`);
 
-    // Run Gemini batch rating — same as /ai/rate-batch
-    // Only keep green and rainbow rated listings
-    const BATCH = 15;
     const approved = [];
 
-    for (let i = 0; i < rows.length; i += BATCH) {
-      const batch = rows.slice(i, i + BATCH);
-      const keyword = batch[0]?.keyword || '';
+    for (const row of rows) {
+      const t = (row.title || '').toLowerCase();
+      if (/\b(hire|rental|for hire|per day|per week|hourly|service|installation|wanted|wtb|wtt)\b/.test(t)) continue;
+      if (/^(tools?|stuff|items?|electronics?|misc|other|various|assorted|junk|lot)\s*$/.test(t)) continue;
 
-      // Pre-filter — skip obvious non-flips before hitting Gemini
-      const filteredBatch = batch.filter(r => {
-        const t = (r.title || '').toLowerCase();
-        // Skip hire/rental
-        if (/\b(hire|rental|for hire|per day|per week|hourly)\b/.test(t)) return false;
-        // Skip services (not physical items)
-        if (/\b(service|installation|delivery only|pickup only|wanted|wtb|wtt)\b/.test(t)) return false;
-        // Skip completely vague titles
-        if (/^(tools?|stuff|items?|electronics?|misc|other|various|assorted|junk|lot)\s*$/.test(t)) return false;
-        // Skip make offer with no price
-        if (!r.price || r.price === 0) return false;
-        // Note: NO price floor — a $20 broken iPhone or $35 Dewalt battery
-        // could be worth $200 fixed. Gemini decides based on the title.
-        return true;
+      const score  = row.flip_score || 0;
+      const margin = row.flip_estimated_margin || 0;
+      const isBroken = /\b(broken|faulty|not working|dead|cracked|smashed|parts only|as is|for parts|damaged|needs work|spares|repair)\b/.test(t);
+
+      let tint = null;
+      if (score >= 75 || margin >= 500) tint = 'rainbow';
+      else if (score >= 55 || margin >= 150) tint = 'green';
+      if (!tint) continue;
+
+      approved.push({
+        id:           row.listing_id,
+        title:        row.title,
+        price:        row.price,
+        image:        row.image_url || null,
+        url:          row.url || null,
+        location:     row.location || null,
+        state:        row.state || null,
+        keyword:      row.keyword || null,
+        category:     row.category || 'general',
+        make:         row.make || null,
+        model:        row.model || null,
+        year:         row.year || null,
+        mileage:      row.mileage || null,
+        transmission: row.transmission || null,
+        fuelType:     row.fuelType || null,
+        listedAt:     row.listedAt ? row.listedAt.toISOString() : null,
+        imgCondition: row.img_condition || null,
+        flipScore:    row.flip_score || null,
+        dealType:     isBroken ? 'broken_fixable' : (row.flip_deal_type || null),
+        demand:       row.flip_demand || null,
+        estResale:    row.flip_estimated_resale || null,
+        estMargin:    row.flip_estimated_margin || null,
+        fixCost:      row.flip_fix_cost || null,
+        reasoning:    row.flip_reasoning || null,
+        tint,
+        geminiReason: row.flip_reasoning ? row.flip_reasoning.slice(0, 80) : null,
       });
-      if (!filteredBatch.length) continue;
-
-      // Re-index after filter
-      // Score each listing individually with its photo — one Gemini call per listing
-      // This is the only reliable way to catch mismatches like a rusted wreck
-      // being titled "Classic BMW, significantly underpriced"
-      for (const row of filteredBatch) {
-        try {
-          const t = (row.title||'').toLowerCase();
-          const isBroken = /\b(broken|faulty|not working|dead|cracked|smashed|parts only|as is|for parts|damaged|needs work|spares|repair)\b/.test(t);
-          const specParts = [
-            row.year    ? row.year                                    : null,
-            row.mileage ? `${Number(row.mileage).toLocaleString()}km` : null,
-            row.make    ? row.make                                    : null,
-          ].filter(Boolean);
-          const specStr  = specParts.length ? ` (${specParts.join(', ')})` : '';
-          const priceStr = row.price ? `AUD $${row.price}` : 'price not listed';
-
-          const textPrompt = `You are an expert Australian Facebook Marketplace flipper. Evaluate this single listing as a flip opportunity.
-
-Listing: "${(row.title||'').slice(0,120)}"${specStr}
-Price: ${priceStr}
-${isBroken ? 'NOTE: Title suggests this may be broken/damaged.' : ''}
-
-${isBroken ? `BROKEN ITEM SCORING:
-- Only approve if repair is simple (screen, battery, port, buttons) with cheap parts (<$50)
-- Must have clear resale upside when fixed (phones, consoles, laptops, power tools)
-- Reject if: complex repair, rare parts, poor condition beyond simple fix, or rusted/structural damage
-` : `WORKING ITEM SCORING:
-- Only approve if clearly undervalued vs AU Facebook Marketplace second-hand prices
-- Minimum $150 net profit after all costs (buy, relist, 8% fees, time)
-- Must be high demand and sell within 1-2 weeks
-`}
-PHOTO ANALYSIS IS CRITICAL:
-- Look at the actual condition in the photo — does it match the title?
-- Reject if photo shows heavy rust, major damage, stripped parts, or derelict condition
-- Reject if photo doesn't match what the title claims to be selling
-- A "Classic BMW" that is a rusted wreck in a paddock = REJECT regardless of price
-- A phone with a cracked screen = OK if priced right for parts/repair
-- Stock photos or missing photos = use title judgment only
-
-AUTOMATIC REJECT:
-- Hire/rental listings
-- Condition far worse than title suggests
-- No realistic profit margin for a flipper
-- Item nobody would search for on Facebook Marketplace
-
-Reply ONLY as JSON (single object, not array):
-{"rating":"green"|"rainbow"|"pass","reason":"brief reason max 10 words","relevant":true|false}
-
-rating: rainbow=exceptional steal $500+ margin, green=solid flip $150+ margin, pass=not worth it`;
-
-          // Try to fetch image while URL might still be live
-          const parts = [];
-          if (row.image_url) {
-            try {
-              const imgRes = await axios.get(row.image_url, {
-                responseType: 'arraybuffer', timeout: 8000,
-                headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
-              });
-              const b64  = Buffer.from(imgRes.data).toString('base64');
-              const mime = imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg';
-              parts.push({ inline_data: { mime_type: mime, data: b64 } });
-            } catch (_) { /* image expired — text-only fallback */ }
-          }
-          parts.push({ text: textPrompt });
-
-          const gemResp = await geminiPost(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-            { contents: [{ parts }], generationConfig: { temperature: 0.1 } },
-            { timeout: 25000 }
-          );
-          const text   = gemResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-          const match  = text.match(/\{[\s\S]*\}/);
-          if (!match) { await new Promise(r => setTimeout(r, 800)); continue; }
-
-          const rating = JSON.parse(match[0]);
-          if (!rating.relevant || rating.rating === 'pass') {
-            await new Promise(r => setTimeout(r, 800));
-            continue;
-          }
-          if (rating.rating !== 'green' && rating.rating !== 'rainbow') {
-            await new Promise(r => setTimeout(r, 800));
-            continue;
-          }
-
-          // Approved — add to cache
-          approved.push({
-            id:           row.listing_id,
-            title:        row.title,
-            price:        row.price,
-            image:        row.image_url || null,
-            url:          row.url || null,
-            location:     row.location || null,
-            state:        row.state || null,
-            keyword:      row.keyword || null,
-            category:     row.category || 'general',
-            make:         row.make || null,
-            model:        row.model || null,
-            year:         row.year || null,
-            mileage:      row.mileage || null,
-            transmission: row.transmission || null,
-            fuelType:     row.fuelType || null,
-            listedAt:     row.listedAt ? row.listedAt.toISOString() : null,
-            imgCondition: row.img_condition || null,
-            flipScore:    row.flip_score || null,
-            dealType:     isBroken ? 'broken_fixable' : (row.flip_deal_type || null),
-            demand:       row.flip_demand || null,
-            estResale:    row.flip_estimated_resale || null,
-            estMargin:    row.flip_estimated_margin || null,
-            fixCost:      row.flip_fix_cost || null,
-            reasoning:    row.flip_reasoning || null,
-            tint:         rating.rating,
-            geminiReason: rating.reason || null,
-          });
-          console.log(`[Deals] ✅ "${(row.title||'').slice(0,50)}" — ${rating.rating}: ${rating.reason}`);
-          await new Promise(r => setTimeout(r, 1000));
-        } catch (e) {
-          console.error(`[Deals] Error on "${(row.title||'').slice(0,40)}":`, e.message);
-          await new Promise(r => setTimeout(r, 1000));
-        }
-      }
-      console.log(`[Deals] Batch ${Math.floor(i/BATCH)+1} done — ${approved.length} approved so far`);
+      console.log(`[Deals] ✅ "${(row.title||'').slice(0,50)}" — ${tint} (score: ${score}, margin: $${margin})`);
     }
 
     await redisSet('deals:global', { deals: approved, builtAt: new Date().toISOString() }, 6000);
-    console.log(`[Deals] ✅ Rebuilt deals:global — ${approved.length} Gemini-approved deals from ${rows.length} candidates`);
+    console.log(`[Deals] ✅ Rebuilt deals:global — ${approved.length} deals from ${rows.length} pre-scored candidates`);
   } catch (e) {
     console.error('[Deals] Rebuild failed:', e.message, '|', e.detail || '', '| position:', e.position || '');
   }
 }
+
 
 
 // Boot sequence is handled by runFullBootSequence() — see below
