@@ -2135,13 +2135,23 @@ async function aiTextFilter(listings, keyword) {
       return `${i}|${(l.title || '').slice(0, 100)}|${price}${spec ? '|' + spec : ''}`;
     }).join('\n');
 
+    // Build a one-line definition of what the keyword means so the AI
+    // reasons from first principles rather than pattern-matching examples.
+    // This covers every possible keyword without needing a hardcoded map.
     const prompt = `You are filtering Australian Facebook Marketplace listings for a flipper searching: "${keyword}"
 
-For each listing decide:
-- relevant: is this actually the item being searched for? Strict — accessories, parts, services, wrong category = false
-- pass: would a flipper even consider this? False if: hire/rental, wanted ad, placeholder price, obvious junk with no resale value
+First, reason about what "${keyword}" means:
+- What is the EXACT item being searched for? Be specific about type, brand, and use case.
+- What are common things that get confused with it that are NOT a match? (accessories, kids versions, different categories, wrong brand, parts only)
+- What makes something clearly NOT this item?
 
-Return ONLY a JSON array, one entry per line, same order as input:
+Use that reasoning to filter each listing:
+- relevant: true only if this listing is genuinely selling the searched item. False if it is an accessory, part, kids toy version, wrong category, different brand, service, or anything that is not the actual item.
+- pass: false if hire/rental, wanted ad, $0 or no price, new retail/wholesale stock being dropshipped
+
+Be strict. If in any doubt → relevant:false. A flipper wastes time on irrelevant listings.
+
+Return ONLY a JSON array, same order as input:
 [{"i":0,"relevant":true,"pass":true},...]
 
 Listings (index|title|price|specs):
@@ -2233,18 +2243,21 @@ Keyword searched: "${keyword}"
 Title: "${(listing.title || '').slice(0, 120)}"
 Price: ${listing.price ? '$' + listing.price : 'unknown'} AUD
 
-Look at the photo. Return ONLY JSON:
+Look at the photo carefully. Return ONLY JSON:
 {
   "pass": true|false,
   "condition": "new"|"like_new"|"good"|"fair"|"poor"|"damaged"|"cannot_assess",
-  "reject_reason": null|"brief reason e.g. photo shows a rusted wreck"|"wrong item — photo shows X not Y"
+  "reject_reason": null|"brief reason e.g. photo shows a kids push scooter not a moped"
 }
 
-Reject (pass:false) ONLY if:
-- Photo clearly shows a completely DIFFERENT type of item to the keyword
-- Item is obviously destroyed/derelict/unsalvageable (not just worn — actually wrecked)
-- Photo is clearly a placeholder/no-item (blank wall, random object, meme)
-Approve everything else — minor wear, fair condition, stock photos are all fine.`;
+Reject (pass:false) if ANY of these:
+- Photo shows a DIFFERENT type of item than the keyword (kids push scooter when searching moped, phone case when searching iphone, controller when searching ps5)
+- Photo is a RETAIL STOCK IMAGE or product ad (white background, ORDER NOW, price tags, watermarks, catalogue styling) — wholesale/dropship not second-hand
+- Photo shows a KIDS TOY version of an adult item (kids scooter is not a moped, toy bike is not a dirt bike)
+- Item is completely destroyed or derelict
+- Photo is a blank wall, screenshot, meme, or completely unrelated image
+
+Approve if: real second-hand item, matches keyword category, any reasonable condition`;
 
       const gemRes = await geminiPost(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
