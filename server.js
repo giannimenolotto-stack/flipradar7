@@ -1362,6 +1362,10 @@ const CATEGORY_SELL_RATES = {
   sneakers:      { sellDiscount: 0.10, flipCostLow: 20,  flipCostHigh: 50  },
   // Coffee machines / premium appliances
   appliance:     { sellDiscount: 0.15, flipCostLow: 50,  flipCostHigh: 200 },
+  // Furniture/IKEA/flat-pack: near-zero secondhand market in AU, huge effort to move
+  furniture:     { sellDiscount: 0.50, flipCostLow: 150, flipCostHigh: 500 },
+  // Mattresses: essentially unflippable due to hygiene concerns
+  mattress:      { sellDiscount: 0.70, flipCostLow: 50,  flipCostHigh: 100 },
   // Default for anything unrecognised
   _default:      { sellDiscount: 0.15, flipCostLow: 100, flipCostHigh: 300 },
 };
@@ -1385,6 +1389,8 @@ function kwToSellCategory(keyword) {
   if (/rolex|omega|seiko prospex|tag heuer|ap royal oak|grand seiko/.test(k)) return 'watch';
   if (/jordan|yeezy|nike dunk|air max|new balance 550/.test(k))      return 'sneakers';
   if (/thermomix|kitchenaid|breville barista|breville oracle|delonghi|jura|dyson v/.test(k)) return 'appliance';
+  if (/mattress|sofa bed|bed base/.test(k)) return 'mattress';
+  if (/couch|sofa|lounge suite|ikea|bed frame|queen bed|king bed|double bed|single bed|wardrobe|dresser|bookshelf|dining table|furniture/.test(k)) return 'furniture';
   return '_default';
 }
 
@@ -2169,7 +2175,7 @@ ${lines}`;
       text = r.data?.content?.[0]?.text || '';
     } else {
       const r = await geminiPost(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        geminiUrl(GEMINI_SMART),
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
         { timeout: 15000 }
       );
@@ -2260,11 +2266,11 @@ Reject (pass:false) if ANY of these:
 Approve if: real second-hand item, matches keyword category, any reasonable condition`;
 
       const gemRes = await geminiPost(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        geminiUrl(GEMINI_CHEAP),
         { contents: [{ parts: [
           { inline_data: { mime_type: imgMime, data: imgBase64 } },
           { text: prompt }
-        ]}], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        ]}] },
         { timeout: 12000 }
       );
 
@@ -2912,23 +2918,67 @@ Scoring guide:
         let text = '';
         if (GEMINI_API_KEY) {
           const parts = [{ text: prompt }];
-          // Add image if available
-          if (row.image_url) {
+          // Only fetch image if we don't already have condition data from the AI gate.
+          // The gate runs at scrape time (images still fresh) so trust it when available.
+          // If no gate data yet, try fetching — use cheap model since this is just a
+          // condition/relevance check, not a full appraisal.
+          if (row.image_url && !row.img_condition) {
             try {
               const imgRes = await axios.get(row.image_url, {
-                responseType: 'arraybuffer', timeout: 10000,
+                responseType: 'arraybuffer', timeout: 8000,
                 headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
               });
-              parts.unshift({ inline_data: {
-                mime_type: imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg',
-                data: Buffer.from(imgRes.data).toString('base64'),
-              }});
+              const imgB64  = Buffer.from(imgRes.data).toString('base64');
+              const imgMime = imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg';
+
+              // Quick cheap image check before the main scoring call
+              const quickCheck = await geminiPost(
+                geminiUrl(GEMINI_CHEAP),
+                { contents: [{ parts: [
+                  { inline_data: { mime_type: imgMime, data: imgB64 } },
+                  { text: `Listing keyword: "${row.keyword}". Title: "${(row.title||'').slice(0,80)}". Price: $${row.price} AUD.
+Look at this photo. Return ONLY JSON:
+{"pass":true|false,"condition":"new"|"like_new"|"good"|"fair"|"poor"|"damaged","reject_reason":null|"brief reason"}
+Reject if: wrong item in photo, kids toy version, retail stock ad, completely destroyed.` }
+                ]}] },
+                { timeout: 8000 }
+              ).catch(() => null);
+
+              if (quickCheck) {
+                const qRaw = quickCheck.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                const qMatch = qRaw.match(/\{[\s\S]*\}/);
+                if (qMatch) {
+                  const qResult = JSON.parse(qMatch[0]);
+                  // Persist image result so it's not re-checked
+                  pool.query(
+                    `UPDATE listings SET img_condition=$1, img_matches_keyword=$2, img_mismatch_reason=$3, img_analysed_at=NOW(),
+                     in_price_pool=CASE WHEN $2=FALSE OR $1='damaged' THEN FALSE ELSE in_price_pool END
+                     WHERE id=$4`,
+                    [qResult.condition||null, qResult.pass!==false, qResult.reject_reason||null, row.id]
+                  ).catch(()=>{});
+                  // Skip scoring entirely if image fails — don't waste the smart model call
+                  if (qResult.pass === false) {
+                    await pool.query('UPDATE listings SET flip_scored_at=NOW(), flip_score=0, flip_deal_type=$1 WHERE id=$2', ['not_a_deal', row.id]);
+                    await new Promise(r => setTimeout(r, 200));
+                    continue;
+                  }
+                  // Inject condition into prompt context so smart model knows
+                  if (qResult.condition) {
+                    parts[0].text = parts[0].text.replace(
+                      `- Photo condition assessment: unknown`,
+                      `- Photo condition assessment: ${qResult.condition}`
+                    );
+                  }
+                }
+              }
+              // Include image in the smart scoring call too
+              parts.unshift({ inline_data: { mime_type: imgMime, data: imgB64 } });
             } catch (_) {}
           }
-          const res = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+          const res = await geminiPost(
+            geminiUrl(GEMINI_SMART),
             { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
-            { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
+            { timeout: 20000 }
           );
           text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         } else {
@@ -4863,6 +4913,13 @@ app.get('/push/vapid-key', (req, res) => {
 const GEMINI_API_KEY    = process.env.GEMINI_API_KEY    || null;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
 
+// Gemini model tiers:
+// gemini-2.0-flash-lite  — vision + text, cheapest (~$0.000075/image). Use for bulk image checks.
+// gemini-2.5-flash       — smarter reasoning, ~8x more expensive. Use for appraisals only.
+const GEMINI_CHEAP  = 'gemini-2.0-flash-lite';
+const GEMINI_SMART  = 'gemini-2.5-flash';
+const geminiUrl = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+
 // ── Web Push (VAPID) ──────────────────────────────────────
 const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
@@ -5468,108 +5525,181 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
   try {
     const { listings, keyword } = req.body;
     if (!Array.isArray(listings) || !listings.length) return res.status(400).json({ error: 'listings array required' });
+    if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys' });
 
-    // Look up DB prices for each listing
-    const enriched = await Promise.all(listings.map(async (l, i) => {
+    // ── Per-listing rating with image + price data ─────────────────────────
+    // Each listing gets its own Gemini call with:
+    //   1. The actual listing photo (fetched fresh — URLs expire so do it now)
+    //   2. DB price data for that keyword/product
+    //   3. Keyword context so AI knows what a valid match looks like
+    // This means the rating reflects real condition, not just a title/price guess.
+
+    const CONCURRENCY = 5; // parallel calls — fast enough, won't hammer Gemini
+    const results = new Array(listings.length).fill(null);
+
+    async function rateOne(l, idx) {
       const kw = (l.keyword || keyword || '').toLowerCase().trim();
-      let dbMedian = null, dbSamples = null, dbP25 = null, dbP75 = null;
 
-      // 1. Exact keyword match against keyword_price_stats (most reliable)
+      // ── Fetch DB price context ──────────────────────────────────────────
+      let dbMedian = null, dbP25 = null, dbP75 = null, dbSamples = null, dbSource = null;
       if (kw) {
-        const { rows: kwExact } = await pool.query(
-          `SELECT median_price, p25_price, p75_price, sample_count, is_broad
-           FROM keyword_price_stats WHERE keyword = $1`, [kw]
-        );
-        if (kwExact[0]?.median_price && !kwExact[0].is_broad) {
-          dbMedian  = kwExact[0].median_price;
-          dbP25     = kwExact[0].p25_price;
-          dbP75     = kwExact[0].p75_price;
-          dbSamples = kwExact[0].sample_count;
-        }
+        try {
+          const { rows } = await pool.query(
+            `SELECT median_price, p25_price, p75_price, sample_count
+             FROM keyword_price_stats WHERE keyword = $1 AND is_broad IS NOT TRUE`, [kw]
+          );
+          if (rows[0]?.median_price) {
+            dbMedian = rows[0].median_price; dbP25 = rows[0].p25_price;
+            dbP75 = rows[0].p75_price; dbSamples = rows[0].sample_count;
+            dbSource = 'keyword_stats';
+          }
+        } catch (_) {}
       }
-
-      // 2. Fallback: product_price_stats fuzzy match (requires 8+ samples)
+      // Fallback: product stats
       if (!dbMedian && l.title) {
-        const words = l.title.split(' ').filter(w => w.length > 2).slice(0, 3).join('%');
-        const { rows: prodRows } = await pool.query(
-          `SELECT median_price, p25_price, p75_price, sample_count
-           FROM product_price_stats
-           WHERE LOWER(display_name) LIKE LOWER($1)
-           ORDER BY sample_count DESC LIMIT 1`, [`%${words}%`]
-        );
-        if (prodRows[0]?.median_price && prodRows[0].sample_count >= 4) {
-          dbMedian  = prodRows[0].median_price;
-          dbP25     = prodRows[0].p25_price;
-          dbP75     = prodRows[0].p75_price;
-          dbSamples = prodRows[0].sample_count;
-        }
+        try {
+          const words = l.title.split(' ').filter(w => w.length > 2).slice(0, 3).join('%');
+          const { rows } = await pool.query(
+            `SELECT median_price, p25_price, p75_price, sample_count
+             FROM product_price_stats WHERE LOWER(display_name) LIKE LOWER($1)
+             ORDER BY sample_count DESC LIMIT 1`, [`%${words}%`]
+          );
+          if (rows[0]?.median_price && rows[0].sample_count >= 4) {
+            dbMedian = rows[0].median_price; dbP25 = rows[0].p25_price;
+            dbP75 = rows[0].p75_price; dbSamples = rows[0].sample_count;
+            dbSource = 'product_stats';
+          }
+        } catch (_) {}
       }
 
-      const priceStr = l.price ? `AUD $${l.price}` : 'price not listed';
-      const dbStr = dbMedian
-        ? ` [DB avg: $${dbMedian}, p25: $${dbP25}, p75: $${dbP75}, ${dbSamples} AU FB sales]`
-        : ` [No DB data — use AU FB Marketplace second-hand knowledge]`;
-      // Include year/mileage so AI prices the specific vehicle, not just the keyword average
+      // ── Fetch image ─────────────────────────────────────────────────────
+      let imgData = null;
+      if (GEMINI_API_KEY && l.image) {
+        try {
+          const imgRes = await axios.get(l.image, {
+            responseType: 'arraybuffer', timeout: 8000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
+          });
+          imgData = {
+            mime_type: imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg',
+            data: Buffer.from(imgRes.data).toString('base64'),
+          };
+        } catch (_) { /* image expired — rate text-only */ }
+      }
+
+      // ── Build prompt ────────────────────────────────────────────────────
       const specParts = [
-        l.year    ? `${l.year}`                                       : null,
-        l.mileage ? `${Number(l.mileage||0).toLocaleString()}km`      : null,
-        l.make    ? l.make                                            : null,
+        l.year    ? `${l.year}`                                    : null,
+        l.mileage ? `${Number(l.mileage||0).toLocaleString()} km` : null,
+        l.make    ? l.make                                         : null,
       ].filter(Boolean);
-      const specStr = specParts.length ? ` (${specParts.join(', ')})` : '';
 
-      return { idx: i, line: `${i}. "${(l.title||'').slice(0,100)}"${specStr} listed ${priceStr}${dbStr}` };
-    }));
+      const priceCtx = dbMedian
+        ? `Market data: median $${dbMedian}, p25 $${dbP25}, p75 $${dbP75} (${dbSamples} AU FB Marketplace sales)`
+        : `No DB data — use your knowledge of current AU FB Marketplace second-hand prices`;
 
-    const lines = enriched.map(e => e.line).join(' | ');
+      const sellRates = CATEGORY_SELL_RATES[kwToSellCategory(kw)] || CATEGORY_SELL_RATES._default;
 
-    const prompt = `You are an Australian Facebook Marketplace second-hand pricing expert rating listings for a flipper searching: "${keyword || 'unknown'}".
+      const imgNote = imgData
+        ? `A photo of the listing is attached. Use it to assess condition, verify the item matches the keyword, and check for damage, heavy wear, or retail stock photos.`
+        : `No photo available — rate based on title and price only.`;
 
-KEYWORD RELEVANCE — THIS IS THE MOST IMPORTANT CHECK:
-The search keyword is: "${keyword || 'unknown'}"
-Mark relevant:false if the listing is NOT the actual item being searched for. Be strict:
-- Searching "moped" → only actual mopeds/50cc motorised bikes. NOT: electric scooters, mobility scooters, push scooters, bike parts, hub motors, accessories
-- Searching "iphone 13" → only actual iPhone 13 devices. NOT: cases, cables, chargers, screen protectors, other iPhone models
-- Searching "milwaukee drill" → only actual Milwaukee drills. NOT: other brands, batteries only, accessories, cases
-- Searching "ps5" → only actual PS5 consoles. NOT: controllers only, games only, headsets
-- General rule: if it's an accessory, part, or different category to what was searched — relevant:false
-- If genuinely unsure whether it matches the keyword → relevant:false (be strict)
+      const prompt = `You are an expert Australian Facebook Marketplace flipper rating a single listing.
 
-PRICING RULES:
-- All ratings based on USED AU Facebook Marketplace prices only — NOT RRP, NOT retail
-- VEHICLES: price based on the SPECIFIC year and km shown — never use all-years average
-- High mileage (150k+) and old age (15+ years) significantly reduce value
-- Only green/rainbow if REAL profit margin after all costs (buy, relist, 8% fees, time)
-- rainbow = exceptional flip, 40%+ below real AU FB value
-- green = good deal, 20-40% below real AU FB value  
-- yellow = fair price
-- red = overpriced or marginal
-- relevant:false = wrong item, part/accessory, or no realistic profit
+Search keyword: "${kw}"
+Title: "${(l.title||'').slice(0,120)}"
+Price: ${l.price ? '$' + l.price + ' AUD' : 'not listed'}${specParts.length ? ' · ' + specParts.join(', ') : ''}
+${priceCtx}
+Typical sell discount for this category: ${Math.round(sellRates.sellDiscount * 100)}% below asking median
+Typical flip costs: $${sellRates.flipCostLow}–$${sellRates.flipCostHigh}
 
-Listings (year, km, make shown in brackets where available):
-${lines}
+${imgNote}
 
-Reply ONLY as JSON array: [{"idx":0,"rating":"yellow","reason":"Fair for 210k km 2005","relevant":true}]
-Max 8 words per reason. Be specific about year/km impact on value.`;
+CATEGORIES THAT ALMOST NEVER FLIP PROFITABLY - rate red unless truly exceptional:
+- Mattresses: used mattresses are nearly impossible to resell in AU due to hygiene concerns. Rate red.
+- Generic IKEA / flat-pack furniture: depreciates to near zero. Beds, tables, wardrobes. Rate red.
+  A $50 used IKEA bed does NOT resell for $250 - the seller is lying about resale value.
+- Sofas/couches: only flip if leather, designer brand, near-new, at 40%+ below market.
+- Generic white goods: thin margins, heavy. Only green for premium brand at big discount.
+- Kids toys / baby gear (non-premium pram): near-zero resale margin. Rate red.
+- Generic clothing (non-brand): no consistent market. Rate red.
 
-    const useGemini = !!GEMINI_API_KEY;
-    let text = '';
+WHAT FLIPS WELL in AU - only green/rainbow for items with a real liquid secondhand market:
+iPhones, Samsung flagships, MacBooks, laptops, iPads, PS5/Xbox/Switch consoles, Milwaukee/DeWalt/Makita/Festool tools, cameras (Sony/Canon/Nikon/Fuji), premium audio (Sony WH/Bose/Sonos/Airpods Max), vehicles, motorcycles, quality bikes (Trek/Specialized/Santa Cruz), Peloton/Concept2/Rogue gym gear, watches (Rolex/Omega/Seiko Prospex), Nike Jordan/Yeezy/Dunk sneakers, generators, welders, camping fridges (Engel/Dometic/ARB), Weber/Traeger BBQs, name-brand golf clubs.
 
-    if (useGemini) {
-      const r = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1 } },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 25000 }
-      );
-      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    } else if (ANTHROPIC_API_KEY) {
-      const r = await axios.post('https://api.anthropic.com/v1/messages', {
-        model: 'claude-haiku-4-5-20251001', max_tokens: 1000,
-        messages: [{ role: 'user', content: prompt }],
-      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 20000 });
-      text = r.data?.content?.[0]?.text || '';
+IMAGE ASSESSMENT - if photo attached, use it:
+- Visible damage, stains, rust, heavy wear: factor into rating, do not ignore
+- Blurry / item not clearly visible: treat condition as unknown, do not assume good
+- Retail stock photo or ORDER NOW advertisement: mark relevant:false - wholesale dropship not secondhand
+- Ignore messy backgrounds, only assess the actual item condition
+
+PRICING REALITY:
+- Use the DB market data above as your price anchor
+- IGNORE the seller's stated resale value - they always overstate it
+- A used mattress bundle at $50 "resells for $250" is red - the resale market barely exists
+- IKEA furniture "below market" is irrelevant - the secondhand market is nearly zero
+- If no DB data: use real AU FB Marketplace knowledge, not RRP or retail prices
+
+RATING GUIDE:
+- rainbow: exceptional flip - high demand item, clearly underpriced, good condition in photo, $300+ realistic margin after costs
+- green: solid deal - real liquid market, meaningfully below market, decent condition, realistic profit after costs
+- yellow: fair price, slow market, or condition uncertain
+- red: overpriced, no real resale market, poor condition, or category that does not flip (mattress, IKEA, generic furniture)
+- relevant: false if wrong item, accessory, kids toy, service, hire, retail wholesale stock
+
+Return ONLY JSON:
+{"rating":"green","reason":"Brief reason max 8 words","relevant":true}`;
+
+      try {
+        let text = '';
+        if (GEMINI_API_KEY) {
+          const parts = imgData
+            ? [{ inline_data: imgData }, { text: prompt }]
+            : [{ text: prompt }];
+          const model = imgData ? GEMINI_CHEAP : GEMINI_SMART;
+          const r = await geminiPost(
+            geminiUrl(model),
+            { contents: [{ parts }], generationConfig: { temperature: 0.1 } },
+            { timeout: 15000 }
+          );
+          text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        } else {
+          const r = await axios.post('https://api.anthropic.com/v1/messages', {
+            model: 'claude-haiku-4-5-20251001', max_tokens: 120,
+            messages: [{ role: 'user', content: prompt }],
+          }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 12000 });
+          text = r.data?.content?.[0]?.text || '';
+        }
+
+        const match = text.match(/\{[\s\S]*\}/);
+        if (match) {
+          const r = JSON.parse(match[0]);
+          results[idx] = {
+            idx,
+            rating:   r.rating   || 'yellow',
+            reason:   (r.reason  || '').slice(0, 60),
+            relevant: r.relevant !== false,
+          };
+        } else {
+          results[idx] = { idx, rating: 'yellow', reason: '', relevant: true };
+        }
+      } catch (e) {
+        console.error(`[RateBatch] Error on "${(l.title||'').slice(0,40)}":`, e.message);
+        results[idx] = { idx, rating: 'yellow', reason: '', relevant: true }; // fail open
+      }
     }
 
-    res.json({ text });
+    // Run with concurrency cap
+    for (let i = 0; i < listings.length; i += CONCURRENCY) {
+      const batch = listings.slice(i, i + CONCURRENCY);
+      await Promise.all(batch.map((l, j) => rateOne(l, i + j)));
+    }
+
+    // Return as text string matching what the frontend parser expects
+    const validResults = results.filter(Boolean);
+    console.log(`[RateBatch] "${keyword}" → ${listings.length} listings rated (${validResults.filter(r=>r.relevant!==false).length} relevant, ${validResults.filter(r=>r.rating==='green'||r.rating==='rainbow').length} green+rainbow)`);
+    res.json({ text: JSON.stringify(validResults) });
+
   } catch (e) {
     console.error('[RateBatch]', e.message);
     res.status(500).json({ error: e.message });
