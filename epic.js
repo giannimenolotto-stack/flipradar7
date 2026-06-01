@@ -596,6 +596,26 @@ Be strict on matches_keyword — only false if the item in the photo is clearly 
       listingId,
     ]);
 
+    // Photo mismatch — purge from every user's Redis feed immediately
+    // The DB is updated above but the personal feed is Redis-only, so this is the only way to remove it
+    if (newQuality === 'spam') {
+      try {
+        const affectedWatchers = watchlist.filter(w =>
+          w.keyword && keyword && w.keyword.toLowerCase() === keyword.toLowerCase()
+        );
+        for (const watcher of affectedWatchers) {
+          const userListings = await getUserListings(watcher.userId);
+          const filtered = userListings.filter(l => String(l.id) !== String(listingId));
+          if (filtered.length < userListings.length) {
+            await saveUserListings(watcher.userId, filtered);
+            console.log(`[PhotoCheck] Purged mismatch ${listingId} from feed of user ${watcher.userId}`);
+          }
+        }
+      } catch (e) {
+        console.error(`[PhotoCheck] Feed purge error for ${listingId}:`, e.message);
+      }
+    }
+
   } catch (e) {
     // Silent fail — nightly batch will catch it
     console.error(`[PhotoCheck] ${listingId}:`, e.message?.slice(0,80));
