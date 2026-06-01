@@ -4057,7 +4057,9 @@ async function runFullBootSequence() {
     await scoreDealsWithAINightly();
 
     // Step 9: Final deals rebuild with all fresh data
+    // Always force-rebuild deals cache on boot so new logic takes effect immediately
     console.log('[Boot] Step 9 — Final deals rebuild...');
+    await redisSet('deals:global', null); // clear stale cache first
     await rebuildGlobalDeals();
 
     console.log('[Boot] ✅ Full boot sequence complete — everything is live');
