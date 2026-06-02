@@ -3174,8 +3174,7 @@ async function extractProductsNightly() {
 
     const items = rows.map((r, i) =>
       `${i+1}. "${r.title.replace(/"/g, "'").slice(0, 120)}" | keyword: ${r.keyword || '?'} | price: $${r.price}${r.description ? ' | desc: ' + r.description.slice(0, 80) : ''}`
-    ).join('
-');
+    ).join('\n');
 
     const prompt = `You are extracting the most precise possible product identifier from Australian Facebook Marketplace listing titles.
 
@@ -6405,7 +6404,6 @@ async function getKeywordPriceAnchor(keyword, sampleTitles = []) {
     '  "price_high": <top 25% - near new, barely used, great condition>',
     '}',
   ].filter(Boolean).join('\n');
-');
 
   try {
     let text = '';
