@@ -1506,9 +1506,11 @@ async function getProductPriceData(productKey, displayName, brand, category, key
   }
 
   // ── Tier 1: Exact product_key slug ────────────────────────────────────────
-  if (productKey) {
+  // Normalise the incoming key so "de-walt-drill" → "dewalt-drill" matches DB
+  const normKey = productKey ? normaliseProductKey(productKey) : null;
+  if (normKey) {
     const { rows } = await pool.query(
-      `SELECT * FROM product_price_stats WHERE product_key = $1`, [productKey]
+      `SELECT * FROM product_price_stats WHERE product_key = $1`, [normKey]
     );
     // Accept if: has a median (either real or AI anchor) — sample_count can be 0 (AI-only)
     if (rows[0]?.median_price) {
@@ -3149,6 +3151,105 @@ Reject if: wrong item in photo, kids toy version, retail stock ad, completely de
 // Reads unprocessed listing titles in batches of 50, asks Claude to identify
 // the exact product, saves back to DB. Runs nightly — never re-processes a listing.
 
+// ── Product key normalisation ─────────────────────────────────────────────────
+// Ensures consistent slugs regardless of how the AI formats the output.
+// Two listings of the same product MUST produce the same key.
+// Rules applied in order:
+//   1. Lowercase, strip special chars → basic slug
+//   2. Known brand spelling variants → canonical brand name
+//   3. Strip redundant suffix words that don't split the market
+//   4. Normalise storage (256-gb → 256gb), voltage (18-v → 18v), displacement (300-cc → 300cc)
+//   5. Collapse repeated hyphens, strip leading/trailing hyphens
+function normaliseProductKey(raw) {
+  if (!raw) return null;
+
+  let k = raw.toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')  // non-alphanumeric → hyphen
+    .replace(/-+/g, '-')           // collapse multiple hyphens
+    .replace(/^-|-$/g, '');        // strip leading/trailing
+
+  // ── Brand canonicalisation ────────────────────────────────────────────────
+  // Handles AI inconsistencies like "de-walt" vs "dewalt", "hi-fi" etc
+  const brandAliases = {
+    'de-walt':        'dewalt',
+    'de-longhi':      'delonghi',
+    'kit-chen-aid':   'kitchenaid',
+    'kitchenaid':     'kitchenaid',
+    'la-marzocco':    'lamarzocco',
+    'land-rover':     'landrover',
+    'hi-koki':        'hikoki',
+    'hitachi':        'hikoki',       // hikoki rebranded from hitachi
+    'snap-on':        'snapon',
+    'snap-on-tools':  'snapon',
+    'mac-tools':      'mactools',
+    'tri-ton':        'triton',
+    'aus-tralian':    null,           // remove country prefixes
+    'second-hand':    null,
+    'used':           null,
+    'preowned':       null,
+    'pre-owned':      null,
+  };
+  for (const [alias, canonical] of Object.entries(brandAliases)) {
+    if (canonical === null) {
+      k = k.replace(new RegExp('(^|-)' + alias + '(-|$)', 'g'), '$1$2');
+    } else if (k.startsWith(alias + '-') || k === alias) {
+      k = k.replace(new RegExp('^' + alias), canonical);
+    }
+  }
+
+  // ── Storage normalisation ─────────────────────────────────────────────────
+  // "256-gb" → "256gb", "1-tb" → "1tb", "512-g-b" → "512gb"
+  k = k.replace(/(\d+)-?g-?b/g, '$1gb');
+  k = k.replace(/(\d+)-?t-?b/g, '$1tb');
+  k = k.replace(/(\d+)-?m-?b/g, '$1mb');
+
+  // ── Voltage normalisation ─────────────────────────────────────────────────
+  // "18-v" → "18v", "40-volt" → "40v", "60-v" → "60v"
+  k = k.replace(/(\d+)-?v(?:olt)?s?/g, '$1v');
+
+  // ── Displacement normalisation ────────────────────────────────────────────
+  // "300-cc" → "300cc", "250-c-c" → "250cc", "1000cc" stays
+  k = k.replace(/(\d+)-?c-?c/g, '$1cc');
+
+  // ── Series/generation suffixes that don't split the market ───────────────
+  // "gen-2", "generation-2", "mk-2", "mark-2", "v2" at END of key only
+  // These are minor revisions, not different products price-wise
+  // Exception: keep if it's a MAJOR model number (e.g. ps5 → keep, iphone-15 → keep)
+  // Only strip if it's clearly a revision suffix, not the model itself
+  const revisionSuffixes = [
+    /-gen-\d+$/,        // -gen-2
+    /-generation-\d+$/, // -generation-2
+    /-mk-\d+$/,         // -mk-2
+    /-mark-\d+$/,       // -mark-2
+    /-rev-\d+$/,        // -rev-2
+    /-edition$/,        // -edition (keep "disc-edition" because that splits price)
+  ];
+  // Only strip -edition if it's standalone and not meaningful
+  // Actually keep all these for now — safer to over-specify than under-specify
+
+  // ── Strip redundant descriptor words at END of key ────────────────────────
+  // Words that sellers add but don't affect which product it is
+  const trailingJunk = [
+    /-with-charger$/, /-with-battery$/, /-with-case$/,
+    /-no-charger$/, /-no-battery$/, /-no-case$/,
+    /-for-sale$/, /-selling$/, /-cheap$/, /-bargain$/,
+    /-pick-?up-?only$/, /-local-?pickup$/,
+    /-aus-stock$/, /-australian-stock$/,
+    /-au-?seller$/, /-fast-?ship$/,
+    /-brand-?new$/, /-like-?new$/, /-good-?condition$/,
+    /-great-?condition$/, /-mint-?condition$/,
+    /-ex-?demo$/, /-ex-?display$/,
+  ];
+  for (const pattern of trailingJunk) {
+    k = k.replace(pattern, '');
+  }
+
+  // ── Final cleanup ─────────────────────────────────────────────────────────
+  k = k.replace(/-+/g, '-').replace(/^-|-$/g, '');
+
+  return k || null;
+}
+
 async function extractProductsNightly() {
   if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY) { console.log('[Extract] No AI key — skipping'); return; }
 
@@ -3263,9 +3364,11 @@ No explanation. No markdown. Start with [ end with ].`;
         const row = rows[i];
         const r   = results[i] || {};
         // Only store high/medium confidence — low confidence poisons the stats
+        // Normalise the slug — ensures consistent keys across different AI phrasings
+        // e.g. "de-walt" → "dewalt", "256-gb" → "256gb", "18-v" → "18v"
         const productKey = (r.confidence === 'low' || !r.product_key)
           ? null
-          : r.product_key.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+          : normaliseProductKey(r.product_key);
 
         await pool.query(`
           UPDATE listings SET
