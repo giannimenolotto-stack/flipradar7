@@ -235,22 +235,31 @@ async function initDB() {
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_dropped_at TIMESTAMPTZ',
       'CREATE TABLE IF NOT EXISTS keyword_anchors (keyword TEXT PRIMARY KEY, anchor_price INTEGER NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())',
       `CREATE TABLE IF NOT EXISTS product_price_stats (
-        product_key     TEXT PRIMARY KEY,
-        display_name    TEXT NOT NULL,
-        brand           TEXT,
-        category        TEXT,
-        variant         TEXT,
-        sample_count    INTEGER DEFAULT 0,
-        median_price    INTEGER,
-        p25_price       INTEGER,
-        p75_price       INTEGER,
-        low_price       INTEGER,
-        high_price      INTEGER,
-        updated_at      TIMESTAMPTZ DEFAULT NOW()
+        product_key       TEXT PRIMARY KEY,
+        display_name      TEXT NOT NULL,
+        brand             TEXT,
+        category          TEXT,
+        variant           TEXT,
+        sample_count      INTEGER DEFAULT 0,  -- real listings used in median (0 = AI-only)
+        median_price      INTEGER,            -- real median when sample_count >= 5, else ai_anchor_median
+        p25_price         INTEGER,
+        p75_price         INTEGER,
+        low_price         INTEGER,
+        high_price        INTEGER,
+        ai_anchor_median  INTEGER,            -- AI's estimate of secondhand FB price (always stored)
+        ai_anchor_low     INTEGER,            -- AI bottom 25%
+        ai_anchor_high    INTEGER,            -- AI top 25%
+        is_ai_only        BOOLEAN DEFAULT TRUE, -- TRUE until we have >= 5 real listings
+        updated_at        TIMESTAMPTZ DEFAULT NOW()
       )`,
       'CREATE INDEX IF NOT EXISTS idx_product_stats_brand ON product_price_stats(brand)',
       'CREATE INDEX IF NOT EXISTS idx_product_stats_category ON product_price_stats(category)',
       'CREATE INDEX IF NOT EXISTS idx_listings_extracted ON listings(extracted_product) WHERE extracted_product IS NOT NULL',
+      'ALTER TABLE product_price_stats ADD COLUMN IF NOT EXISTS ai_anchor_median INTEGER',
+      'ALTER TABLE product_price_stats ADD COLUMN IF NOT EXISTS ai_anchor_low INTEGER',
+      'ALTER TABLE product_price_stats ADD COLUMN IF NOT EXISTS ai_anchor_high INTEGER',
+      'ALTER TABLE product_price_stats ADD COLUMN IF NOT EXISTS is_ai_only BOOLEAN DEFAULT TRUE',
+      'CREATE INDEX IF NOT EXISTS idx_product_stats_key ON product_price_stats(product_key)',
       'ALTER TABLE listings ADD COLUMN IF NOT EXISTS norm_category TEXT',
     ];
     for (const sql of migrations) {
@@ -284,17 +293,16 @@ function buildVehicleCohortKey(make, model, series, variant, yearBand, mileageBa
 // e.g. 2008 → '2006-2010', 2019 → '2018-2022'
 function bandYear(year) {
   if (!year) return null;
-  // 5-year bands aligned to common AU model generations
-  const bands = [
-    [1990, 1994], [1995, 1999],
-    [2000, 2004], [2005, 2007], [2008, 2010],
-    [2011, 2013], [2014, 2016], [2017, 2019],
-    [2020, 2022], [2023, 2026],
-  ];
-  for (const [lo, hi] of bands) {
-    if (year >= lo && year <= hi) return `${lo}-${hi}`;
-  }
-  return `${year}`;
+  // 3-year bands — tight enough to be meaningful, wide enough to get samples.
+  // 3 years = one model refresh cycle for most AU vehicles.
+  // e.g. 2019 HiLux facelift and 2021 HiLux are comparable; 2015 is not.
+  const base = 1990;
+  const band_size = 3;
+  const lo = Math.floor((year - base) / band_size) * band_size + base;
+  const hi = lo + band_size - 1;
+  // Don't let hi exceed current year + 1
+  const maxYear = new Date().getFullYear() + 1;
+  return `${lo}-${Math.min(hi, maxYear)}`;
 }
 
 // ── Band mileage into a range ─────────────────────────────
@@ -1472,6 +1480,102 @@ async function fetchBestVehiclePrice(make, model, year, mileage, opts = {}) {
   console.log(`[VehiclePrice] DB score ${score} < ${DB_TRUST_THRESHOLD} — AI preferred for ${make} ${model} ${year}`);
   // Still return it so the AI route can use it to sanity-check its output
   return { ...dbVehicle, belowThreshold: true };
+}
+
+// ── Smart product price lookup ─────────────────────────────────────────────
+// 1. Exact product_key match (slug lookup)
+// 2. Fuzzy display_name match (first 3 words)
+// 3. Same brand + category fallback (when model unclear)
+// 4. AI anchor when nothing in DB — returns AI's estimate of AU FB price
+// Returns { median, p25, p75, samples, source, displayName, sellPrice }
+async function getProductPriceData(productKey, displayName, brand, category, keyword) {
+  // ── Helper: format a product_price_stats row into a price data object ──────
+  function formatProdRow(row, src, kw) {
+    const rates = CATEGORY_SELL_RATES[kwToSellCategory(kw || row.product_key)] || CATEGORY_SELL_RATES._default;
+    return {
+      median:       row.median_price,
+      p25:          row.p25_price,
+      p75:          row.p75_price,
+      samples:      row.sample_count || 0,
+      source:       src,
+      displayName:  row.display_name,
+      sellPrice:    Math.round(row.median_price * (1 - rates.sellDiscount)),
+      isAiOnly:     row.is_ai_only === true || row.sample_count === 0,
+      aiAnchor:     row.ai_anchor_median || null,
+    };
+  }
+
+  // ── Tier 1: Exact product_key slug ────────────────────────────────────────
+  if (productKey) {
+    const { rows } = await pool.query(
+      `SELECT * FROM product_price_stats WHERE product_key = $1`, [productKey]
+    );
+    // Accept if: has a median (either real or AI anchor) — sample_count can be 0 (AI-only)
+    if (rows[0]?.median_price) {
+      return formatProdRow(rows[0], 'exact_key', keyword || productKey);
+    }
+  }
+
+  // ── Tier 2: Fuzzy display_name match (first 2+ meaningful words) ──────────
+  // More conservative than before — require brand + at least one model word
+  const searchName = displayName || (productKey || '').replace(/-/g, ' ');
+  if (searchName) {
+    const words = searchName.split(' ').filter(w => w.length > 2).slice(0, 2);
+    if (words.length >= 2) {
+      // Use AND logic: both words must appear, preventing "Milwaukee M18" matching "Makita 18V"
+      const { rows } = await pool.query(`
+        SELECT * FROM product_price_stats
+        WHERE LOWER(display_name) LIKE LOWER($1)
+          AND LOWER(display_name) LIKE LOWER($2)
+        ORDER BY sample_count DESC LIMIT 1
+      `, [`%${words[0]}%`, `%${words[1]}%`]);
+      if (rows[0]?.median_price) {
+        return formatProdRow(rows[0], 'fuzzy_name', keyword || searchName);
+      }
+    }
+  }
+
+  // ── Tier 3: Same brand + category (broader fallback) ─────────────────────
+  // Only use if not AI-only — a real median for a similar product is useful,
+  // but an AI-only estimate for a different model could mislead.
+  if (brand && category) {
+    const { rows } = await pool.query(`
+      SELECT * FROM product_price_stats
+      WHERE LOWER(brand) = LOWER($1) AND category = $2
+        AND (is_ai_only IS NOT TRUE OR sample_count >= 3)
+      ORDER BY sample_count DESC LIMIT 1
+    `, [brand, category]);
+    if (rows[0]?.median_price) {
+      console.log(`[ProductLookup] Tier 3 (brand+cat) for "${displayName}" → using "${rows[0].display_name}"`);
+      return {
+        ...formatProdRow(rows[0], 'brand_category', category),
+        isSimilar: true,
+        similarTo: rows[0].display_name,
+      };
+    }
+  }
+
+  // ── Tier 4: AI anchor ─────────────────────────────────────────────────────
+  // Nothing in DB — ask AI for its estimate of AU FB Marketplace price.
+  // Cached 30 days so this is only expensive once per product.
+  const anchor = await getKeywordPriceAnchor(
+    searchName || keyword || productKey || 'unknown',
+    []
+  );
+  if (anchor?.asking_median) {
+    console.log(`[ProductLookup] Tier 4 (AI anchor) for "${searchName}" → $${anchor.asking_median}`);
+    return {
+      median:      anchor.asking_median,
+      p25:         anchor.price_low,
+      p75:         anchor.price_high,
+      samples:     0,
+      source:      'ai_anchor',
+      displayName: displayName || searchName,
+      sellPrice:   anchor.sell_price,
+    };
+  }
+
+  return null;
 }
 
 async function getPriceCacheForKeyword(keyword) {
@@ -3046,15 +3150,14 @@ Reject if: wrong item in photo, kids toy version, retail stock ad, completely de
 // the exact product, saves back to DB. Runs nightly — never re-processes a listing.
 
 async function extractProductsNightly() {
-  if (!ANTHROPIC_API_KEY) { console.log('[Extract] No Anthropic key — skipping'); return; }
+  if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY) { console.log('[Extract] No AI key — skipping'); return; }
 
-  const BATCH = 50;
+  const BATCH = 40; // smaller batch = more accurate extraction per call
   let processed = 0;
 
   while (true) {
-    // Grab next batch of unextracted listings (non-vehicle, has a real price)
     const { rows } = await pool.query(`
-      SELECT id, listing_id, title, keyword, price
+      SELECT id, listing_id, title, keyword, price, description
       FROM listings
       WHERE extracted_at IS NULL
         AND category != 'vehicle'
@@ -3067,55 +3170,104 @@ async function extractProductsNightly() {
     `, [BATCH]);
 
     if (!rows.length) break;
-
     console.log(`[Extract] Processing batch of ${rows.length} listings...`);
 
-    // Build prompt — ask Claude to classify all titles in one call
-    const items = rows.map((r, i) => `${i+1}. "${r.title.replace(/"/g, "'").slice(0, 120)}" (keyword: ${r.keyword || 'unknown'}, price: ${r.price})`).join('\n');
+    const items = rows.map((r, i) =>
+      `${i+1}. "${r.title.replace(/"/g, "'").slice(0, 120)}" | keyword: ${r.keyword || '?'} | price: $${r.price}${r.description ? ' | desc: ' + r.description.slice(0, 80) : ''}`
+    ).join('
+');
 
-    const prompt = `You are extracting structured product data from Australian Facebook Marketplace listing titles.
+    const prompt = `You are extracting the most precise possible product identifier from Australian Facebook Marketplace listing titles.
 
-For each listing, identify the EXACT product being sold. Focus on the specific model/item, not accessories or bundles.
+PURPOSE: Group identical products together for secondhand price analysis.
+Two listings of the exact same product must produce the exact same product_key.
+Two listings of different products must produce different product_keys.
 
-Rules:
-- extracted_product: the clean standardised product name (e.g. "Milwaukee M18 Impact Driver", "iPhone 15 Pro 256GB", "Weber Q2200 BBQ", "Dyson V15 Detect", "Trek Marlin 7 Mountain Bike")
-- brand: the manufacturer/brand (e.g. "Milwaukee", "Apple", "Weber", "Trek")  
-- category: one of: phones | laptops | tablets | gaming | tvs | audio | power_tools | hand_tools | garden | camping | vehicles | bikes | furniture | appliances | fitness | musical_instruments | photography | baby_kids | clothing | watches | collectibles | trade_industrial | general
-- variant: any key differentiator like storage size, colour, voltage, size (e.g. "256GB", "18V", "65 inch", "XL") — null if none
-- confidence: "high" if you are certain of the exact product, "medium" if you made a reasonable guess, "low" if the title is too vague
+SPECIFICITY RULES — read carefully:
 
-Listings:
+ALWAYS include year for vehicles, bikes, and power equipment:
+  GOOD: ktm-300-exc-2014 | honda-crf-250r-2019 | husqvarna-450-fc-2021 | yamaha-yz250f-2018
+  BAD:  ktm-exc | honda-dirt-bike | husqvarna-dirt-bike | yamaha-motocross
+
+ALWAYS include the exact model name for appliances and electronics:
+  GOOD: delonghi-la-specialista-arte | breville-barista-express-bes870 | dyson-v15-detect-absolute
+  BAD:  delonghi-coffee-machine | breville-coffee-machine | dyson-vacuum
+
+ALWAYS include displacement for bikes and scooters:
+  GOOD: ktm-300-exc-2014 | kymco-agility-rs-50 | honda-crf-250r-2019
+  BAD:  ktm-exc | kymco-scooter | honda-dirt-bike
+
+ALWAYS include voltage and line for power tools:
+  GOOD: milwaukee-m18-fuel-impact-driver | dewalt-flexvolt-60v-circular-saw | makita-xgt-40v-grinder
+  BAD:  milwaukee-impact-driver | dewalt-circular-saw | makita-grinder
+
+ALWAYS include storage for phones and tablets:
+  GOOD: iphone-15-pro-256gb | samsung-galaxy-s24-ultra-512gb | ipad-pro-12-9-256gb
+  BAD:  iphone-15-pro | samsung-galaxy-s24 | ipad-pro
+
+THESE ARE ALWAYS confidence:low — they are categories not products:
+  coffee-machine, dirt-bike, drill, phone, laptop, scooter, golf-clubs, tools,
+  camera, speaker, bike, watch, washing-machine, fridge, tv, headphones,
+  power-tool, vacuum, blender, kettle, toaster, motorcycle, bicycle
+  A good product_key must be specific enough to search on eBay and find only that model.
+
+More GOOD examples:
+  callaway-paradym-driver-2023 | sony-wh-1000xm5 | ps5-slim-disc-edition
+  weber-genesis-ii-e-310 | scott-spark-rc-world-cup-2022 | specialized-turbo-levo-sl-comp-2023
+  rolex-submariner-date-116610 | seiko-prospex-srp777 | omega-seamaster-300m-2531-80
+
+Fields:
+  product_key: lowercase, hyphens only, brand + exact model + critical variant (year/storage/displacement/voltage)
+  display_name: title-case readable name e.g. KTM 300 EXC 2014, DeLonghi La Specialista Arte
+  brand: manufacturer e.g. KTM, DeLonghi, Milwaukee, Apple
+  category: phones | laptops | tablets | gaming | tvs | audio | power_tools | garden_tools |
+            motorbikes | scooters | bicycles | fitness | photography | appliances | watches |
+            sneakers | golf | musical_instruments | collectibles | trade_industrial | general
+  variant: ONLY if it splits the market AND is not already in product_key. null for most items.
+  confidence: high = certain exact model | medium = reasonable guess | low = too vague
+
+Listings (index. title | keyword | price | description snippet):
 ${items}
 
-Return ONLY a JSON array with ${rows.length} objects in the same order:
-[{"extracted_product":"...","brand":"...","category":"...","variant":"...","confidence":"..."},...]
+Return ONLY a JSON array, ${rows.length} objects, same order:
+[{"product_key":"ktm-300-exc-2014","display_name":"KTM 300 EXC 2014","brand":"KTM","category":"motorbikes","variant":null,"confidence":"high"},...]
 
-No explanation. No markdown. Start with [ and end with ].`;
+No explanation. No markdown. Start with [ end with ].`;
 
     try {
-      const resp = await axios.post('https://api.anthropic.com/v1/messages', {
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 4000,
-        messages: [{ role: 'user', content: prompt }],
-      }, {
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-        },
-        timeout: 30000,
-      });
+      let text = '';
+      if (ANTHROPIC_API_KEY) {
+        const resp = await axios.post('https://api.anthropic.com/v1/messages', {
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 4000,
+          messages: [{ role: 'user', content: prompt }],
+        }, {
+          headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+          timeout: 30000,
+        });
+        text = resp.data?.content?.[0]?.text || '';
+      } else {
+        const resp = await geminiPost(
+          geminiUrl(GEMINI_SMART),
+          { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+          { timeout: 30000 }
+        );
+        text = resp.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      }
 
-      const text = resp.data?.content?.[0]?.text || '';
       const match = text.match(/\[[\s\S]*\]/);
       if (!match) { console.error('[Extract] Bad response, skipping batch'); break; }
 
       const results = JSON.parse(match[0]);
 
-      // Write results back to DB
       for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
-        const r = results[i] || {};
+        const r   = results[i] || {};
+        // Only store high/medium confidence — low confidence poisons the stats
+        const productKey = (r.confidence === 'low' || !r.product_key)
+          ? null
+          : r.product_key.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+
         await pool.query(`
           UPDATE listings SET
             extracted_product     = $1,
@@ -3123,27 +3275,25 @@ No explanation. No markdown. Start with [ and end with ].`;
             extracted_category    = $3,
             extracted_variant     = $4,
             extraction_confidence = $5,
+            norm_category         = $3,
             extracted_at          = NOW()
           WHERE id = $6
         `, [
-          r.extracted_product || null,
-          r.brand             || null,
-          r.category          || null,
-          r.variant           || null,
-          r.confidence        || 'low',
+          productKey            || null,  // use the slug as the canonical key
+          r.brand               || null,
+          r.category            || null,
+          r.variant             || null,
+          r.confidence          || 'low',
           row.id,
         ]);
       }
 
       processed += rows.length;
-      console.log(`[Extract] ${processed} listings extracted so far...`);
-
-      // Small delay between batches — be gentle on API
-      await new Promise(res => setTimeout(res, 1000));
+      console.log(`[Extract] ${processed} listings extracted...`);
+      await new Promise(res => setTimeout(res, 800));
 
     } catch (e) {
       console.error('[Extract] Batch failed:', e.message);
-      // Mark these as attempted so we don't retry in an infinite loop
       const ids = rows.map(r => r.id);
       await pool.query(`UPDATE listings SET extracted_at = NOW() WHERE id = ANY($1)`, [ids]);
       break;
@@ -3153,76 +3303,246 @@ No explanation. No markdown. Start with [ and end with ].`;
   console.log(`[Extract] ✅ Done — ${processed} listings extracted`);
 }
 
-// Rebuild product_price_stats from extracted data
-// Groups by extracted_product, runs IQR clean, computes median/p25/p75
+// ── Rebuild product_price_stats ──────────────────────────────────────────────
+//
+// Pipeline per product key:
+//
+// 1. AI anchor = ask AI: "what does this exact product sell for secondhand on AU FB?"
+//    → stored always as ai_anchor_median/low/high
+//    → used as the benchmark fence: only keep listings within ±40% of this
+//
+// 2. Filter real listings to anchor ±40%
+//    → rejects "$50 iPhone 15 Pro" and "$5000 Kymco 50cc scooter" before IQR
+//    → ±40% is intentionally tight — if it's outside that range it's a different
+//      product, a scam, or a data error. Don't include it.
+//
+// 3. IQR on the anchor-filtered set
+//    → finds the tight majority within the already-sane set
+//    → further removes stragglers at the edges
+//
+// 4. Need ≥5 real listings after all filtering to call it a real median
+//    → below 5: serve AI anchor as the median (is_ai_only = TRUE)
+//    → at or above 5: median is real data (is_ai_only = FALSE)
+//
+// This means:
+//   - A new product key with 2 listings → AI anchor shown, flagged as estimate
+//   - A product key with 8 listings all clustered near the anchor → real median
+//   - A product key where 3 of 6 listings are suspiciously cheap → excluded by anchor fence,
+//     remaining 3 below threshold → AI anchor shown until more real data arrives
+//
 async function rebuildProductPriceStats() {
   try {
-    await pool.query(`
-      INSERT INTO product_price_stats
-        (product_key, display_name, brand, category, variant,
-         sample_count, median_price, p25_price, p75_price,
-         low_price, high_price, updated_at)
-      WITH base AS (
-        SELECT
-          LOWER(REGEXP_REPLACE(extracted_product, '[^a-z0-9]+', '-', 'gi')) AS product_key,
-          extracted_product  AS display_name,
-          extracted_brand    AS brand,
-          extracted_category AS category,
-          extracted_variant  AS variant,
-          COUNT(*)::INT AS raw_count,
-          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price)::INT AS p25,
-          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price)::INT AS p75
-        FROM listings
-        WHERE extracted_product IS NOT NULL
-          AND extraction_confidence IN ('high', 'medium')
-          AND price > 0
-          AND is_offer_price = FALSE
-          AND price_quality = 'ok'
-          AND is_active = TRUE
-          AND scraped_at > NOW() - INTERVAL '90 days'
-        GROUP BY product_key, display_name, brand, category, variant
-        HAVING COUNT(*) >= 4
-      ),
-      fenced AS (
-        SELECT
-          b.product_key, b.display_name, b.brand, b.category, b.variant,
-          b.raw_count,
-          COUNT(l.id)::INT AS clean_count,
-          PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY l.price)::INT AS median,
-          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY l.price)::INT AS p25_clean,
-          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY l.price)::INT AS p75_clean,
-          MIN(l.price)::INT AS low,
-          MAX(l.price)::INT AS high
-        FROM listings l
-        JOIN base b ON LOWER(REGEXP_REPLACE(l.extracted_product, '[^a-z0-9]+', '-', 'gi')) = b.product_key
-        WHERE l.price BETWEEN GREATEST(0, b.p25 - 1.5*(b.p75-b.p25))
-                          AND (b.p75 + 1.5*(b.p75-b.p25))
-          AND l.is_offer_price = FALSE
-          AND l.price_quality = 'ok'
-          AND l.is_active = TRUE
-          AND l.scraped_at > NOW() - INTERVAL '90 days'
-        GROUP BY b.product_key, b.display_name, b.brand, b.category, b.variant, b.raw_count
-        HAVING COUNT(l.id) >= 4
-      )
-      SELECT product_key, display_name, brand, category, variant,
-             clean_count, raw_count, median, p25_clean, p75_clean, low, high, NOW()
-      FROM fenced
-      ON CONFLICT (product_key) DO UPDATE SET
-        display_name  = EXCLUDED.display_name,
-        brand         = EXCLUDED.brand,
-        category      = EXCLUDED.category,
-        variant       = EXCLUDED.variant,
-        sample_count  = EXCLUDED.sample_count,
-        median_price  = EXCLUDED.median_price,
-        p25_price     = EXCLUDED.p25_price,
-        p75_price     = EXCLUDED.p75_price,
-        low_price     = EXCLUDED.low_price,
-        high_price    = EXCLUDED.high_price,
-        updated_at    = NOW()
+    // ── Step A: Get all product keys that have at least 1 real listing ───────
+    // We want keys even with thin data — AI anchor fills the gap.
+    const { rows: productRows } = await pool.query(`
+      SELECT
+        extracted_product                                        AS product_key,
+        MAX(extracted_brand)                                     AS brand,
+        MAX(extracted_category)                                  AS category,
+        MAX(extracted_variant)                                   AS variant,
+        COUNT(*)::INT                                            AS raw_count,
+        (ARRAY_AGG(title ORDER BY scraped_at DESC))[1:5]         AS sample_titles
+      FROM listings
+      WHERE extracted_product IS NOT NULL
+        AND extraction_confidence IN ('high', 'medium')
+        AND price > 0
+        AND is_offer_price = FALSE
+        AND price_quality NOT IN ('spam', 'damage', 'accessory')
+        AND is_active = TRUE
+      GROUP BY extracted_product
+      HAVING COUNT(*) >= 1
     `);
 
-    const { rows } = await pool.query('SELECT COUNT(*)::INT AS cnt FROM product_price_stats');
-    console.log(`[ProductStats] ✅ Rebuilt — ${rows[0].cnt} unique products in stats table`);
+    console.log(`[ProductStats] Processing ${productRows.length} product keys...`);
+
+    // Minimum real listings needed before we trust the median over AI anchor
+    const MIN_REAL = 5;
+
+    let built = 0, aiOnly = 0;
+
+    for (const prod of productRows) {
+      try {
+        // ── Step B: Get AI anchor ─────────────────────────────────────────
+        // Ask AI: "what does this exact product sell for secondhand on AU FB Marketplace?"
+        // Cached 30 days in Redis — cheap after first call.
+        const readableName = prod.product_key.replace(/-/g, ' ');
+        const anchor = await getKeywordPriceAnchor(readableName, prod.sample_titles || []);
+
+        if (!anchor || !anchor.asking_median) {
+          // No AI anchor and no data — skip entirely
+          console.log(`[ProductStats] No anchor for "${prod.product_key}" — skipping`);
+          continue;
+        }
+
+        // ── Step C: Tight fence around AI anchor (±40%) ──────────────────
+        // This is the critical gate. If a listing price is outside ±40% of
+        // what AI says the product sells for secondhand, it's not this product
+        // or it's a scam/error. Don't include it in the median.
+        //
+        // Examples at anchor $800 (e.g. iPhone 14):
+        //   ±40% = $480 to $1120
+        //   $50 iPhone 14 → rejected (scam/accessory)
+        //   $450 iPhone 14 → rejected (too far below — likely broken, parts only)
+        //   $600 iPhone 14 → accepted (genuine deal)
+        //   $1200 iPhone 14 → rejected (overpriced outlier)
+        //
+        const fence_lo = Math.round(anchor.asking_median * 0.60);  // 40% below
+        const fence_hi = Math.round(anchor.asking_median * 1.40);  // 40% above
+
+        const { rows: priceRows } = await pool.query(`
+          SELECT price FROM listings
+          WHERE extracted_product = $1
+            AND extraction_confidence IN ('high', 'medium')
+            AND price BETWEEN $2 AND $3
+            AND is_offer_price = FALSE
+            AND price_quality NOT IN ('spam', 'damage', 'accessory')
+            AND is_active = TRUE
+          ORDER BY price
+        `, [prod.product_key, fence_lo, fence_hi]);
+
+        const prices = priceRows.map(r => r.price).sort((a, b) => a - b);
+
+        // Build display name from slug (preserve known acronyms)
+        const displayName = prod.product_key
+          .split('-')
+          .map(w => ['rs', 'sr5', 'xr6', 'xr8', 'sv6', 'ss', 'gt', 'm18', 'm12', 'xgt', 'lxt', 'cxt', 'gb', 'tb', 'pro', 'max', 'se', 'oled', 'qled', '4wd', '2wd', 'awd', 'dsg', 'cvt', 'lpg'].includes(w) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1))
+          .join(' ');
+
+        if (prices.length < MIN_REAL) {
+          // ── Not enough real data — store AI anchor as the median ───────────
+          // Mark is_ai_only = TRUE so consumers know this is an estimate.
+          // Still useful for appraisals — far better than nothing.
+          await pool.query(`
+            INSERT INTO product_price_stats
+              (product_key, display_name, brand, category, variant,
+               sample_count, median_price, p25_price, p75_price, low_price, high_price,
+               ai_anchor_median, ai_anchor_low, ai_anchor_high,
+               is_ai_only, updated_at)
+            VALUES ($1,$2,$3,$4,$5, 0,$6,$7,$8,$9,$10, $11,$12,$13, TRUE, NOW())
+            ON CONFLICT (product_key) DO UPDATE SET
+              display_name     = EXCLUDED.display_name,
+              brand            = EXCLUDED.brand,
+              category         = EXCLUDED.category,
+              variant          = EXCLUDED.variant,
+              sample_count     = 0,
+              median_price     = EXCLUDED.ai_anchor_median,
+              p25_price        = EXCLUDED.ai_anchor_low,
+              p75_price        = EXCLUDED.ai_anchor_high,
+              low_price        = EXCLUDED.ai_anchor_low,
+              high_price       = EXCLUDED.ai_anchor_high,
+              ai_anchor_median = EXCLUDED.ai_anchor_median,
+              ai_anchor_low    = EXCLUDED.ai_anchor_low,
+              ai_anchor_high   = EXCLUDED.ai_anchor_high,
+              is_ai_only       = TRUE,
+              updated_at       = NOW()
+          `, [
+            prod.product_key, displayName,
+            prod.brand || null, prod.category || null, prod.variant || null,
+            anchor.asking_median, anchor.price_low, anchor.price_high,
+            anchor.price_low, anchor.price_high,
+            anchor.asking_median, anchor.price_low, anchor.price_high,
+          ]);
+          aiOnly++;
+          console.log(`[ProductStats] "${prod.product_key}" → AI anchor only ($${anchor.asking_median}, ${prices.length}/${MIN_REAL} real listings)`);
+          await new Promise(r => setTimeout(r, 80));
+          continue;
+        }
+
+        // ── Step D: IQR on anchor-filtered prices ─────────────────────────
+        // Even within ±40%, there can be clusters. IQR finds the tight majority.
+        const p25 = prices[Math.floor(prices.length * 0.25)];
+        const p75 = prices[Math.floor(prices.length * 0.75)];
+        const iqr  = p75 - p25;
+        const iqr_lo = Math.max(fence_lo, p25 - 1.5 * iqr);
+        const iqr_hi = Math.min(fence_hi, p75 + 1.5 * iqr);
+
+        const clean = prices.filter(p => p >= iqr_lo && p <= iqr_hi);
+
+        if (clean.length < MIN_REAL) {
+          // IQR reduced us below threshold — fall back to AI anchor
+          await pool.query(`
+            INSERT INTO product_price_stats
+              (product_key, display_name, brand, category, variant,
+               sample_count, median_price, p25_price, p75_price, low_price, high_price,
+               ai_anchor_median, ai_anchor_low, ai_anchor_high,
+               is_ai_only, updated_at)
+            VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9,$10,$11, $12,$13,$14, TRUE, NOW())
+            ON CONFLICT (product_key) DO UPDATE SET
+              display_name     = EXCLUDED.display_name,
+              sample_count     = EXCLUDED.sample_count,
+              median_price     = EXCLUDED.ai_anchor_median,
+              p25_price        = EXCLUDED.ai_anchor_low,
+              p75_price        = EXCLUDED.ai_anchor_high,
+              low_price        = EXCLUDED.ai_anchor_low,
+              high_price       = EXCLUDED.ai_anchor_high,
+              ai_anchor_median = EXCLUDED.ai_anchor_median,
+              ai_anchor_low    = EXCLUDED.ai_anchor_low,
+              ai_anchor_high   = EXCLUDED.ai_anchor_high,
+              is_ai_only       = TRUE,
+              updated_at       = NOW()
+          `, [
+            prod.product_key, displayName,
+            prod.brand || null, prod.category || null, prod.variant || null,
+            clean.length,
+            anchor.asking_median, anchor.price_low, anchor.price_high,
+            anchor.price_low, anchor.price_high,
+            anchor.asking_median, anchor.price_low, anchor.price_high,
+          ]);
+          aiOnly++;
+          console.log(`[ProductStats] "${prod.product_key}" → IQR reduced to ${clean.length} (need ${MIN_REAL}), using AI anchor ($${anchor.asking_median})`);
+          await new Promise(r => setTimeout(r, 80));
+          continue;
+        }
+
+        // ── Step E: Real median from clean majority ────────────────────────
+        // We have ≥5 real prices clustered within ±40% of AI anchor and within IQR.
+        // This is a trustworthy median.
+        const median   = clean[Math.floor(clean.length / 2)];
+        const cleanP25 = clean[Math.floor(clean.length * 0.25)];
+        const cleanP75 = clean[Math.floor(clean.length * 0.75)];
+
+        await pool.query(`
+          INSERT INTO product_price_stats
+            (product_key, display_name, brand, category, variant,
+             sample_count, median_price, p25_price, p75_price, low_price, high_price,
+             ai_anchor_median, ai_anchor_low, ai_anchor_high,
+             is_ai_only, updated_at)
+          VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9,$10,$11, $12,$13,$14, FALSE, NOW())
+          ON CONFLICT (product_key) DO UPDATE SET
+            display_name     = EXCLUDED.display_name,
+            brand            = EXCLUDED.brand,
+            category         = EXCLUDED.category,
+            variant          = EXCLUDED.variant,
+            sample_count     = EXCLUDED.sample_count,
+            median_price     = EXCLUDED.median_price,
+            p25_price        = EXCLUDED.p25_price,
+            p75_price        = EXCLUDED.p75_price,
+            low_price        = EXCLUDED.low_price,
+            high_price       = EXCLUDED.high_price,
+            ai_anchor_median = EXCLUDED.ai_anchor_median,
+            ai_anchor_low    = EXCLUDED.ai_anchor_low,
+            ai_anchor_high   = EXCLUDED.ai_anchor_high,
+            is_ai_only       = FALSE,
+            updated_at       = NOW()
+        `, [
+          prod.product_key, displayName,
+          prod.brand || null, prod.category || null, prod.variant || null,
+          clean.length, median, cleanP25, cleanP75, clean[0], clean[clean.length - 1],
+          anchor.asking_median, anchor.price_low, anchor.price_high,
+        ]);
+
+        built++;
+        console.log(`[ProductStats] "${prod.product_key}" → REAL median $${median} (${clean.length} listings, anchor $${anchor.asking_median})`);
+        await new Promise(r => setTimeout(r, 80));
+
+      } catch (e) {
+        console.error(`[ProductStats] Error on ${prod.product_key}:`, e.message);
+      }
+    }
+
+    const { rows } = await pool.query('SELECT COUNT(*)::INT AS cnt, COUNT(*) FILTER (WHERE is_ai_only = FALSE)::INT AS real_cnt FROM product_price_stats');
+    console.log(`[ProductStats] ✅ Done — ${built} real medians, ${aiOnly} AI-only, ${rows[0].cnt} total keys`);
+    console.log(`[ProductStats]    Real data: ${rows[0].real_cnt}/${rows[0].cnt} product keys have ≥${MIN_REAL} real listings`);
   } catch (e) {
     console.error('[ProductStats] Rebuild failed:', e.message);
   }
@@ -4390,6 +4710,94 @@ app.post('/admin/deals-rebuild', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /admin/stats-rebuild — run the full product stats pipeline right now
+// Triggers: AI product extraction → AI anchor fetch → anchor-gated IQR rebuild → deals rebuild
+// Use this to test the new pricing pipeline without waiting for 2am cron.
+app.post('/admin/stats-rebuild', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+
+    // Respond immediately so the browser doesn't time out — rebuild runs in background
+    res.json({ ok: true, message: 'Full stats rebuild started — check server logs for progress. Takes 2-5 mins depending on listing count.' });
+
+    console.log('[Admin/StatsRebuild] Manual rebuild triggered...');
+
+    // Step 1: extract precise product keys from all unextracted listings
+    await extractProductsNightly().catch(e => console.error('[Admin/StatsRebuild] Extract error:', e.message));
+
+    // Step 2: rebuild product_price_stats with AI anchor benchmark + IQR pipeline
+    await rebuildProductPriceStats().catch(e => console.error('[Admin/StatsRebuild] ProductStats error:', e.message));
+
+    // Step 3: rebuild keyword_price_stats and deals cache
+    await quickStatsAndDealsRebuild().catch(e => console.error('[Admin/StatsRebuild] QuickStats error:', e.message));
+
+    // Step 4: rebuild deals feed from fresh stats
+    await rebuildGlobalDeals().catch(e => console.error('[Admin/StatsRebuild] Deals error:', e.message));
+
+    // Step 5: report final state
+    const [prodStats, kwStats, dealsCache] = await Promise.all([
+      pool.query('SELECT COUNT(*)::INT AS total, COUNT(*) FILTER (WHERE is_ai_only IS NOT TRUE)::INT AS real FROM product_price_stats').catch(() => null),
+      pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats').catch(() => null),
+      redisGet('deals:global'),
+    ]);
+
+    console.log('[Admin/StatsRebuild] ✅ Complete:', {
+      product_keys:    prodStats?.rows[0]?.total || 0,
+      real_medians:    prodStats?.rows[0]?.real  || 0,
+      keyword_stats:   kwStats?.rows[0]?.cnt     || 0,
+      deals_in_cache:  dealsCache?.deals?.length || 0,
+    });
+
+  } catch (e) {
+    console.error('[Admin/StatsRebuild] Fatal error:', e.message);
+  }
+});
+
+// GET /admin/stats-status — check current state of product stats without rebuilding
+app.get('/admin/stats-status', authMiddleware, async (req, res) => {
+  try {
+    const user = await getUser(req.userId);
+    if (!isOwner(user)) return res.status(403).json({ error: 'Owner only' });
+
+    const [prodStats, kwStats, topReal, topAI, dealsCache] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*)::INT                                           AS total_keys,
+          COUNT(*) FILTER (WHERE is_ai_only IS NOT TRUE)::INT    AS real_medians,
+          COUNT(*) FILTER (WHERE is_ai_only = TRUE)::INT         AS ai_only,
+          AVG(sample_count) FILTER (WHERE is_ai_only IS NOT TRUE)::INT AS avg_samples
+        FROM product_price_stats
+      `),
+      pool.query('SELECT COUNT(*)::INT AS cnt FROM keyword_price_stats'),
+      pool.query(`
+        SELECT product_key, display_name, median_price, sample_count, is_ai_only
+        FROM product_price_stats WHERE is_ai_only IS NOT TRUE
+        ORDER BY sample_count DESC LIMIT 10
+      `),
+      pool.query(`
+        SELECT product_key, display_name, median_price, ai_anchor_median, is_ai_only
+        FROM product_price_stats WHERE is_ai_only = TRUE
+        ORDER BY updated_at DESC LIMIT 10
+      `),
+      redisGet('deals:global'),
+    ]);
+
+    res.json({
+      product_stats: prodStats.rows[0],
+      keyword_stats: kwStats.rows[0],
+      top_real_medians:  topReal.rows,
+      recent_ai_only:    topAI.rows,
+      deals_cache: {
+        count:    dealsCache?.deals?.length || 0,
+        built_at: dealsCache?.builtAt || null,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Browser-driven photo check ────────────────────────────────────────────────
 // Called from the frontend after an image loads in the Feed.
 // Browser sends base64 image data — avoids Facebook CDN expiry issues entirely.
@@ -5540,8 +5948,12 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
     async function rateOne(l, idx) {
       const kw = (l.keyword || keyword || '').toLowerCase().trim();
 
-      // ── Fetch DB price context ──────────────────────────────────────────
+      // ── Fetch DB price context via 4-tier product lookup ──────────────────
+      // Tries: exact product_key → fuzzy name → brand+category → AI anchor
+      // This means even new products with no DB data get an AI-estimated anchor price
       let dbMedian = null, dbP25 = null, dbP75 = null, dbSamples = null, dbSource = null;
+
+      // First try keyword_price_stats (fast, covers broad searches)
       if (kw) {
         try {
           const { rows } = await pool.query(
@@ -5555,19 +5967,21 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
           }
         } catch (_) {}
       }
-      // Fallback: product stats
+      // Then try 4-tier product lookup for exact/similar product match
       if (!dbMedian && l.title) {
         try {
-          const words = l.title.split(' ').filter(w => w.length > 2).slice(0, 3).join('%');
-          const { rows } = await pool.query(
-            `SELECT median_price, p25_price, p75_price, sample_count
-             FROM product_price_stats WHERE LOWER(display_name) LIKE LOWER($1)
-             ORDER BY sample_count DESC LIMIT 1`, [`%${words}%`]
-          );
-          if (rows[0]?.median_price && rows[0].sample_count >= 4) {
-            dbMedian = rows[0].median_price; dbP25 = rows[0].p25_price;
-            dbP75 = rows[0].p75_price; dbSamples = rows[0].sample_count;
-            dbSource = 'product_stats';
+          // Derive a product key from the title (same logic as extractProductsNightly)
+          const titleSlug = (l.title || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+          const priceData = await getProductPriceData(titleSlug, l.title, l.make || null, null, kw);
+          if (priceData) {
+            dbMedian  = priceData.median;
+            dbP25     = priceData.p25;
+            dbP75     = priceData.p75;
+            dbSamples = priceData.samples;
+            dbSource  = priceData.source;
+            if (priceData.isSimilar) {
+              console.log(`[RateBatch] Using similar product "${priceData.similarTo}" for "${(l.title||'').slice(0,40)}"`);
+            }
           }
         } catch (_) {}
       }
@@ -5595,8 +6009,10 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
       ].filter(Boolean);
 
       const priceCtx = dbMedian
-        ? `Market data: median $${dbMedian}, p25 $${dbP25}, p75 $${dbP75} (${dbSamples} AU FB Marketplace sales)`
-        : `No DB data — use your knowledge of current AU FB Marketplace second-hand prices`;
+        ? (dbSamples && dbSamples >= 5
+            ? `Real market data (${dbSamples} AU FB Marketplace listings): median $${dbMedian}, p25 $${dbP25}, p75 $${dbP75}`
+            : `AI-estimated market data (not enough real listings yet): median ~$${dbMedian}, p25 ~$${dbP25}, p75 ~$${dbP75} — treat as a guide, not a hard number`)
+        : `No market data — use your knowledge of current AU FB Marketplace second-hand prices`;
 
       const sellRates = CATEGORY_SELL_RATES[kwToSellCategory(kw)] || CATEGORY_SELL_RATES._default;
 
@@ -5971,23 +6387,24 @@ async function getKeywordPriceAnchor(keyword, sampleTitles = []) {
   const discPct  = Math.round(rates.sellDiscount * 100);
 
   const prompt = [
-    'You are an Australian Facebook Marketplace second-hand pricing expert.',
-    `Product keyword: "${keyword}"`,
-    sampleTitles.length ? `Example listing titles from real AU FB Marketplace:
-- ${sampleTitles.slice(0, 6).join('
-- ')}` : '',
+    'You are pricing secondhand items on Australian Facebook Marketplace.',
+    `Product: "${keyword}"`,
+    sampleTitles.length ? `Real listing titles from AU Facebook Marketplace:\n- ${sampleTitles.slice(0, 6).join('\n- ')}` : '',
     '',
-    'Give pricing for the MAIN product in good used condition (not accessories, not broken).',
+    'You must give SECONDHAND prices for this EXACT product in GOOD USED condition.',
+    'Facebook Marketplace AU private seller prices only. NOT retail, NOT eBay, NOT RRP.',
+    'FB Marketplace AU prices are typically 40-60% below RRP.',
+    'Be specific to this exact product - do not give generic category pricing.',
     'All prices in AUD.',
     '',
-    'Return ONLY valid JSON:',
+    'Return ONLY valid JSON, no markdown, no explanation:',
     '{',
-    '  "asking_median": <typical asking price on AU FB Marketplace>,',
-    `  "sell_price": <what it ACTUALLY sells for — typically ${discPct}% below asking on FB Marketplace>,`,
-    '  "price_low": <bottom 25% of market — worn/old/high-kms>,',
-    '  "price_high": <top 25% — near-new, low-use, great condition>',
+    '  "asking_median": <middle asking price on AU FB Marketplace for this exact product in good used condition>,',
+    `  "sell_price": <what buyers actually pay - typically ${discPct}% below asking>,`,
+    '  "price_low": <bottom 25% - worn, old, high usage, minor issues, still functional>,',
+    '  "price_high": <top 25% - near new, barely used, great condition>',
     '}',
-  ].filter(Boolean).join('
+  ].filter(Boolean).join('\n');
 ');
 
   try {
@@ -6075,28 +6492,39 @@ app.listen(PORT, async () => {
   // Runs once per deploy via a flag in Redis. Clears polluted price stats
   // and resets price pool flags so tonight's nightly rebuilds everything
   // cleanly with the anchor gate in place.
-  const RESET_FLAG = 'fr:migration:anchor-reset-v2'; // v2 = after keyword overhaul
+  const RESET_FLAG = 'fr:migration:anchor-reset-v4'; // v4 = AI anchor benchmark pipeline
   const alreadyReset = await redisGet(RESET_FLAG);
   if (!alreadyReset) {
     try {
-      console.log('[Migration] Running one-time anchor reset...');
+      console.log('[Migration] Running one-time v4 reset — AI anchor benchmark pipeline...');
 
-      // Clear polluted stats tables — will be rebuilt cleanly at 2am
+      // Clear all stats — will be rebuilt nightly with anchor-gated pipeline
+      await pool.query('TRUNCATE product_price_stats');
       await pool.query('TRUNCATE keyword_price_stats');
       await pool.query('TRUNCATE keyword_anchors');
 
-      // Reset price_quality on non-vehicle listings that weren't manually flagged
-      // so the nightly re-scores them through the anchor filter
+      // Clear cached AI anchors in Redis so they get re-fetched with the better prompt
+      // (The anchor prompt was updated to ask for secondhand FB prices specifically)
+      // We can't bulk-delete Redis keys by pattern here, but they'll expire in 30 days naturally.
+      // Force refresh by also clearing the anchor2: prefix keys at next nightly run.
+
+      // Reset extraction so all listings get re-processed with precise product keys
       const { rowCount } = await pool.query(`
         UPDATE listings
-        SET in_price_pool = TRUE,
-            price_quality = 'unscored'
+        SET extracted_at          = NULL,
+            extracted_product     = NULL,
+            extracted_brand       = NULL,
+            extracted_category    = NULL,
+            extracted_variant     = NULL,
+            extraction_confidence = NULL,
+            in_price_pool         = TRUE,
+            price_quality         = 'unscored'
         WHERE category != 'vehicle'
           AND price_quality NOT IN ('spam','damage','broken','swap','accessory')
       `);
 
       await redisSet(RESET_FLAG, { doneAt: new Date().toISOString() });
-      console.log(`[Migration] ✅ Done — reset ${rowCount} listings, cleared price stats.`);
+      console.log(`[Migration] ✅ Done — reset ${rowCount} listings. Stats will rebuild at 2am nightly cron.`);
     } catch (e) {
       console.error('[Migration] Reset failed:', e.message);
     }
