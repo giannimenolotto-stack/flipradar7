@@ -29,6 +29,33 @@ const pool = new Pool({
 
 pool.on('error', (e) => console.error('[DB] Pool error:', e.message));
 
+// ── Gemini call with exponential backoff on 503/429 ──────────────────────────
+// Drop-in wrapper for all Gemini API calls. Retries up to 4 times with
+// doubling delay (2s → 4s → 8s → 16s, capped 30s) on transient errors.
+async function geminiPost(url, body, opts = {}) {
+  const MAX_RETRIES = 4;
+  let delay = 2000;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await axios.post(url, body, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 25000,
+        ...opts,
+      });
+    } catch (e) {
+      const status = e.response?.status;
+      if ((status === 503 || status === 429) && attempt < MAX_RETRIES) {
+        console.warn(`[Gemini] ${status} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        await new Promise(r => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 30000);
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+
 async function initDB() {
   try {
     // ── Core listings table ───────────────────────────────
@@ -1467,19 +1494,74 @@ function scoreDBKeywordResult(stats) {
 }
 
 async function fetchBestVehiclePrice(make, model, year, mileage, opts = {}) {
+  // ── Tier A: DB waterfall (exact cohort match) ─────────────────────────────
   const dbVehicle = await getDBVehicleStats(make, model, year, mileage, opts);
-  if (!dbVehicle) {
-    console.log(`[VehiclePrice] No DB data for ${make} ${model} ${year} — using AI`);
-    return null;
+  if (dbVehicle) {
+    const score = scoreDBResult(dbVehicle);
+    if (score >= DB_TRUST_THRESHOLD) {
+      console.log(`[VehiclePrice] DB preferred (score ${score}) — ${make} ${model} ${year} tier ${dbVehicle.tier} n=${dbVehicle.samples}`);
+      return dbVehicle;
+    }
+    console.log(`[VehiclePrice] DB score ${score} < ${DB_TRUST_THRESHOLD} — trying comp blend`);
+  } else {
+    console.log(`[VehiclePrice] No DB cohort for ${make} ${model} ${year} — trying comp blend`);
   }
-  const score = scoreDBResult(dbVehicle);
-  if (score >= DB_TRUST_THRESHOLD) {
-    console.log(`[VehiclePrice] DB preferred (score ${score}) — ${make} ${model} ${year} tier ${dbVehicle.tier} n=${dbVehicle.samples}`);
-    return dbVehicle;
+
+  // ── Tier B: km-slide blend from nearby listings ───────────────────────────
+  // Slides prices of comparable listings (same make/model/series, different km/year)
+  // to the target km using depreciation per km, weighted by km proximity and recency.
+  // Better than AI alone because it uses real AU listing prices, just adjusted.
+  if (make && model && mileage) {
+    try {
+      const blendResult = await appraiseVehicleValue({
+        make, model, year, kms: mileage,
+        series:  opts.series  || null,
+        variant: opts.variant || null,
+      });
+
+      if (blendResult && blendResult.value && blendResult.confidence >= 20) {
+        const v = blendResult.value;
+        console.log(`[VehiclePrice] Comp blend — ${make} ${model} ${year} ${mileage}km → $${v} (${blendResult.source}, confidence ${blendResult.confidence}, ${blendResult.poolN} comps)`);
+
+        // Format as a vehicle stats object so the appraisal route handles it consistently
+        const iqrEstimate = Math.round(v * 0.25); // rough ±12.5% spread
+        return {
+          marketMedian:   v,
+          marketLow:      Math.round(v * 0.82),
+          marketHigh:     Math.round(v * 1.15),
+          samples:        blendResult.poolN,
+          rawSamples:     blendResult.poolN,
+          iqr:            iqrEstimate,
+          floor:          Math.round(v * 0.60),
+          ceiling:        Math.round(v * 1.50),
+          yearBand:       null,
+          mileageBand:    null,
+          cohortKey:      null,
+          tier:           `blend (${blendResult.source})`,
+          source:         'comp_blend',
+          sourceLabel:    `Comp blend · ${blendResult.poolN} real AU listings adjusted to ${Number(mileage).toLocaleString()}km`,
+          confidence:     blendResult.confidence / 100,
+          make, model,
+          series:         opts.series  || null,
+          variant:        opts.variant || null,
+          // Flag so the appraisal override uses appropriate confidence
+          isBlend:        true,
+          blendConfidence: blendResult.confidence,
+          aiEst:          blendResult.aiEst || null,
+          // belowThreshold so the appraisal prompt still runs AI but uses this as context
+          belowThreshold: blendResult.confidence < 50,
+        };
+      }
+    } catch (e) {
+      console.error('[VehiclePrice] Comp blend error:', e.message);
+    }
   }
-  console.log(`[VehiclePrice] DB score ${score} < ${DB_TRUST_THRESHOLD} — AI preferred for ${make} ${model} ${year}`);
-  // Still return it so the AI route can use it to sanity-check its output
-  return { ...dbVehicle, belowThreshold: true };
+
+  // ── Tier C: pure AI ───────────────────────────────────────────────────────
+  // No DB data, no comp blend — fall through to AI with whatever DB context we have
+  if (dbVehicle) return { ...dbVehicle, belowThreshold: true };
+  console.log(`[VehiclePrice] No data at all for ${make} ${model} ${year} — AI only`);
+  return null;
 }
 
 // ── Smart product price lookup ─────────────────────────────────────────────
@@ -6379,15 +6461,33 @@ async function getVehicleComps(target) {
 async function aiEstimateVehicle(target) {
   const ck = `vest:${[target.make,target.model,target.series,target.year,Math.round((target.kms||0)/20000)].join('|')}`;
   const cached = await redisGet(ck);
-  if (cached?.est) return cached.est;
+  if (cached?.est) return cached.est; // returns the likely sell price
   if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return null;
-  const prompt = `Typical USED private-sale price AUD on Australian Facebook Marketplace:\n${target.year||''} ${target.make||''} ${target.model||''} ${target.series||''} ${target.variant||''}, ${target.kms||'?'} km.\nReturn ONLY JSON: { "est_aud": number }`;
+  const carLabel = [target.year, target.make, target.model, target.series, target.variant].filter(Boolean).join(' ');
+  const kmsLabel = target.kms ? `${Number(target.kms).toLocaleString()} km` : 'unknown kms';
+  const prompt = `You are pricing a secondhand vehicle on Australian Facebook Marketplace.
+
+Vehicle: ${carLabel}, ${kmsLabel}
+
+Give the PRIVATE SALE price a SELLER would LIST this vehicle for on Facebook Marketplace AU.
+This is NOT trade-in value. NOT dealer price. NOT RedBook. NOT insurance value.
+It is what a private seller in Australia would ask for this exact vehicle in average condition.
+FB Marketplace private sale prices are typically 10-20% below what dealers charge.
+Higher kms and older age significantly reduce value.
+
+Return ONLY valid JSON:
+{
+  "asking_price": <what a private seller would list it for on FB Marketplace AU>,
+  "likely_sell_price": <what it would actually sell for after negotiation — typically 5-10% below asking>,
+  "price_low": <bottom of market — high kms, rough condition, needs work>,
+  "price_high": <top of market — low kms, great condition, well maintained with service history>
+}`;
   try {
     let text = '';
     if (GEMINI_API_KEY) {
-      const r = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      const r = await geminiPost(geminiUrl(GEMINI_SMART),
         {contents:[{parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingBudget:0}}},
-        {headers:{'Content-Type':'application/json'},timeout:10000});
+        {timeout:10000});
       text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'';
     } else {
       const r = await axios.post('https://api.anthropic.com/v1/messages',
@@ -6396,8 +6496,21 @@ async function aiEstimateVehicle(target) {
       text = r.data?.content?.[0]?.text||'';
     }
     const m = text.match(/\{[\s\S]*\}/);
-    const est = m ? Math.round(JSON.parse(m[0]).est_aud) : null;
-    if (est > 0) { await redisSet(ck,{est},14*24*3600); return est; }
+    if (m) {
+      const parsed = JSON.parse(m[0]);
+      // Use likely_sell_price as the estimate — that's what buyers actually pay
+      // Fall back to asking_price if sell price not returned
+      const est = Math.round(parsed.likely_sell_price || parsed.asking_price || parsed.est_aud || 0);
+      if (est > 0) {
+        await redisSet(ck, {
+          est,
+          asking:   Math.round(parsed.asking_price   || est * 1.08),
+          low:      Math.round(parsed.price_low      || est * 0.75),
+          high:     Math.round(parsed.price_high     || est * 1.25),
+        }, 14*24*3600);
+        return est;
+      }
+    }
   } catch(e) { console.error('[VEst]',e.message); }
   return null;
 }
