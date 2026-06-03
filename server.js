@@ -6222,13 +6222,28 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
         l.year    ? `${l.year}`                                    : null,
         l.mileage ? `${Number(l.mileage||0).toLocaleString()} km` : null,
         l.make    ? l.make                                         : null,
+        l.model   ? l.model                                        : null,
       ].filter(Boolean);
+
+      // ── KM impact context ─────────────────────────────────────────────────
+      // Tells AI explicitly how to adjust value based on kms.
+      // AU buyers are very sensitive to odometer — every 50k km shifts price significantly.
+      let kmContext = null;
+      if (l.mileage && l.mileage > 0) {
+        const km = l.mileage;
+        if (km < 50000)        kmContext = `LOW kms (${Number(km).toLocaleString()} km) — premium condition, commands top of market price`;
+        else if (km < 100000)  kmContext = `GOOD kms (${Number(km).toLocaleString()} km) — solid used, near market median`;
+        else if (km < 150000)  kmContext = `AVERAGE kms (${Number(km).toLocaleString()} km) — at or slightly below median, buyers start to negotiate harder`;
+        else if (km < 200000)  kmContext = `HIGH kms (${Number(km).toLocaleString()} km) — 10-20% below median expected, harder to sell, more risk`;
+        else if (km < 250000)  kmContext = `VERY HIGH kms (${Number(km).toLocaleString()} km) — 25-35% below median, slow to sell, needs strong price to move`;
+        else                   kmContext = `EXTREME kms (${Number(km).toLocaleString()} km) — significantly discounted market, only specialists buy these`;
+      }
 
       const priceCtx = dbMedian
         ? (dbSamples && dbSamples >= 5
-            ? `Real market data (${dbSamples} AU FB Marketplace listings): median $${dbMedian}, p25 $${dbP25}, p75 $${dbP75}`
-            : `AI-estimated market data (not enough real listings yet): median ~$${dbMedian}, p25 ~$${dbP25}, p75 ~$${dbP75} — treat as a guide, not a hard number`)
-        : `No market data — use your knowledge of current AU FB Marketplace second-hand prices`;
+            ? `Real market data (${dbSamples} AU FB Marketplace listings): median $${dbMedian}, p25 $${dbP25}, p75 $${dbP75}${kmContext ? '. NOTE: ' + kmContext : ''}`
+            : `AI-estimated market data: median ~$${dbMedian}${kmContext ? '. NOTE: ' + kmContext : ''} — adjust for kms and condition`)
+        : `No DB data — use your knowledge of AU FB Marketplace prices${kmContext ? '. ' + kmContext : ''}`;
 
       const sellRates = CATEGORY_SELL_RATES[kwToSellCategory(kw)] || CATEGORY_SELL_RATES._default;
 
@@ -6248,7 +6263,9 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
 LISTING:
 Keyword: "${kw}"
 Title: "${(l.title||'').slice(0,120)}"
-Price: ${l.price ? '$' + l.price + ' AUD' : 'not listed'}${specParts.length ? ' · ' + specParts.join(', ') : ''}${listingDesc ? `
+Price: ${l.price ? '$' + l.price + ' AUD' : 'not listed'}${specParts.length ? ' · ' + specParts.join(', ') : ''}${l.mileage ? `
+Odometer: ${Number(l.mileage).toLocaleString()} km` : ''}${l.year ? `
+Year: ${l.year}` : ''}${listingDesc ? `
 Description: "${listingDesc}"` : ''}
 
 MARKET CONTEXT (AU Facebook Marketplace secondhand prices):
@@ -6270,6 +6287,16 @@ SECONDHAND FB MARKETPLACE REALITY:
 - Assume you need to sell for 10-15% below what similar listings are asking to actually move it
 - Factor in your costs: transport, cleaning, relisting time, platform fees
 - Minimum $150 profit to be worth green. Minimum $400 to be worth rainbow.
+
+KM ADJUSTMENT FOR VEHICLES (critical — do not ignore):
+- The market data median is for average kms. You MUST adjust for the actual odometer.
+- Under 80k km: item worth 10-20% MORE than median — buyers pay premium for low kms
+- 80k-130k km: near median — standard used vehicle pricing
+- 130k-180k km: 10-20% LESS than median — buyers negotiate hard
+- 180k-250k km: 20-35% LESS than median — hard to sell, limited buyer pool
+- Over 250k km: 35-50% LESS than median — specialist/tradie buyers only, very slow
+- Apply this adjustment BEFORE calculating profit margin
+- A 200k km HiLux listed at "below market median" may actually be above market for its kms
 
 INSTANT RED FLAGS (automatic red rating):
 - Photo shows damage, heavy rust, broken parts, flood or hail damage
