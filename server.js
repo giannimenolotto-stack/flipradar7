@@ -6262,12 +6262,44 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
       let kmContext = null;
       if (l.mileage && l.mileage > 0) {
         const km = l.mileage;
-        if (km < 50000)        kmContext = `LOW kms (${Number(km).toLocaleString()} km) — premium condition, commands top of market price`;
-        else if (km < 100000)  kmContext = `GOOD kms (${Number(km).toLocaleString()} km) — solid used, near market median`;
-        else if (km < 150000)  kmContext = `AVERAGE kms (${Number(km).toLocaleString()} km) — at or slightly below median, buyers start to negotiate harder`;
-        else if (km < 200000)  kmContext = `HIGH kms (${Number(km).toLocaleString()} km) — 10-20% below median expected, harder to sell, more risk`;
-        else if (km < 250000)  kmContext = `VERY HIGH kms (${Number(km).toLocaleString()} km) — 25-35% below median, slow to sell, needs strong price to move`;
-        else                   kmContext = `EXTREME kms (${Number(km).toLocaleString()} km) — significantly discounted market, only specialists buy these`;
+        const kmStr = Number(km).toLocaleString();
+
+        // Detect vehicle type from title/make for context-aware km thresholds
+        const titleLower = (l.title || '').toLowerCase();
+        const makeLower  = (l.make  || '').toLowerCase();
+
+        // Diesel 4WDs and heavy-duty vehicles hold value at high kms
+        // e.g. HiLux, LandCruiser, Patrol, Prado, Triton, Ranger, BT-50, D-Max, Navara
+        const isDiesel4WD = /hilux|land.?cruiser|landcruiser|prado|patrol|triton|ranger|bt.?50|bt50|d.?max|dmax|navara|pajero|fortuner|everest|colorado|patrol|territory/i.test(titleLower + ' ' + makeLower);
+
+        // Commercial vans and work vehicles that buyers expect high kms on
+        // e.g. Mercedes Vito, Sprinter, Transit, HiAce, Express, Ducato
+        const isCommercialVan = /vito|sprinter|transit|hiace|hi.?ace|express|ducato|crafter|trafic|vivaro|master/i.test(titleLower + ' ' + makeLower);
+
+        // Performance/sports cars where buyers are km-sensitive
+        // e.g. WRX, STI, EVO, Type R, M3, RS, AMG, GTI
+        const isSportsPerformance = /wrx|sti|evo|lancer|type.?r|civic.?r|m3|m4|m5|rs3|rs4|rs6|amg|gti|golf.?r|supra|gt86|86|brz|370z|350z|mustang|camaro/i.test(titleLower + ' ' + makeLower);
+
+        if (isDiesel4WD || isCommercialVan) {
+          // These vehicles are built for high kms — buyers expect and accept it
+          if (km < 100000)       kmContext = `LOW kms (${kmStr} km) — very desirable for this type, commands premium`;
+          else if (km < 200000)  kmContext = `NORMAL kms (${kmStr} km) — standard working vehicle usage, near market median`;
+          else if (km < 300000)  kmContext = `HIGHER kms (${kmStr} km) — slight discount expected but strong demand remains, these engines are built for it`;
+          else                   kmContext = `HIGH kms (${kmStr} km) — 15-25% below median expected, buyers want mechanical assurance`;
+        } else if (isSportsPerformance) {
+          // Performance cars — buyers are very km sensitive, often driven hard
+          if (km < 80000)        kmContext = `LOW kms (${kmStr} km) — highly desirable for performance car, strong premium`;
+          else if (km < 120000)  kmContext = `MODERATE kms (${kmStr} km) — acceptable, near median for this type`;
+          else if (km < 160000)  kmContext = `HIGHER kms (${kmStr} km) — 15-25% discount expected, buyers wonder if it was driven hard`;
+          else                   kmContext = `HIGH kms (${kmStr} km) — significant discount needed, limited buyer pool for high-km performance cars`;
+        } else {
+          // Standard passenger cars and everything else
+          if (km < 80000)        kmContext = `LOW kms (${kmStr} km) — below average, commands premium over median`;
+          else if (km < 150000)  kmContext = `AVERAGE kms (${kmStr} km) — normal used car range, near market median`;
+          else if (km < 200000)  kmContext = `ABOVE AVERAGE kms (${kmStr} km) — 10-20% below median expected, buyers negotiate harder`;
+          else if (km < 250000)  kmContext = `HIGH kms (${kmStr} km) — 20-35% below median, harder to sell, limited buyer pool`;
+          else                   kmContext = `VERY HIGH kms (${kmStr} km) — significant discount needed, mostly tradie/budget buyers`;
+        }
       }
 
       const priceCtx = dbMedian
@@ -6310,14 +6342,19 @@ SECONDHAND FB MARKETPLACE REALITY:
 - Minimum $150 profit to be worth green. Minimum $400 to be worth rainbow.
 
 KM ADJUSTMENT FOR VEHICLES (critical — do not ignore):
-- The market data median is for average kms. You MUST adjust for the actual odometer.
-- Under 80k km: item worth 10-20% MORE than median — buyers pay premium for low kms
-- 80k-130k km: near median — standard used vehicle pricing
-- 130k-180k km: 10-20% LESS than median — buyers negotiate hard
-- 180k-250k km: 20-35% LESS than median — hard to sell, limited buyer pool
-- Over 250k km: 35-50% LESS than median — specialist/tradie buyers only, very slow
-- Apply this adjustment BEFORE comparing listed price to market
-- A 200k km HiLux listed at "below market median" may actually be above market for its kms
+- DIESEL 4WDs & COMMERCIAL VANS (HiLux, LandCruiser, Prado, Patrol, Ranger, Triton, Navara, D-Max,
+  Mercedes Vito, Sprinter, Transit, HiAce): these engines are BUILT for high kms.
+  200k-300k km is normal working life — do NOT apply the same discount as a passenger car.
+  Buyers expect and accept high kms on these. 200k km HiLux at the right price is still green.
+
+- PERFORMANCE/SPORTS CARS (WRX, STI, EVO, Type R, M3, AMG, GTI, Golf R, Supra):
+  buyers are km-sensitive — assume it was driven hard. 150k+ km = significant discount needed.
+
+- STANDARD PASSENGER CARS (Corolla, Civic, Mazda3, Camry etc):
+  Under 150k = average, near median. 150-200k = 10-20% discount. Over 200k = 20-35% discount.
+
+- Apply this BEFORE comparing listed price to market median.
+- The km note above already tells you which category this vehicle is in.
 
 INSTANT RED FLAGS (automatic red rating):
 - Photo shows damage, heavy rust, broken parts, flood or hail damage
