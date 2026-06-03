@@ -6172,21 +6172,30 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
         } catch (_) {}
       }
 
-      // ── Check DB for existing image analysis ────────────────────────────
-      // If the AI gate already analysed this image at scrape time, use that result.
-      // Avoids re-fetching an image that may have already expired on FB CDN.
+      // ── Fetch description + image analysis from DB in one query ────────
+      // Description: stored at scrape time if SociaVault returned it in search results.
+      //   No extra credit cost — it's already in the DB.
+      //   Gives Gemini the same context the appraisal has: condition signals,
+      //   service history, damage notes, "selling due to upgrade" etc.
+      // img_condition: from the AI gate that ran at scrape time while image was fresh.
       let priorCondition = l.imgCondition || null;
-      let priorMatches   = true; // default assume it matches
+      let priorMatches   = true;
+      let listingDesc    = null;
 
-      if (!priorCondition && l.id) {
+      if (l.id) {
         try {
-          const { rows: imgRows } = await pool.query(
-            `SELECT img_condition, img_matches_keyword FROM listings WHERE listing_id = $1`,
+          const { rows: dbRows } = await pool.query(
+            `SELECT description, img_condition, img_matches_keyword
+             FROM listings WHERE listing_id = $1`,
             [String(l.id)]
           );
-          if (imgRows[0]) {
-            priorCondition = imgRows[0].img_condition || null;
-            priorMatches   = imgRows[0].img_matches_keyword !== false;
+          if (dbRows[0]) {
+            // Description — cap at 300 chars, same as appraisal uses
+            listingDesc    = dbRows[0].description
+              ? dbRows[0].description.slice(0, 300).trim()
+              : null;
+            priorCondition = priorCondition || dbRows[0].img_condition || null;
+            priorMatches   = dbRows[0].img_matches_keyword !== false;
           }
         } catch (_) {}
       }
@@ -6234,12 +6243,18 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
           ? `No live photo available. ${conditionCtx}.`
           : `No photo available — rate based on title and price only.`;
 
+      // Build description context — extract key signals for the prompt
+      // Don't dump the whole description, pull out what matters for flip decisions
+      const descCtx = listingDesc
+        ? `Seller description: "${listingDesc}"`
+        : null;
+
       const prompt = `You are an expert Australian Facebook Marketplace flipper rating a single listing.
 
 Search keyword: "${kw}"
 Title: "${(l.title||'').slice(0,120)}"
 Price: ${l.price ? '$' + l.price + ' AUD' : 'not listed'}${specParts.length ? ' · ' + specParts.join(', ') : ''}
-${priceCtx}
+${descCtx ? descCtx + '\n' : ''}${priceCtx}
 Typical sell discount for this category: ${Math.round(sellRates.sellDiscount * 100)}% below asking median
 Typical flip costs: $${sellRates.flipCostLow}–$${sellRates.flipCostHigh}
 
