@@ -6247,16 +6247,9 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
 
       const sellRates = CATEGORY_SELL_RATES[kwToSellCategory(kw)] || CATEGORY_SELL_RATES._default;
 
-      // Build condition context — use prior analysis if image fetch failed
-      const conditionCtx = priorCondition
-        ? `Prior image analysis found condition: ${priorCondition}${!priorMatches ? ' — WARNING: photo may not match keyword' : ''}`
-        : null;
-
       const imgNote = imgData
-        ? `A photo is attached. Assess condition, verify it matches the keyword, check for damage or retail stock photos.`
-        : conditionCtx
-          ? `No live photo available. ${conditionCtx}.`
-          : `No photo available — rate based on title and price only.`;
+        ? `A photo is attached. Use it to verify the item matches the keyword and assess overall quality.`
+        : `No photo available — rate based on title and price only.`;
 
       const prompt = `You are a ruthless Australian Facebook Marketplace flipper. Your job is to find cheap deals to buy and resell for profit. You pass on 90% of listings.
 
@@ -6270,10 +6263,9 @@ Description: "${listingDesc}"` : ''}
 
 
 ${imgNote}
-${conditionCtx ? `Prior condition check: ${conditionCtx}` : ''}
 
 YOUR JOB:
-1. Look at the photo first — what is the actual condition? Damage, wear, missing parts?
+1. Look at the photo — does it match the keyword? Is this a real secondhand item?
 2. Read the description — any red flags? (needs work, as is, not running, no RWC, engine issues, flood, hail, project car, parts only)
 3. Is this a realistic flip? Can you buy it, clean it up, relist and profit after costs?
 4. What does this actually sell for secondhand on AU Facebook Marketplace right now?
@@ -6314,7 +6306,7 @@ red — pass. Overpriced, bad condition, red flags in description, or no real re
 relevant: false = wrong item / accessory / kids toy / service / hire / wholesale stock
 
 Return ONLY JSON:
-{"rating":"yellow","reason":"One specific reason max 8 words","relevant":true}`;
+{"rating":"yellow","reason":"One specific reason about price or market only — no condition words","relevant":true}`;
 
       try {
         let text = '';
