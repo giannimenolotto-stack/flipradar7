@@ -3094,45 +3094,48 @@ async function scoreDealsWithAINightly() {
       try {
         const median    = row.median_price || null;
         const product   = row.extracted_product || row.title || row.keyword || 'unknown item';
-        const condition = row.img_condition || 'unknown';
         const desc      = (row.description || '').slice(0, 300);
         const isBroken  = /\b(broken|faulty|not working|dead|cracked|smashed|parts only|as is|for parts|damaged|repair|needs work|spares)\b/i.test((row.title || '') + ' ' + desc);
 
-        const prompt = `You are an expert Australian marketplace flipper scoring a Facebook Marketplace listing as a flip opportunity.
+        // Vehicle-type-aware km context
+        let flipKmCtx = '';
+        if (row.kms && row.kms > 0 && row.category === 'vehicle') {
+          const km = row.kms; const kmStr = Number(km).toLocaleString();
+          const tl = (row.title||'').toLowerCase();
+          const isDiesel4WD = /hilux|land.?cruiser|prado|patrol|triton|ranger|bt.?50|d.?max|navara|pajero|fortuner|everest|colorado/i.test(tl);
+          const isVan = /vito|sprinter|transit|hiace|ducato|crafter|trafic/i.test(tl);
+          const isSports = /wrx|sti|evo|type.?r|m3|m4|m5|rs3|rs4|amg|gti|golf.?r|supra/i.test(tl);
+          if (isDiesel4WD || isVan) {
+            flipKmCtx = km < 200000 ? kmStr+'km — normal for diesel/van, no discount' : km < 300000 ? kmStr+'km — higher but acceptable for diesel/van' : kmStr+'km — very high, 15-25% below median';
+          } else if (isSports) {
+            flipKmCtx = km < 120000 ? kmStr+'km — ok for performance car' : kmStr+'km — HIGH for performance car, assume driven hard';
+          } else {
+            flipKmCtx = km < 150000 ? kmStr+'km — average' : km < 200000 ? kmStr+'km — above average, 10-20% below median' : kmStr+'km — high, 20-35% below median';
+          }
+        }
 
-Listing:
-- Product: ${product}
-- Title: "${(row.title||'').slice(0,120)}"
-- Description: "${desc}"
-- Listed price: ${row.price} AUD
-- Photo condition assessment: ${condition}
-- Keyword median market price: ${median ? '$'+median+' AUD' : 'unknown'}
-- Market p25/p75: ${row.p25_price ? '$'+row.p25_price : '?'} / ${row.p75_price ? '$'+row.p75_price : '?'}
+        const prompt = `You are scoring an AU Facebook Marketplace listing as a flip opportunity. You are ruthless — most listings are NOT worth flipping.
 
-- Appears broken/faulty: ${isBroken}
+LISTING:
+Title: "${(row.title||'').slice(0,120)}"
+Price: $${row.price} AUD${row.year ? ' · ' + row.year : ''}${flipKmCtx ? ' · ' + flipKmCtx : ''}
+Description: "${desc}"
+AU FB Marketplace keyword median: ${median ? '$' + median : 'unknown'}
+Broken/faulty signals: ${isBroken ? 'YES' : 'none'}
 
-Score this as a FLIP OPPORTUNITY for someone who buys cheap and resells for profit in Australia.
-Consider: actual resale value, condition, demand, how fast it sells, fix cost if broken.
+NEVER FLIP (score 0-15): used mattresses, IKEA/particle-board flat-pack furniture, generic budget sofas (Kmart/no-brand fabric), heavy white goods (washers/dryers/fridges unless Miele/Fisher&Paykel/Smeg), kids toys, generic non-brand clothing.
+GOOD FLIPS (score 60+): iPhones/Samsung, MacBooks, PS5/Xbox/Switch, Milwaukee/DeWalt/Makita/Festool, cameras, quality bikes, diesel 4WDs, motorcycles, camping fridges, Weber/Traeger, named watches, sneakers, leather sofas, designer furniture (Jardan/Nick Scali/Herman Miller/Hay/Muuto), solid hardwood tables, Aeron/Steelcase chairs.
 
-Return ONLY valid JSON (no markdown, no explanation):
+Price these at AU Facebook Marketplace PRIVATE SALE prices — NOT retail, NOT eBay, NOT RRP.
+
+Return ONLY valid JSON:
 {
-  "flip_score": <0-100 integer. 0=waste of time, 100=exceptional flip>,
+  "flip_score": <0-100>,
   "deal_type": "underpriced" | "broken_fixable" | "rare_find" | "bulk_lot" | "not_a_deal",
   "demand": "high" | "medium" | "low",
-  "estimated_resale": <realistic AUD resale price as integer, or null>,
-  "estimated_margin": <estimated profit after buy + fix costs, or null>,
-  "fix_cost_estimate": <estimated repair cost in AUD if broken, else null>,
-  "reasoning": "<one concise sentence explaining the score, max 80 chars>"
-}
-
-Scoring guide:
-- 85-100: Exceptional — clear undervalue, high demand, easy flip, great margin
-- 65-84: Solid — good margin, reasonable demand, low risk  
-- 45-64: Worth a look — some upside but competition or condition concerns
-- 20-44: Marginal — thin margin, slow seller, or condition risk
-- 0-19: Not worth it — overpriced, no demand, or too risky
-- broken_fixable: only if fixable by a competent hobbyist for <30% of resale value
-- rare_find: limited supply, collector interest, or hard to find locally`;
+  "estimated_resale": <realistic AU FB private sale price as integer, or null>,
+  "reasoning": "<one sentence max 80 chars, price vs AU FB market>"
+}`;
 
         let text = '';
         if (GEMINI_API_KEY) {
@@ -6362,7 +6365,11 @@ INSTANT RED FLAGS (automatic red rating):
 - Retail stock photo or ORDER NOW advertisement (relevant:false)
 - Kids toy version of adult item (relevant:false)
 - Wrong item in photo (relevant:false)
-- Used mattress, generic flat-pack furniture, generic white goods — almost never worth flipping
+- Used mattress — hygiene issues, almost no resale in AU. Always red.
+- IKEA / flat-pack particle board furniture — depreciates to zero. Always red.
+- Generic budget sofas (Kmart/Fantastic/no-brand fabric) — no demand, hard to move. Red.
+- White goods (washers/dryers/fridges) — only green if premium brand (Miele/Fisher&Paykel/Smeg) at 40%+ below market
+- NOTE: leather sofas, solid timber furniture, designer brands (Jardan/Nick Scali/Herman Miller) CAN flip well — rate on price vs market
 - Listed price is at or above what it actually sells for on AU FB
 
 RATING SCALE:
@@ -6374,7 +6381,7 @@ red — pass. Overpriced, bad condition, red flags in description, or no real re
 relevant: false = wrong item / accessory / kids toy / service / hire / wholesale stock
 
 Return ONLY JSON:
-{"rating":"yellow","reason":"3 words max","relevant":true}`;
+{"rating":"yellow","reason":"Short sentence — price vs market, key reason why","relevant":true}`;
 
       try {
         let text = '';
@@ -6450,7 +6457,7 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
     const cr = await consumeAppraisal(req.userId);
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
-    var parts = [{ text: prompt }];
+    var parts = [{ text: finalPrompt }];
 
     // If there's an image URL, fetch and include it
     if (imageUrl) {
