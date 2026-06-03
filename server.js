@@ -6172,17 +6172,17 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
         } catch (_) {}
       }
 
-      // ── Fetch description + image analysis from DB in one query ────────
-      // Description: stored at scrape time if SociaVault returned it in search results.
-      //   No extra credit cost — it's already in the DB.
-      //   Gives Gemini the same context the appraisal has: condition signals,
-      //   service history, damage notes, "selling due to upgrade" etc.
-      // img_condition: from the AI gate that ran at scrape time while image was fresh.
+      // ── Get description + image analysis ────────────────────────────────
+      // Priority 1: description sent directly from frontend payload (no DB cost)
+      //   SociaVault returns descriptions on ~50% of search results — these come
+      //   through on the listing object and get passed here directly.
+      // Priority 2: DB query for the rest (no extra SociaVault credit)
+      //   Covers listings where description came through on a previous scan.
       let priorCondition = l.imgCondition || null;
       let priorMatches   = true;
-      let listingDesc    = null;
+      let listingDesc    = l.description || null; // from frontend payload if available
 
-      if (l.id) {
+      if ((!listingDesc || !priorCondition) && l.id) {
         try {
           const { rows: dbRows } = await pool.query(
             `SELECT description, img_condition, img_matches_keyword
@@ -6190,10 +6190,10 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
             [String(l.id)]
           );
           if (dbRows[0]) {
-            // Description — cap at 300 chars, same as appraisal uses
-            listingDesc    = dbRows[0].description
-              ? dbRows[0].description.slice(0, 300).trim()
-              : null;
+            // Only use DB description if we don't already have one from payload
+            if (!listingDesc && dbRows[0].description) {
+              listingDesc = dbRows[0].description.slice(0, 300).trim();
+            }
             priorCondition = priorCondition || dbRows[0].img_condition || null;
             priorMatches   = dbRows[0].img_matches_keyword !== false;
           }
@@ -6285,15 +6285,39 @@ PRICING REALITY:
 - IKEA furniture "below market" is irrelevant - the secondhand market is nearly zero
 - If no DB data: use real AU FB Marketplace knowledge, not RRP or retail prices
 
-RATING GUIDE:
-- rainbow: exceptional flip - high demand item, clearly underpriced, good condition in photo, $300+ realistic margin after costs
-- green: solid deal - real liquid market, meaningfully below market, decent condition, realistic profit after costs
-- yellow: fair price, slow market, or condition uncertain
-- red: overpriced, no real resale market, poor condition, or category that does not flip (mattress, IKEA, generic furniture)
-- relevant: false if wrong item, accessory, kids toy, service, hire, retail wholesale stock
+HARD RATING RULES — apply these strictly, no exceptions:
+
+rainbow (exceptional flip):
+  - Listed at 40%+ below market median AND condition is good/great in photo
+  - Realistic profit after ALL costs (buy + prep + fees + time) = $500+
+  - High demand item that sells within days (phone, console, name-brand tool, vehicle)
+  - Do NOT give rainbow if condition is unknown, poor, or description has any red flags
+
+green (solid deal):
+  - Listed at 20-40% below market median AND condition is at least fair
+  - Realistic profit after ALL costs = $150-500
+  - Real liquid market exists for this exact item
+  - Do NOT give green if: condition unknown and title has no positive signals,
+    description mentions damage/issues/as-is/needs work, or margin is borderline
+
+yellow (fair — watch but don't buy now):
+  - Listed near market median (within 20% either way)
+  - OR condition is uncertain / description is vague
+  - OR item is real but market is slow
+
+red (pass — not worth pursuing):
+  - Listed above market median
+  - OR condition is poor/damaged
+  - OR category has no real resale market (furniture, mattress, generic white goods)
+  - OR description has ANY of: needs work, as is, not working, damaged, for parts,
+    project, no RWC, unregistered (vehicles), engine issues, rust, flood, hail
+  - OR margin after realistic costs is under $100
+  - When in doubt → red. A serious flipper passes 90% of listings.
+
+relevant: false if wrong item, accessory, kids toy version, service, hire, retail/wholesale stock
 
 Return ONLY JSON:
-{"rating":"green","reason":"Brief reason max 8 words","relevant":true}`;
+{"rating":"green","reason":"Brief specific reason max 8 words","relevant":true}`;
 
       try {
         let text = '';
