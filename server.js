@@ -6513,6 +6513,123 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
   }
 });
 
+
+
+// POST /ai/general — general item appraisal
+app.post('/ai/general', authMiddleware, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
+    const { title, price, keyword, listingId, listingUrl, imageUrl, imageBase64, imageMime } = req.body;
+    if (!price) return res.status(400).json({ error: 'price required' });
+
+    const cached = await getAppraisalCache(listingId, title, price, keyword);
+    if (cached) { console.log('[AI/general] Cache hit'); return res.json({ ...cached, usedCache: true }); }
+    const cr = await consumeAppraisal(req.userId);
+    if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
+
+    let fullDescription = '', condition = null;
+    if (listingId || listingUrl) {
+      try {
+        const details = await fetchListingDetails(listingId, listingUrl);
+        if (details) {
+          fullDescription = details.description || '';
+          condition       = details.condition   || null;
+          console.log(`[AI/general] SociaVault — ${fullDescription.length} chars`);
+        }
+      } catch (e) { console.error('[AI/general] SociaVault:', e.message); }
+    }
+
+    const kw = (keyword || title || '').toLowerCase();
+    let priceContext = 'No market data — use your knowledge of AU FB Marketplace secondhand prices.';
+    try {
+      const titleSlug = kw.replace(/[^a-z0-9]+/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').slice(0,60);
+      const pd = await getProductPriceData(titleSlug, title, null, null, kw);
+      if (pd) {
+        const src = pd.isAiOnly ? 'AI estimate' : (pd.samples + ' real AU FB listings');
+        priceContext = 'Market data (' + src + '): median $' + pd.median + ', p25 $' + pd.p25 + ', p75 $' + pd.p75;
+        if (pd.sellPrice) priceContext += '. Typical AU FB sell price: $' + pd.sellPrice;
+      }
+    } catch (_) {}
+
+    const sellCat   = kwToSellCategory(kw);
+    const sellRates = CATEGORY_SELL_RATES[sellCat] || CATEGORY_SELL_RATES._default;
+    const sellMulti = (1 - sellRates.sellDiscount).toFixed(2);
+    const descBlock = (fullDescription || '(not provided)').slice(0, 800);
+    const condLine  = condition ? '\nCondition: ' + condition : '';
+
+    const prompt = 'You are an expert Australian Facebook Marketplace flipper. Give a sharp, honest appraisal.\n\n'
+      + 'ITEM DETAILS:\n'
+      + 'Title: ' + (title || '(not provided)') + '\n'
+      + 'Listed Price: $' + Number(price).toLocaleString() + ' AUD' + condLine + '\n'
+      + 'Search keyword: ' + kw + '\n\n'
+      + priceContext + '\n\n'
+      + 'FULL LISTING DESCRIPTION:\n"""\n' + descBlock + '\n"""\n\n'
+      + 'WHAT THIS ITEM ACTUALLY SELLS FOR ON AU FACEBOOK MARKETPLACE:\n'
+      + 'Category: ' + sellCat + '\n'
+      + 'Typical sell discount off asking median: ' + Math.round(sellRates.sellDiscount * 100) + '%\n'
+      + 'Typical flip costs: $' + sellRates.flipCostLow + '-' + sellRates.flipCostHigh + ' (cleaning, listing, meeting buyer)\n\n'
+      + 'NEVER FLIP (verdict PASS): used mattresses, IKEA flat-pack, generic budget sofas, heavy white goods unless premium brand.\n'
+      + 'GOOD FLIPS: phones, laptops, consoles, name-brand tools, cameras, quality bikes, leather sofas, designer furniture (Jardan/Herman Miller/Nick Scali), camping fridges, Weber/Traeger, watches, named sneakers.\n\n'
+      + 'CALCULATE STEP BY STEP:\n'
+      + 'Step 1 - Realistic sell price: market median x ' + sellMulti + '\n'
+      + 'Step 2 - Flip costs: $' + sellRates.flipCostLow + '-' + sellRates.flipCostHigh + '\n'
+      + 'Step 3 - Repairs if needed: estimate from description\n'
+      + 'Step 4 - estimatedProfit = sell price - buy price - costs\n\n'
+      + 'VERDICT: roiPercent > 30% = STEAL, 15-30% = GOOD DEAL, 5-15% = FAIR, below 5% = PASS\n\n'
+      + 'Respond ONLY in this exact JSON (no markdown):\n'
+      + '{"verdict":"STEAL|GOOD DEAL|FAIR|PASS","dealScore":0,"oneLiner":"","extractedTitle":"","extractedPrice":0,"estimatedMarketValue":0,"estimatedResellLow":0,"estimatedResellHigh":0,"recommendedOffer":0,"walkAwayPrice":0,"estimatedProfit":0,"roiPercent":0,"timeToSell":"1-2 weeks","demandLevel":"Moderate","whyItsWorth":"","greenFlags":[],"redFlags":[],"whatToCheckInPerson":[],"negotiationScript":"","isBrokenOrProject":false,"repairEstimate":0,"aiGenerated":true}';
+
+    let text = '';
+    if (GEMINI_API_KEY) {
+      const parts = [];
+      if (imageBase64) {
+        parts.push({ inline_data: { mime_type: imageMime || 'image/jpeg', data: imageBase64 } });
+      } else if (imageUrl) {
+        try {
+          const imgRes = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 8000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' } });
+          parts.push({ inline_data: { mime_type: imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg',
+            data: Buffer.from(imgRes.data).toString('base64') }});
+        } catch (_) {}
+      }
+      parts.push({ text: prompt });
+      const r = await geminiPost(geminiUrl(GEMINI_SMART),
+        { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+        { timeout: 30000 });
+      text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else {
+      const r = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001', max_tokens: 1500,
+        messages: [{ role: 'user', content: prompt }],
+      }, { headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, timeout: 30000 });
+      text = r.data?.content?.[0]?.text || '';
+    }
+
+    const clean = text.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    let parsed = null;
+    try {
+      const s = clean.indexOf('{'); const e = clean.lastIndexOf('}');
+      if (s !== -1 && e !== -1) parsed = JSON.parse(clean.slice(s, e + 1));
+    } catch (_) {}
+
+    if (!parsed || !parsed.verdict) {
+      console.error('[AI/general] Bad response:', clean.slice(0, 200));
+      return res.status(500).json({ error: 'Could not parse AI response. Try again.' });
+    }
+
+    const result = { ...parsed, usedCache: false };
+    if (listingId || (title && price)) {
+      await setAppraisalCache(listingId, title, price, keyword, result)
+        .catch(e => console.error('[AprCache] Write error (general):', e.message));
+    }
+    console.log('[AI/general] "' + (title||'').slice(0,40) + '" -> ' + parsed.verdict + ' (' + parsed.dealScore + ')');
+    res.json(result);
+  } catch (e) {
+    console.error('[AI/general]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
 // ── Appraisal cache admin ─────────────────────────────────
 // GET /appraisal-cache?listingId=xxx  — check if a result is cached
 app.get('/appraisal-cache', authMiddleware, async (req, res) => {
