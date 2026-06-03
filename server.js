@@ -6350,8 +6350,13 @@ ${imgNote}
 YOUR JOB:
 1. Look at the photo — does it match the keyword? Is this a real secondhand item?
 2. Read the description — any red flags? (needs work, as is, not running, no RWC, engine issues, flood, hail, project car, parts only)
-3. Is this a realistic flip? Can you buy it, clean it up, relist and profit after costs?
+3. Is this a realistic flip? Can you buy it, clean it up, relist and profit?
 4. What does this actually sell for secondhand on AU Facebook Marketplace right now?
+
+REASON FIELD — must be a clean price verdict, NOT analysis:
+GOOD: "25% below typical sell price" | "Overpriced for AU market" | "Strong demand, good price" | "No real resale market"
+BAD: "The title says X but..." | "The keyword is..." | "Despite claiming..." | anything quoting the title or describing your reasoning
+The reason is what the USER sees on the card. Keep it short and market-focused.
 
 SECONDHAND FB MARKETPLACE REALITY:
 - Base your price estimate on what private sellers list and SELL for on AU FB Marketplace
@@ -6398,7 +6403,7 @@ red — pass. Overpriced, bad condition, red flags in description, or no real re
 relevant: false = wrong item / accessory / kids toy / service / hire / wholesale stock
 
 Return ONLY JSON:
-{"rating":"yellow","reason":"Short sentence — price vs market, key reason why","relevant":true}`;
+{"rating":"yellow","reason":"PRICE verdict only e.g. 'Below typical sell price' or 'Overpriced for this model' — NO analysis, NO title quotes, NO keyword mentions, max 6 words","relevant":true}`;
 
       try {
         let text = '';
