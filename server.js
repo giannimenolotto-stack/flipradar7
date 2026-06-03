@@ -5506,10 +5506,12 @@ const GEMINI_API_KEY    = process.env.GEMINI_API_KEY    || null;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
 
 // Gemini model tiers:
-// gemini-2.0-flash-lite  — vision + text, cheapest (~$0.000075/image). Use for bulk image checks.
-// gemini-2.5-flash       — smarter reasoning, ~8x more expensive. Use for appraisals only.
-const GEMINI_CHEAP  = 'gemini-2.0-flash-lite';
-const GEMINI_SMART  = 'gemini-2.5-flash';
+// gemini-2.5-flash-lite  — vision + text, cheapest. Use for bulk image gate checks.
+// gemini-2.5-flash       — smarter reasoning. Use for appraisals and border ratings.
+// gemini-2.5-flash-lite was shut down June 1 2026 — updated to 2.5 equivalents
+const GEMINI_CHEAP  = 'gemini-2.5-flash-lite'; // bulk image checks — same price, better quality
+const GEMINI_SMART  = 'gemini-2.5-flash';       // appraisals, text reasoning
+const GEMINI_RATE   = 'gemini-2.5-flash';       // rate-batch border colours — quality matters here
 const geminiUrl = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
 
 // ── Web Push (VAPID) ──────────────────────────────────────
@@ -6170,7 +6172,28 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
         } catch (_) {}
       }
 
+      // ── Check DB for existing image analysis ────────────────────────────
+      // If the AI gate already analysed this image at scrape time, use that result.
+      // Avoids re-fetching an image that may have already expired on FB CDN.
+      let priorCondition = l.imgCondition || null;
+      let priorMatches   = true; // default assume it matches
+
+      if (!priorCondition && l.id) {
+        try {
+          const { rows: imgRows } = await pool.query(
+            `SELECT img_condition, img_matches_keyword FROM listings WHERE listing_id = $1`,
+            [String(l.id)]
+          );
+          if (imgRows[0]) {
+            priorCondition = imgRows[0].img_condition || null;
+            priorMatches   = imgRows[0].img_matches_keyword !== false;
+          }
+        } catch (_) {}
+      }
+
       // ── Fetch image ─────────────────────────────────────────────────────
+      // Only fetch if we don't already have condition from the DB gate.
+      // Image URLs expire fast on FB CDN so fetch immediately, not later.
       let imgData = null;
       if (GEMINI_API_KEY && l.image) {
         try {
@@ -6182,7 +6205,7 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
             mime_type: imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg',
             data: Buffer.from(imgRes.data).toString('base64'),
           };
-        } catch (_) { /* image expired — rate text-only */ }
+        } catch (_) { /* image expired — use priorCondition if available */ }
       }
 
       // ── Build prompt ────────────────────────────────────────────────────
@@ -6200,9 +6223,16 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
 
       const sellRates = CATEGORY_SELL_RATES[kwToSellCategory(kw)] || CATEGORY_SELL_RATES._default;
 
+      // Build condition context — use prior analysis if image fetch failed
+      const conditionCtx = priorCondition
+        ? `Prior image analysis found condition: ${priorCondition}${!priorMatches ? ' — WARNING: photo may not match keyword' : ''}`
+        : null;
+
       const imgNote = imgData
-        ? `A photo of the listing is attached. Use it to assess condition, verify the item matches the keyword, and check for damage, heavy wear, or retail stock photos.`
-        : `No photo available — rate based on title and price only.`;
+        ? `A photo is attached. Assess condition, verify it matches the keyword, check for damage or retail stock photos.`
+        : conditionCtx
+          ? `No live photo available. ${conditionCtx}.`
+          : `No photo available — rate based on title and price only.`;
 
       const prompt = `You are an expert Australian Facebook Marketplace flipper rating a single listing.
 
@@ -6256,10 +6286,11 @@ Return ONLY JSON:
           const parts = imgData
             ? [{ inline_data: imgData }, { text: prompt }]
             : [{ text: prompt }];
-          const model = imgData ? GEMINI_CHEAP : GEMINI_SMART;
+          // Always use GEMINI_RATE (2.5 Flash) for border ratings —
+          // this is the most user-visible output, quality matters
           const r = await geminiPost(
-            geminiUrl(model),
-            { contents: [{ parts }], generationConfig: { temperature: 0.1 } },
+            geminiUrl(GEMINI_RATE),
+            { contents: [{ parts }], generationConfig: { temperature: 0.1, thinkingConfig: { thinkingBudget: 0 } } },
             { timeout: 15000 }
           );
           text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
