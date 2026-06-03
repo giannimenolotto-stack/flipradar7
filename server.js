@@ -6337,7 +6337,7 @@ red — pass. Overpriced, bad condition, red flags in description, or no real re
 relevant: false = wrong item / accessory / kids toy / service / hire / wholesale stock
 
 Return ONLY JSON:
-{"rating":"yellow","reason":"Max 5 words, price or market only","relevant":true}`;
+{"rating":"yellow","reason":"3 words max","relevant":true}`;
 
       try {
         let text = '';
