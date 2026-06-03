@@ -5764,6 +5764,13 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
       '',
       'Broken/project cars: if listing mentions "spares or repairs", "not running", "blown", "needs work", "as-is" — set isBrokenOrProject true, provide repairEstimate, cap verdict at FAIR unless post-repair ROI is exceptional.',
       '',
+      'NEGOTIATION SCRIPT RULES — critical:',
+      '- recommendedOffer is ALWAYS below the asking price. If asking $200, offer $150 or less.',
+      '- NEVER write a script that offers more than the asking price — this makes no sense for a buyer.',
+      '- The script should sound natural, reference the specific item, and justify the lower offer.',
+      '- Example for $200 coffee machine: "Hi, I\'m interested in the Breville Barista Touch. Would you take $150? Happy to pick up today."',
+      '- Keep it short — 1-2 sentences max.',
+      '',
       'Respond ONLY in this exact JSON format (no markdown, no text outside JSON):',
       '{',
       '  "verdict": "STEAL|GOOD DEAL|FAIR|PASS",',
@@ -5784,7 +5791,7 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
       '  "greenFlags": ["..."],',
       '  "redFlags": ["..."],',
       '  "whatToCheckInPerson": ["..."],',
-      '  "negotiationScript": "what to say to the seller",',
+      '  "negotiationScript": "short message to send the seller — ALWAYS offer BELOW the asking price (recommendedOffer), NEVER at or above it. Sound keen but not desperate. Reference the item specifically.",',
       '  "isBrokenOrProject": false,',
       '  "repairEstimate": 0,',
       '  "repairNotes": "",',
@@ -5891,6 +5898,19 @@ app.post('/ai/vehicle', authMiddleware, async (req, res) => {
       delete parsed.dataPoints;
       delete parsed.dbData;
       delete parsed._pricingCorrected;
+
+      // Hard cap: recommendedOffer and walkAwayPrice must ALWAYS be below asking price
+      // The AI sometimes confuses buy price with sell price — this corrects it server-side
+      if (parsed.recommendedOffer && parsed.recommendedOffer >= listingPrice) {
+        parsed.recommendedOffer = Math.round(listingPrice * 0.82);
+      }
+      if (parsed.walkAwayPrice && parsed.walkAwayPrice >= listingPrice) {
+        parsed.walkAwayPrice = Math.round(listingPrice * 0.90);
+      }
+      // recommendedOffer should always be <= walkAwayPrice
+      if (parsed.recommendedOffer && parsed.walkAwayPrice && parsed.recommendedOffer > parsed.walkAwayPrice) {
+        parsed.recommendedOffer = Math.round(parsed.walkAwayPrice * 0.92);
+      }
 
       const finalResult = { ...parsed, text, usedCache: false };
       await setAppraisalCache(listingId, title, listingPrice, keyword, finalResult).catch(e =>
@@ -6581,8 +6601,9 @@ app.post('/ai/general', authMiddleware, async (req, res) => {
       + 'Step 3 - Repairs if needed: estimate from description\n'
       + 'Step 4 - estimatedProfit = sell price - buy price - costs\n\n'
       + 'VERDICT: roiPercent > 30% = STEAL, 15-30% = GOOD DEAL, 5-15% = FAIR, below 5% = PASS\n\n'
+      + 'NEGOTIATION SCRIPT: always offer recommendedOffer which is BELOW asking price. Never offer at or above asking. Keep it 1-2 sentences, reference the specific item.\n\n'
       + 'Respond ONLY in this exact JSON (no markdown):\n'
-      + '{"verdict":"STEAL|GOOD DEAL|FAIR|PASS","dealScore":0,"oneLiner":"","extractedTitle":"","extractedPrice":0,"estimatedMarketValue":0,"estimatedResellLow":0,"estimatedResellHigh":0,"recommendedOffer":0,"walkAwayPrice":0,"estimatedProfit":0,"roiPercent":0,"timeToSell":"1-2 weeks","demandLevel":"Moderate","whyItsWorth":"","greenFlags":[],"redFlags":[],"whatToCheckInPerson":[],"negotiationScript":"","isBrokenOrProject":false,"repairEstimate":0,"aiGenerated":true}';
+      + '{"verdict":"STEAL|GOOD DEAL|FAIR|PASS","dealScore":0,"oneLiner":"","extractedTitle":"","extractedPrice":0,"estimatedMarketValue":0,"estimatedResellLow":0,"estimatedResellHigh":0,"recommendedOffer":0,"walkAwayPrice":0,"estimatedProfit":0,"roiPercent":0,"timeToSell":"1-2 weeks","demandLevel":"Moderate","whyItsWorth":"","greenFlags":[],"redFlags":[],"whatToCheckInPerson":[],"negotiationScript":"ALWAYS offer recommendedOffer which is BELOW asking price — never at or above it","isBrokenOrProject":false,"repairEstimate":0,"aiGenerated":true}';
 
     let text = '';
     if (GEMINI_API_KEY) {
@@ -6620,6 +6641,20 @@ app.post('/ai/general', authMiddleware, async (req, res) => {
     if (!parsed || !parsed.verdict) {
       console.error('[AI/general] Bad response:', clean.slice(0, 200));
       return res.status(500).json({ error: 'Could not parse AI response. Try again.' });
+    }
+
+    // Hard cap: recommendedOffer and walkAwayPrice must be below asking price
+    const askingPrice = Number(price) || 0;
+    if (askingPrice > 0) {
+      if (parsed.recommendedOffer && parsed.recommendedOffer >= askingPrice) {
+        parsed.recommendedOffer = Math.round(askingPrice * 0.82);
+      }
+      if (parsed.walkAwayPrice && parsed.walkAwayPrice >= askingPrice) {
+        parsed.walkAwayPrice = Math.round(askingPrice * 0.90);
+      }
+      if (parsed.recommendedOffer && parsed.walkAwayPrice && parsed.recommendedOffer > parsed.walkAwayPrice) {
+        parsed.recommendedOffer = Math.round(parsed.walkAwayPrice * 0.92);
+      }
     }
 
     const result = { ...parsed, usedCache: false };
