@@ -6295,7 +6295,7 @@ KM ADJUSTMENT FOR VEHICLES (critical — do not ignore):
 - 130k-180k km: 10-20% LESS than median — buyers negotiate hard
 - 180k-250k km: 20-35% LESS than median — hard to sell, limited buyer pool
 - Over 250k km: 35-50% LESS than median — specialist/tradie buyers only, very slow
-- Apply this adjustment BEFORE calculating profit margin
+- Apply this adjustment BEFORE comparing listed price to market
 - A 200k km HiLux listed at "below market median" may actually be above market for its kms
 
 INSTANT RED FLAGS (automatic red rating):
@@ -6305,12 +6305,12 @@ INSTANT RED FLAGS (automatic red rating):
 - Kids toy version of adult item (relevant:false)
 - Wrong item in photo (relevant:false)
 - Used mattress, generic flat-pack furniture, generic white goods — almost never worth flipping
-- Margin under $150 after all realistic costs
+- Listed price is at or above what it actually sells for on AU FB
 
 RATING SCALE:
-rainbow — exceptional. 40%+ below what it actually sells for, great condition confirmed in photo, $400+ profit realistic, sells fast
-green — solid deal. Clearly below market, condition is fine, $150-400 profit realistic
-yellow — fair price or uncertain. Near market rate, or condition unclear, or slow market
+rainbow — exceptional. 35%+ below real AU FB secondhand sell price, great condition confirmed in photo, high demand item
+green — solid deal. 15-35% below real AU FB secondhand sell price, condition is fine, real liquid market
+yellow — fair. Within 15% of real AU FB sell price, or condition unclear, or slow moving
 red — pass. Overpriced, bad condition, red flags in description, or no real resale market
 
 relevant: false = wrong item / accessory / kids toy / service / hire / wholesale stock
