@@ -6243,81 +6243,53 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
           ? `No live photo available. ${conditionCtx}.`
           : `No photo available — rate based on title and price only.`;
 
-      // Build description context — extract key signals for the prompt
-      // Don't dump the whole description, pull out what matters for flip decisions
-      const descCtx = listingDesc
-        ? `Seller description: "${listingDesc}"`
-        : null;
+      const prompt = `You are a ruthless Australian Facebook Marketplace flipper. Your job is to find cheap deals to buy and resell for profit. You pass on 90% of listings.
 
-      const prompt = `You are an expert Australian Facebook Marketplace flipper rating a single listing.
-
-Search keyword: "${kw}"
+LISTING:
+Keyword: "${kw}"
 Title: "${(l.title||'').slice(0,120)}"
-Price: ${l.price ? '$' + l.price + ' AUD' : 'not listed'}${specParts.length ? ' · ' + specParts.join(', ') : ''}
-${descCtx ? descCtx + '\n' : ''}${priceCtx}
-Typical sell discount for this category: ${Math.round(sellRates.sellDiscount * 100)}% below asking median
-Typical flip costs: $${sellRates.flipCostLow}–$${sellRates.flipCostHigh}
+Price: ${l.price ? '$' + l.price + ' AUD' : 'not listed'}${specParts.length ? ' · ' + specParts.join(', ') : ''}${listingDesc ? `
+Description: "${listingDesc}"` : ''}
+
+MARKET CONTEXT (AU Facebook Marketplace secondhand prices):
+${priceCtx}
 
 ${imgNote}
+${conditionCtx ? `Prior condition check: ${conditionCtx}` : ''}
 
-CATEGORIES THAT ALMOST NEVER FLIP PROFITABLY - rate red unless truly exceptional:
-- Mattresses: used mattresses are nearly impossible to resell in AU due to hygiene concerns. Rate red.
-- Generic IKEA / flat-pack furniture: depreciates to near zero. Beds, tables, wardrobes. Rate red.
-  A $50 used IKEA bed does NOT resell for $250 - the seller is lying about resale value.
-- Sofas/couches: only flip if leather, designer brand, near-new, at 40%+ below market.
-- Generic white goods: thin margins, heavy. Only green for premium brand at big discount.
-- Kids toys / baby gear (non-premium pram): near-zero resale margin. Rate red.
-- Generic clothing (non-brand): no consistent market. Rate red.
+YOUR JOB:
+1. Look at the photo first — what is the actual condition? Damage, wear, missing parts?
+2. Read the description — any red flags? (needs work, as is, not running, no RWC, engine issues, flood, hail, project car, parts only)
+3. Is this a realistic flip? Can you buy it, clean it up, relist and profit after costs?
+4. What does this actually sell for secondhand on AU Facebook Marketplace right now?
 
-WHAT FLIPS WELL in AU - only green/rainbow for items with a real liquid secondhand market:
-iPhones, Samsung flagships, MacBooks, laptops, iPads, PS5/Xbox/Switch consoles, Milwaukee/DeWalt/Makita/Festool tools, cameras (Sony/Canon/Nikon/Fuji), premium audio (Sony WH/Bose/Sonos/Airpods Max), vehicles, motorcycles, quality bikes (Trek/Specialized/Santa Cruz), Peloton/Concept2/Rogue gym gear, watches (Rolex/Omega/Seiko Prospex), Nike Jordan/Yeezy/Dunk sneakers, generators, welders, camping fridges (Engel/Dometic/ARB), Weber/Traeger BBQs, name-brand golf clubs.
+SECONDHAND FB MARKETPLACE REALITY:
+- Base your price estimate on what private sellers list and SELL for on AU FB Marketplace
+- NOT retail, NOT eBay, NOT RRP — FB Marketplace private sale prices
+- Vehicles: what a private seller asks, not dealer price or RedBook
+- Assume you need to sell for 10-15% below what similar listings are asking to actually move it
+- Factor in your costs: transport, cleaning, relisting time, platform fees
+- Minimum $150 profit to be worth green. Minimum $400 to be worth rainbow.
 
-IMAGE ASSESSMENT - if photo attached, use it:
-- Visible damage, stains, rust, heavy wear: factor into rating, do not ignore
-- Blurry / item not clearly visible: treat condition as unknown, do not assume good
-- Retail stock photo or ORDER NOW advertisement: mark relevant:false - wholesale dropship not secondhand
-- Ignore messy backgrounds, only assess the actual item condition
+INSTANT RED FLAGS (automatic red rating):
+- Photo shows damage, heavy rust, broken parts, flood or hail damage
+- Description mentions: needs work / as is / not working / engine issues / for parts / project / no RWC / unregistered
+- Retail stock photo or ORDER NOW advertisement (relevant:false)
+- Kids toy version of adult item (relevant:false)
+- Wrong item in photo (relevant:false)
+- Used mattress, generic flat-pack furniture, generic white goods — almost never worth flipping
+- Margin under $150 after all realistic costs
 
-PRICING REALITY:
-- Use the DB market data above as your price anchor
-- IGNORE the seller's stated resale value - they always overstate it
-- A used mattress bundle at $50 "resells for $250" is red - the resale market barely exists
-- IKEA furniture "below market" is irrelevant - the secondhand market is nearly zero
-- If no DB data: use real AU FB Marketplace knowledge, not RRP or retail prices
+RATING SCALE:
+rainbow — exceptional. 40%+ below what it actually sells for, great condition confirmed in photo, $400+ profit realistic, sells fast
+green — solid deal. Clearly below market, condition is fine, $150-400 profit realistic
+yellow — fair price or uncertain. Near market rate, or condition unclear, or slow market
+red — pass. Overpriced, bad condition, red flags in description, or no real resale market
 
-HARD RATING RULES — apply these strictly, no exceptions:
-
-rainbow (exceptional flip):
-  - Listed at 40%+ below market median AND condition is good/great in photo
-  - Realistic profit after ALL costs (buy + prep + fees + time) = $500+
-  - High demand item that sells within days (phone, console, name-brand tool, vehicle)
-  - Do NOT give rainbow if condition is unknown, poor, or description has any red flags
-
-green (solid deal):
-  - Listed at 20-40% below market median AND condition is at least fair
-  - Realistic profit after ALL costs = $150-500
-  - Real liquid market exists for this exact item
-  - Do NOT give green if: condition unknown and title has no positive signals,
-    description mentions damage/issues/as-is/needs work, or margin is borderline
-
-yellow (fair — watch but don't buy now):
-  - Listed near market median (within 20% either way)
-  - OR condition is uncertain / description is vague
-  - OR item is real but market is slow
-
-red (pass — not worth pursuing):
-  - Listed above market median
-  - OR condition is poor/damaged
-  - OR category has no real resale market (furniture, mattress, generic white goods)
-  - OR description has ANY of: needs work, as is, not working, damaged, for parts,
-    project, no RWC, unregistered (vehicles), engine issues, rust, flood, hail
-  - OR margin after realistic costs is under $100
-  - When in doubt → red. A serious flipper passes 90% of listings.
-
-relevant: false if wrong item, accessory, kids toy version, service, hire, retail/wholesale stock
+relevant: false = wrong item / accessory / kids toy / service / hire / wholesale stock
 
 Return ONLY JSON:
-{"rating":"green","reason":"Brief specific reason max 8 words","relevant":true}`;
+{"rating":"yellow","reason":"One specific reason max 8 words","relevant":true}`;
 
       try {
         let text = '';
