@@ -4386,9 +4386,23 @@ async function rebuildGlobalDeals() {
       return '_default';
     }
 
+    // ── Diversity caps ─────────────────────────────────────
+    // Prevent one keyword or category from dominating the deals page
+    const keywordCount  = {};   // max 3 deals per keyword
+    const categoryCount = {};   // max 5 deals per category bucket
+    const MAX_PER_KW    = 3;
+    const MAX_PER_CAT   = 5;
+
     for (const row of rows) {
       const t   = (row.title || '').toLowerCase();
       const kw  = (row.keyword || '').toLowerCase();
+
+      // ── Diversity caps — skip if this keyword or category already has enough ──
+      const bucket = dealsBucket(kw);
+      keywordCount[kw]     = (keywordCount[kw]     || 0);
+      categoryCount[bucket] = (categoryCount[bucket] || 0);
+      if (keywordCount[kw]     >= MAX_PER_KW)  continue;
+      if (categoryCount[bucket] >= MAX_PER_CAT) continue;
 
       // ── Hard rejects — never flip these ──────────────────
       if (/\b(hire|rental|for hire|per day|per week|hourly|service|installation|wanted|wtb|wtt)\b/.test(t)) continue;
@@ -4401,7 +4415,6 @@ async function rebuildGlobalDeals() {
       if (row.price && row.price < 50) continue;
 
       // ── Category-based minimum price floor ────────────────
-      const bucket = dealsBucket(kw);
       const floor  = CATEGORY_FLOORS[bucket] || CATEGORY_FLOORS._default;
       if (row.price && row.price < floor) continue;
 
@@ -4412,9 +4425,9 @@ async function rebuildGlobalDeals() {
       const margin = row.flip_estimated_margin || 0;
 
       if (row.flip_score !== null) {
-        // Path A: nightly AI score is available — use it directly
-        if (score >= 75 || margin >= 500) tint = 'rainbow';
-        else if (score >= 55 || margin >= 150) tint = 'green';
+        // Path A: nightly AI score — margin field is deprecated, use score only
+        if (score >= 75) tint = 'rainbow';
+        else if (score >= 55) tint = 'green';
       } else if (row.kw_median && row.price) {
         // Path B: no AI score yet — use discount depth vs keyword median
         const pctOff = (row.kw_median - row.price) / row.kw_median;
@@ -4423,6 +4436,10 @@ async function rebuildGlobalDeals() {
       }
 
       if (!tint) continue;
+
+      // Track diversity counts
+      keywordCount[kw]     = (keywordCount[kw]     || 0) + 1;
+      categoryCount[bucket] = (categoryCount[bucket] || 0) + 1;
 
       approved.push({
         id:           row.listing_id,
@@ -5901,11 +5918,11 @@ app.post('/ai/image', authMiddleware, async (req, res) => {
     const cr = await consumeAppraisal(req.userId);
     if (!cr.ok) return res.status(cr.status).json({ error: cr.error, limit: cr.limit, plan: cr.plan });
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 30000,
-    });
+    const geminiRes = await geminiPost(
+      geminiUrl(GEMINI_SMART),
+      { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+      { timeout: 30000 }
+    );
     const text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     res.json({ text });
   } catch (e) {
