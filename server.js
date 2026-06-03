@@ -6268,8 +6268,6 @@ Odometer: ${Number(l.mileage).toLocaleString()} km` : ''}${l.year ? `
 Year: ${l.year}` : ''}${listingDesc ? `
 Description: "${listingDesc}"` : ''}
 
-MARKET CONTEXT (AU Facebook Marketplace secondhand prices):
-${priceCtx}
 
 ${imgNote}
 ${conditionCtx ? `Prior condition check: ${conditionCtx}` : ''}
