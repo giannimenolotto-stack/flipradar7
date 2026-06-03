@@ -663,8 +663,8 @@ async function getDBPriceStats(keyword, minSamples = 5) {
         ceiling:     r.ceiling_price,
         low:         r.low_price,
         high:        r.high_price,
-        source:      'dealdetective_db',
-        sourceLabel: `Deal Detective DB · ${r.sample_count} verified sales`,
+        source:      'dealdaddy_db',
+        sourceLabel: `Deal Daddy DB · ${r.sample_count} verified sales`,
       };
     }
 
@@ -723,8 +723,8 @@ async function getDBPriceStats(keyword, minSamples = 5) {
       ceiling:     Math.round(fence_hi),
       low:         row.low,
       high:        row.high,
-      source:      'dealdetective_db',
-      sourceLabel: `Deal Detective DB · ${row.cnt} verified comparables`,
+      source:      'dealdaddy_db',
+      sourceLabel: `Deal Daddy DB · ${row.cnt} verified comparables`,
     };
   } catch (e) {
     console.error('[DB] getDBPriceStats error:', e.message);
@@ -899,8 +899,8 @@ function formatVehicleStats(median, p25, p75, count, rawCount, iqr, floor, ceili
     mileageBand,
     cohortKey,
     tier,
-    source:          'dealdetective_db',
-    sourceLabel:     `Deal Detective DB · ${count} comparable ${label}${mileageStr}`,
+    source:          'dealdaddy_db',
+    sourceLabel:     `Deal Daddy DB · ${count} comparable ${label}${mileageStr}`,
     confidence:      calcConfidence('vpx', count),
     make, model, series, variant,
   };
@@ -992,7 +992,7 @@ const K = {
 };
 
 // ── Auth ──────────────────────────────────────────────────
-const JWT_SECRET     = process.env.AUTH_SECRET || 'dealdetective-secret-change-me';
+const JWT_SECRET     = process.env.AUTH_SECRET || 'dealdaddy-secret-change-me';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
 // ── Stripe ────────────────────────────────────────────────
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || null;
@@ -1015,7 +1015,7 @@ Object.entries(PRICE_IDS).forEach(([key, priceId]) => {
 });
 const PLAN_APPRAISAL_LIMITS = { free: 999, basic: 999, pro: 999, premium: 999 }; // TEMP — reset before launch
 const PLAN_WATCHLIST_LIMITS = { free: 0, basic: 2, pro: 2, premium: 5 };
-const FROM_EMAIL    = process.env.FROM_EMAIL || 'Deal Detective <noreply@yourdomain.com>';
+const FROM_EMAIL    = process.env.FROM_EMAIL || 'Deal Daddy <noreply@yourdomain.com>';
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
 
@@ -1277,7 +1277,7 @@ async function storeScanPrice(keyword, listing) {
   upsertListingToDB(enriched).catch(() => {});
 }
 
-// VPX / Carsales / AutoGrab removed — Deal Detective DB is the only pricing source
+// VPX / Carsales / AutoGrab removed — Deal Daddy DB is the only pricing source
 
 // ── Appraisal result cache ────────────────────────────────
 // Stores full AI appraisal results so identical listings cost 0 points for subsequent users.
@@ -1711,7 +1711,7 @@ async function getPriceCacheForKeyword(keyword) {
       high:        dbStats.p75 || Math.round(anchor.price_high),
       sell_price:  anchor.sell_price,
       source:      'blended',
-      sourceLabel: `Deal Detective DB (${dbStats.count} listings) + AI estimate`,
+      sourceLabel: `Deal Daddy DB (${dbStats.count} listings) + AI estimate`,
     };
   }
 
@@ -1749,7 +1749,7 @@ async function sendEmail(to, subject, html) {
 }
 
 function welcomeEmail(name, email) {
-  return sendEmail(email, 'Welcome to Deal Detective 👀', `
+  return sendEmail(email, 'Welcome to Deal Daddy 👀', `
 <!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -1762,14 +1762,14 @@ function welcomeEmail(name, email) {
       <div style="font-size:40px;margin-bottom:12px">👋</div>
       <h1 style="color:#fff;font-size:24px;font-weight:800;margin:0 0 8px">Hey ${name}, you're in!</h1>
       <p style="color:#888;font-size:15px;line-height:1.6;margin:0">
-        Deal Detective is now scanning Facebook Marketplace for you. Add your first watchlist keyword and we'll notify you the moment something worth flipping shows up.
+        Deal Daddy is now scanning Facebook Marketplace for you. Add your first watchlist keyword and we'll notify you the moment something worth flipping shows up.
       </p>
     </div>
     <div style="margin-bottom:24px">
       <div style="color:#555;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px">Get started in 3 steps</div>
       ${[
         ['👁️', 'Add a watchlist', 'Type in what you\'re hunting — e.g. "ps5", "bmw e30", "vintage levis"'],
-        ['📡', 'We scan for you', 'Deal Detective checks Marketplace every 30 minutes and sends you new listings instantly'],
+        ['📡', 'We scan for you', 'Deal Daddy checks Marketplace every 30 minutes and sends you new listings instantly'],
         ['💸', 'Flip for profit', 'Use the Sell Scanner to appraise anything and generate a listing description'],
       ].map(([icon, title, desc]) => `
       <div style="display:flex;gap:14px;margin-bottom:16px">
@@ -1781,12 +1781,12 @@ function welcomeEmail(name, email) {
       </div>`).join('')}
     </div>
     <div style="text-align:center;margin-bottom:32px">
-      <a href="https://deal-detective.app" style="display:inline-block;background:#00ff88;color:#000;font-weight:800;font-size:16px;padding:16px 40px;border-radius:14px;text-decoration:none;letter-spacing:.5px">
-        Open Deal Detective →
+      <a href="https://deal-daddy.app" style="display:inline-block;background:#00ff88;color:#000;font-weight:800;font-size:16px;padding:16px 40px;border-radius:14px;text-decoration:none;letter-spacing:.5px">
+        Open Deal Daddy →
       </a>
     </div>
     <div style="border-top:1px solid #1a1a2e;padding-top:20px;color:#444;font-size:12px;line-height:1.6">
-      You're receiving this because you signed up at Deal Detective.<br>
+      You're receiving this because you signed up at Deal Daddy.<br>
       Questions? Just reply to this email.
     </div>
   </div>
@@ -1796,7 +1796,7 @@ function welcomeEmail(name, email) {
 }
 
 function verificationEmail(name, email, code) {
-  return sendEmail(email, `${code} — Verify your Deal Detective email`, `
+  return sendEmail(email, `${code} — Verify your Deal Daddy email`, `
 <!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -1814,7 +1814,7 @@ function verificationEmail(name, email, code) {
       </div>
     </div>
     <div style="color:#444;font-size:12px;text-align:center">
-      If you didn't sign up for Deal Detective, you can safely ignore this email.
+      If you didn't sign up for Deal Daddy, you can safely ignore this email.
     </div>
   </div>
 </body>
@@ -2633,7 +2633,7 @@ async function distributeListingsToUser(watcher, raw, opts = {}) {
     const dropStr  = listing.priceDropped
       ? ` 🔻 Price dropped from $${listing.previousPrice} (-$${listing.dropAmount})`
       : '';
-    const pushTitle = listing.priceDropped ? `💸 Price Drop: ${keyword}` : `Deal Detective: ${keyword}`;
+    const pushTitle = listing.priceDropped ? `💸 Price Drop: ${keyword}` : `Deal Daddy: ${keyword}`;
 
     await sendPushover(pToken, pUser, pushTitle, `${listing.title}\n${priceStr}${dropStr}`, listing.url);
     sendWebPush(watcher.userId, {
@@ -5333,8 +5333,8 @@ app.post('/stripe/create-checkout', authMiddleware, async (req, res) => {
       mode: 'subscription',
       payment_method_types: ['card'],
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: 'https://deal-detective.app?upgraded=1',
-      cancel_url:  'https://deal-detective.app?cancelled=1',
+      success_url: 'https://deal-daddy.app?upgraded=1',
+      cancel_url:  'https://deal-daddy.app?cancelled=1',
       customer_email: user.email,
       metadata: { userId: user.id, priceId },
       subscription_data: { metadata: { userId: user.id, priceId } },
@@ -5378,7 +5378,7 @@ app.post('/stripe/portal', authMiddleware, async (req, res) => {
     if (!user || !user.stripeCustomerId) return res.status(400).json({ error: 'No subscription found' });
     const session = await stripe.billingPortal.sessions.create({
       customer: user.stripeCustomerId,
-      return_url: 'https://deal-detective.app',
+      return_url: 'https://deal-daddy.app',
     });
     res.json({ url: session.url });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -5548,7 +5548,7 @@ const geminiUrl = (model) => `https://generativelanguage.googleapis.com/v1beta/m
 // ── Web Push (VAPID) ──────────────────────────────────────
 const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || null;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
-const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@deal-detective.app';
+const VAPID_EMAIL       = process.env.VAPID_EMAIL       || 'mailto:admin@deal-daddy.app';
 
 
 // Redis key for push subscriptions
@@ -6061,14 +6061,14 @@ Return ONLY JSON (no markdown):
         db_p75:      dbPrice?.p75_price    || null,
         db_samples:  dbPrice?.sample_count || null,
         db_name:     dbPrice?.display_name || null,
-        db_source:   dbPrice ? 'dealdetective_db' : kwMedian ? 'keyword_stats' : 'gemini_knowledge',
+        db_source:   dbPrice ? 'dealdaddy_db' : kwMedian ? 'keyword_stats' : 'gemini_knowledge',
       };
     }));
 
     // Build DB context block for the appraisal prompt
     const dbContext = itemsWithPrices.map(item => {
       if (item.db_median) {
-        return `- ${item.name} (qty: ${item.qty||1}): Deal Detective DB median ${item.db_median} AUD [${item.db_samples} FB Marketplace AU sales, p25=${item.db_p25}, p75=${item.db_p75}]`;
+        return `- ${item.name} (qty: ${item.qty||1}): Deal Daddy DB median ${item.db_median} AUD [${item.db_samples} FB Marketplace AU sales, p25=${item.db_p25}, p75=${item.db_p75}]`;
       } else {
         return `- ${item.name} (qty: ${item.qty||1}): No DB data — use your knowledge of current AU Facebook Marketplace second-hand prices`;
       }
@@ -6479,7 +6479,7 @@ app.delete('/appraisal-cache', authMiddleware, async (req, res) => {
 
 // ── DEV: force-set plan (secret-gated, remove before public launch) ──
 // POST /dev/set-plan  { secret: "...", plan: "premium" }
-const DEV_SECRET = process.env.DEV_SECRET || 'dealdetective-dev';
+const DEV_SECRET = process.env.DEV_SECRET || 'dealdaddy-dev';
 app.post('/dev/set-plan', authMiddleware, async (req, res) => {
   const { secret, plan } = req.body;
   if (secret !== DEV_SECRET) return res.status(403).json({ error: 'Forbidden' });
@@ -6785,7 +6785,7 @@ async function refreshKeywordAnchors() {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`Deal Detective backend on port ${PORT}`);
+  console.log(`Deal Daddy backend on port ${PORT}`);
   console.log(`SociaVault: ${SOCIAVAULT_API_KEY ? 'set' : 'NO TOKEN — add SOCIAVAULT_API_KEY'}`);
   console.log(`Redis:      ${REDIS_URL           ? 'connected' : 'NOT SET'}`);
   console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
