@@ -2329,10 +2329,41 @@ async function aiTextFilter(listings, keyword) {
       return `${i}|${(l.title || '').slice(0, 100)}|${price}${spec ? '|' + spec : ''}`;
     }).join('\n');
 
-    // Build a one-line definition of what the keyword means so the AI
-    // reasons from first principles rather than pattern-matching examples.
-    // This covers every possible keyword without needing a hardcoded map.
-    const prompt = `You are filtering Australian Facebook Marketplace listings for a flipper searching: "${keyword}"
+    // Detect if this is a broad category keyword or a specific product keyword.
+    // Category keywords (furniture, tools, electronics, gaming) = any item in that
+    // category is relevant. Specific keywords (iphone 15, milwaukee m18) = exact match only.
+    const CATEGORY_KEYWORDS = new Set([
+      'furniture','chair','chairs','table','tables','couch','lounge','sofa','bed','beds',
+      'wardrobe','wardrobes','desk','desks','shelf','shelving','storage',
+      'tools','power tools','hand tools','garden tools',
+      'electronics','gaming','games','console','computers','laptops','phones','mobiles',
+      'clothes','clothing','shoes','fashion','bags','accessories',
+      'baby','kids','children','toys','sport','sports','fitness','gym','exercise',
+      'musical instruments','music','cameras','photography',
+      'bikes','bicycles','scooters','vehicles','cars','motorcycles',
+      'appliances','whitegoods','outdoor','camping','garden','plants',
+      'art','books','collectibles','jewellery','jewelry','watches',
+      'building','construction','industrial','trade',
+    ]);
+    const isCategory = CATEGORY_KEYWORDS.has(keyword.toLowerCase().trim());
+
+    const prompt = isCategory
+      ? `You are filtering Australian Facebook Marketplace listings for someone browsing the "${keyword}" category.
+
+This is a CATEGORY search — the user wants ANY item that belongs to the "${keyword}" category.
+Do NOT require the word "${keyword}" to appear in the title.
+A listing titled "Oak dining table" is relevant to "furniture".
+A listing titled "Milwaukee M18 drill" is relevant to "tools".
+
+- relevant: true if the item belongs to the "${keyword}" category. False ONLY if clearly wrong category, or a service/hire/wanted ad.
+- pass: false if hire/rental, wanted ad, $0 or no price, new retail/wholesale dropship stock.
+
+Return ONLY a JSON array, same order as input:
+[{"i":0,"relevant":true,"pass":true},...]
+
+Listings (index|title|price|specs):
+${lines}`
+      : `You are filtering Australian Facebook Marketplace listings for a flipper searching: "${keyword}"
 
 First, reason about what "${keyword}" means:
 - What is the EXACT item being searched for? Be specific about type, brand, and use case.
