@@ -3077,6 +3077,8 @@ async function scoreDealsWithAINightly() {
         AND l.is_active = TRUE
         AND l.price_quality NOT IN ('spam','swap','accessory')
         AND l.img_matches_keyword IS NOT FALSE
+        AND l.category NOT IN ('property','real_estate')
+        AND l.title !~* '\m(bedroom|bathroom|per week|per month|house for sale|unit for sale|apartment|townhouse|granny flat|room for rent)\M'
         -- Only score listings from flipper-relevant seed keywords
         AND l.keyword = ANY($2)
         -- Minimum price floor — nothing under $50 is worth scoring
@@ -4411,6 +4413,9 @@ async function rebuildGlobalDeals() {
       if (/\b(casserole|saucepan|pot set|cutlery|crockery|dinner set|plate set|bowl set|vase|ornament|picture frame|curtain|cushion|doona|pillow|towel|sheet set|rug|mat|lamp|candle|decor)\b/.test(t)) continue;
       // Reject generic furniture (not worth the effort on FB Marketplace)
       if (/\b(dining chair|dining table|coffee table|side table|bedside table|wardrobe|dresser|bookshelf|shelf|shelving unit|chest of drawers|tv unit|entertainment unit|kids bed|bunk bed)\b/.test(t) && !/\b(herman miller|aeron|embody|jarvis|standing desk)\b/.test(t)) continue;
+      // Reject property/real estate — flippers don't want houses, rentals or land
+      if (/\b(bedroom|bathroom|per.?week|per.?month|house|unit for sale|apartment|townhouse|granny flat|room for rent|share house|investment property|off the plan|sqm|land for sale|block for sale)\b/.test(t)) continue;
+      if (row.category === 'property' || row.category === 'real_estate') continue;
       // Reject cheap single items not worth flipping
       if (row.price && row.price < 50) continue;
 
@@ -4545,7 +4550,7 @@ async function quickStatsAndDealsRebuild() {
 
 // Run quick stats rebuild 5 minutes after boot (gives seed scan time to fill some data)
 // Boot sequence handles stats rebuild — see runFullBootSequence()
-cron.schedule('0 */2 * * *', () => rebuildGlobalDeals().catch(e => console.error('[Deals Cron]', e.message)));
+cron.schedule('*/30 * * * *', () => rebuildGlobalDeals().catch(e => console.error('[Deals Cron]', e.message)));
 
 // ── Full boot sequence ────────────────────────────────────────────────────────
 // Runs everything in the right order immediately on deploy.
@@ -6450,12 +6455,26 @@ Return ONLY JSON:
         const match = text.match(/\{[\s\S]*\}/);
         if (match) {
           const r = JSON.parse(match[0]);
-          results[idx] = {
-            idx,
-            rating:   r.rating   || 'yellow',
-            reason:   (r.reason  || '').slice(0, 60),
-            relevant: r.relevant !== false,
-          };
+          const rating   = r.rating   || 'yellow';
+        const reason   = (r.reason  || '').slice(0, 60);
+        const relevant = r.relevant !== false;
+
+        results[idx] = { idx, rating, reason, relevant };
+
+        // Inject high-scoring deals into DB immediately so they appear on Deals page
+        // without waiting for the nightly scorer — same effect as Facebook's real-time feed
+        if ((rating === 'rainbow' || rating === 'green') && relevant && l.id) {
+          const flipScoreMap = { rainbow: 80, green: 62 };
+          pool.query(
+            `UPDATE listings SET
+               flip_score       = GREATEST(COALESCE(flip_score, 0), $1),
+               flip_deal_type   = COALESCE(flip_deal_type, 'underpriced'),
+               flip_reasoning   = $2,
+               flip_scored_at   = COALESCE(flip_scored_at, NOW())
+             WHERE listing_id = $3 AND (flip_score IS NULL OR flip_score < $1)`,
+            [flipScoreMap[rating], reason, String(l.id)]
+          ).catch(e => console.error('[RateBatch] DB write error:', e.message));
+        }
         } else {
           results[idx] = { idx, rating: 'yellow', reason: '', relevant: true };
         }
