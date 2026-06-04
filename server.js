@@ -12,8 +12,55 @@ const { Pool } = require('pg');
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const app = express();
-app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://flip-radar.app,https://www.flip-radar.app').split(',').map(o => o.trim());
+app.use(cors({ origin: function(origin, callback) {
+  if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+  callback(new Error('Not allowed by CORS'));
+}, credentials: true, methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
 app.options('*', cors());
+// ── Rate limiting ─────────────────────────────────────────
+const rateLimit = require('express-rate-limit');
+const slowDown  = require('express-slow-down');
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20, // 20 attempts per 15 min per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later' },
+});
+
+const appraisalLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many appraisal requests' },
+});
+
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests' },
+});
+
+app.use(generalLimiter);
+
+
+// ── Security headers ──────────────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
+
 app.use(express.json({ limit: '10mb' }));
 
 // ── PostgreSQL (Neon) ─────────────────────────────────────
@@ -992,7 +1039,8 @@ const K = {
 };
 
 // ── Auth ──────────────────────────────────────────────────
-const JWT_SECRET     = process.env.AUTH_SECRET || 'flipradar-secret-change-me';
+const JWT_SECRET = process.env.AUTH_SECRET;
+if (!JWT_SECRET) { console.error('[FATAL] AUTH_SECRET env var not set — refusing to start'); process.exit(1); }
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
 // ── Stripe ────────────────────────────────────────────────
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || null;
@@ -1003,18 +1051,14 @@ const PRICE_IDS = {
   pro_weekly:      'price_pro_weekly_placeholder',    // TODO: replace with real Stripe price ID
   pro_monthly:     'price_pro_monthly_placeholder',   // TODO: replace with real Stripe price ID
   pro_yearly:      'price_pro_yearly_placeholder',    // TODO: replace with real Stripe price ID
-  premium_weekly:  'price_1Ta7PsPDjYUYNInHMvbMiWvV',
-  premium_monthly: 'price_1Ta7QDPDjYUYNInHDQTp70Mt',
-  premium_yearly:  'price_1Ta7QSPDjYUYNInHLG2F4aT3',
 };
 const PRICE_TO_PLAN = {};
 Object.entries(PRICE_IDS).forEach(([key, priceId]) => {
-  if (key.startsWith('basic'))   PRICE_TO_PLAN[priceId] = 'basic';
-  else if (key.startsWith('pro')) PRICE_TO_PLAN[priceId] = 'pro';
-  else                            PRICE_TO_PLAN[priceId] = 'premium';
+  if (key.startsWith('basic')) PRICE_TO_PLAN[priceId] = 'basic';
+  else                         PRICE_TO_PLAN[priceId] = 'pro';
 });
-const PLAN_APPRAISAL_LIMITS = { free: 999, basic: 999, pro: 999, premium: 999 }; // TEMP — reset before launch
-const PLAN_WATCHLIST_LIMITS = { free: 0, basic: 2, pro: 2, premium: 5 };
+const PLAN_APPRAISAL_LIMITS = { free: 5, basic: 25, pro: 100 };
+const PLAN_WATCHLIST_LIMITS = { free: 0, basic: 0, pro: 2 };
 const FROM_EMAIL    = process.env.FROM_EMAIL || 'FlipRadar <noreply@yourdomain.com>';
 const INACTIVE_DAYS = 7;
 const BCRYPT_ROUNDS = 10;
@@ -1024,8 +1068,8 @@ const SEEN_MAX_ENTRIES    = 5000;
 
 
 
-// ── Owner account — always premium, no payment required ──
-const OWNER_EMAIL = 'giannimenolotto@gmail.com';
+// ── Owner account — always pro, no payment required ──
+const OWNER_EMAIL = (process.env.OWNER_EMAIL || '').toLowerCase().trim() || null;
 let ownerUserId = null; // resolved at boot
 function isOwner(userOrWatcher) {
   if (!userOrWatcher) return false;
@@ -1033,9 +1077,9 @@ function isOwner(userOrWatcher) {
   if (ownerUserId && userOrWatcher.userId === ownerUserId) return true;
   return false;
 }
-// Use this everywhere instead of user.plan — owner always gets premium
+// Use this everywhere instead of user.plan — owner always gets pro (top plan)
 function getEffectivePlan(userOrWatcher) {
-  if (isOwner(userOrWatcher)) return 'premium';
+  if (isOwner(userOrWatcher)) return 'pro';
   return userOrWatcher?.plan || 'free';
 }
 
@@ -1824,10 +1868,9 @@ function verificationEmail(name, email, code) {
 
 // ── Scan intervals per plan ───────────────────────────────
 const PLAN_INTERVALS = {
-  free:    2 * 60 * 60 * 1000,  // 2 hours
-  basic:   30 * 60 * 1000,      // 30 mins
-  pro:     30 * 60 * 1000,      // 30 mins
-  premium: 30 * 60 * 1000,      // 30 mins
+  free:  null,                   // manual only — no auto scan
+  basic: null,                   // manual only — no auto scan
+  pro:   30 * 60 * 1000,         // 30 mins
 };
 
 // ── In-memory state ───────────────────────────────────────
@@ -2726,8 +2769,12 @@ const watchTimers = {};
 
 function startWatchTimer(watcher) {
   if (watchTimers[watcher.id]) clearInterval(watchTimers[watcher.id]);
-  const interval = PLAN_INTERVALS[getEffectivePlan(watcher)] || PLAN_INTERVALS.basic;
-  console.log(`[Timer] "${watcher.keyword}" every ${interval/60000}m (${watcher.plan||'basic'})`);
+  const interval = PLAN_INTERVALS[getEffectivePlan(watcher)];
+  if (!interval) {
+    console.log(`[Timer] "${watcher.keyword}" — no auto scan (${watcher.plan||'free'})`);
+    return; // free/basic — manual only
+  }
+  console.log(`[Timer] "${watcher.keyword}" every ${interval/60000}m (${watcher.plan||'free'})`);
   watchTimers[watcher.id] = setInterval(() => {
     scanWatchItem(watcher).catch(e => console.error(`[Timer] Error for "${watcher.keyword}":`, e.message));
   }, interval);
@@ -3887,7 +3934,7 @@ app.get('/db/prices', authMiddleware, async (req, res) => {
 });
 
 // ── Auth routes ───────────────────────────────────────────
-app.post('/auth/signup', async (req, res) => {
+app.post('/auth/signup', authLimiter, async (req, res) => {
   try {
     const { email, password, name } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
@@ -3903,7 +3950,7 @@ app.post('/auth/signup', async (req, res) => {
       passwordHash,
       createdAt:     new Date().toISOString(),
       lastSeen:      new Date().toISOString(),
-      plan:          'basic',
+      plan:          'free',
       emailVerified: false,
       verifyCode,
       verifyExpiry:  new Date(Date.now() + 15 * 60 * 1000).toISOString(),
@@ -3938,7 +3985,7 @@ app.post('/auth/verify-email', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/auth/resend-verify', authMiddleware, async (req, res) => {
+app.post('/auth/resend-verify', authMiddleware, authLimiter, async (req, res) => {
   try {
     const user = await getUser(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -3952,7 +3999,7 @@ app.post('/auth/resend-verify', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
@@ -3995,6 +4042,75 @@ app.get('/auth/me', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// DELETE /auth/account — permanently delete account and all associated data
+// Required by Apple App Store (since 2022) and Google Play (since Dec 2023).
+// Requires password confirmation to prevent accidental or hijacked deletion.
+app.delete('/auth/account', authMiddleware, async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: 'Password confirmation required' });
+
+    const user = await getUser(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Verify password before deleting — prevents deletion via stolen token
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) return res.status(401).json({ error: 'Incorrect password' });
+
+    console.log(`[Auth] Account deletion requested: ${user.email}`);
+
+    // ── 1. Cancel Stripe subscription if active ───────────
+    if (stripe && user.stripeSubscriptionId) {
+      try {
+        await stripe.subscriptions.cancel(user.stripeSubscriptionId);
+        console.log(`[Auth] Cancelled Stripe subscription for ${user.email}`);
+      } catch (e) {
+        console.error(`[Auth] Stripe cancel failed (non-fatal):`, e.message);
+      }
+    }
+
+    // ── 2. Stop and delete all watch timers ───────────────
+    const watchIds = await getUserWatchIds(req.userId);
+    for (const watchId of watchIds) {
+      stopWatchTimer(watchId);
+      await deleteWatch(watchId);
+      await removeFromGlobalWatchIndex(watchId);
+    }
+    watchlist = watchlist.filter(w => w.userId !== req.userId);
+
+    // ── 3. Delete all Redis keys for this user ────────────
+    const keysToDelete = [
+      K.user(req.userId),
+      K.emailIdx(user.email),
+      K.userWatches(req.userId),
+      K.listings(req.userId),
+      K.seen(req.userId),
+      K.blocked(req.userId),
+      K_push(req.userId),
+    ];
+    await Promise.allSettled(keysToDelete.map(k => redisDel(k)));
+
+    // ── 4. Anonymise DB listings (don't delete — they're in the shared price pool) ──
+    // We keep the price data because it's aggregate market data, not personal data.
+    // We strip the seller_name field which came from Facebook (not our user's name).
+    // The listing_id is a Facebook ID, not tied to the user account.
+    await pool.query(
+      `UPDATE listings SET seller_name = NULL WHERE keyword IN (SELECT keyword FROM unnest($1::text[]) AS keyword)`,
+      [watchIds]
+    ).catch(() => {}); // non-fatal
+
+    // ── 5. Invalidate in-memory user cache ────────────────
+    _invalidateUserCache(req.userId);
+
+    console.log(`[Auth] ✅ Account deleted: ${user.email} (${req.userId}) — ${watchIds.length} watches removed`);
+    res.json({ ok: true, message: 'Account and all associated data have been deleted.' });
+
+  } catch (e) {
+    console.error('[Auth/DeleteAccount]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ── Watchlist routes ──────────────────────────────────────
 app.get('/watchlist', authMiddleware, async (req, res) => {
   try {
@@ -4008,12 +4124,17 @@ app.post('/watchlist', authMiddleware, async (req, res) => {
     const { keyword, maxPrice, minPrice, pushoverToken, pushoverUser, plan, name, speed } = req.body;
     if (!keyword || keyword.trim().length < 2)
       return res.status(400).json({ error: 'Keyword required' });
+    if (keyword.trim().length > 100)
+      return res.status(400).json({ error: 'Keyword too long (max 100 characters)' });
+    // Basic XSS/injection guard
+    if (/<[^>]*>|javascript:|data:|vbscript:/i.test(keyword))
+      return res.status(400).json({ error: 'Invalid keyword' });
     const user = await getUser(req.userId);
     const planLimit = PLAN_WATCHLIST_LIMITS[getEffectivePlan(user)];
     const existingWatches = await getUserWatches(req.userId);
     if (!isOwner(user) && existingWatches.length >= planLimit)
       return res.status(403).json({ error: 'Watchlist limit reached for your plan', plan: getEffectivePlan(user), limit: planLimit });
-    const watchPlan = plan || (speed === 'premium' ? 'premium' : 'basic');
+    const watchPlan = plan || (speed === 'pro' ? 'pro' : 'free');
     const rawExclude = req.body.excludeWords || [];
     const excludeWords = Array.isArray(rawExclude)
       ? rawExclude.map(w => w.toLowerCase().trim()).filter(Boolean)
@@ -4229,22 +4350,42 @@ app.post('/appraise', authMiddleware, async (req, res) => {
 });
 
 // ── Misc routes ───────────────────────────────────────────
-app.get('/proxy-image', async (req, res) => {
+app.get('/proxy-image', authMiddleware, async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'url required' });
+  // SSRF protection: only allow known Facebook/Instagram CDN domains
+  const ALLOWED_IMAGE_DOMAINS = [
+    'scontent.fmel',   // Facebook CDN Melbourne
+    'scontent.fsyd',   // Facebook CDN Sydney
+    'scontent.fbne',   // Facebook CDN Brisbane
+    'scontent-',       // Facebook CDN (general prefix)
+    'lookaside.fbsbx.com',
+    'external.fmel',
+    'external.fsyd',
+    'external.fbcdn.net',
+    'fbcdn.net',
+  ];
   try {
+    const parsedUrl = new URL(url);
+    const isAllowed = ALLOWED_IMAGE_DOMAINS.some(d => parsedUrl.hostname.includes(d) || parsedUrl.hostname.endsWith(d));
+    if (!isAllowed) return res.status(400).json({ error: 'URL not from allowed domain' });
+    // Enforce HTTPS only
+    if (parsedUrl.protocol !== 'https:') return res.status(400).json({ error: 'HTTPS required' });
     const response = await axios.get(url, {
       responseType: 'arraybuffer', timeout: 10000,
       headers: {
         'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
         'Referer': 'https://www.facebook.com/'
-      }
+      },
+      maxRedirects: 2,
     });
+    const contentType = response.headers['content-type'] || '';
+    if (!contentType.startsWith('image/')) return res.status(400).json({ error: 'Not an image' });
     res.json({
       base64: Buffer.from(response.data).toString('base64'),
-      mediaType: response.headers['content-type'] || 'image/jpeg'
+      mediaType: contentType,
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: 'Image fetch failed' }); }
 });
 
 app.post('/scan/now', authMiddleware, async (req, res) => {
@@ -4256,7 +4397,7 @@ app.post('/scan/now', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/scan/test', async (req, res) => {
+app.post('/scan/test', authMiddleware, async (req, res) => {
   const { keyword } = req.body;
   if (!keyword) return res.status(400).json({ error: 'keyword required' });
   try {
@@ -4933,7 +5074,7 @@ app.get('/admin/deals-debug', authMiddleware, async (req, res) => {
         : !sampleDeals.rows.length
         ? '⚠️ No qualifying deals — not enough price spread yet, need more listings per keyword'
         : dealsCache?.deals?.length
-        ? `✅ ${dealsCache.deals.length} deals in cache — check frontend auth/premium flag`
+        ? `✅ ${dealsCache.deals.length} deals in cache — check frontend auth/pro flag`
         : '⚠️ Deals qualify in DB but cache is empty — trigger /admin/deals-rebuild',
     });
   } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
@@ -5050,6 +5191,11 @@ app.post('/photo-check', authMiddleware, async (req, res) => {
 
     const { listingId, imageBase64, mimeType, title, keyword, price } = req.body;
     if (!listingId || !imageBase64) return res.status(400).json({ error: 'Missing listingId or imageBase64' });
+    // Validate image size — max 5MB base64 encoded (~3.75MB raw)
+    if (imageBase64.length > 5 * 1024 * 1024) return res.status(400).json({ error: 'Image too large' });
+    // Validate mime type
+    const ALLOWED_MIMES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif'];
+    if (mimeType && !ALLOWED_MIMES.includes(mimeType)) return res.status(400).json({ error: 'Invalid image type' });
 
     // Skip if already analysed
     const existing = await pool.query(
@@ -5218,7 +5364,7 @@ app.get('/deals', authMiddleware, async (req, res) => {
   try {
     const user = await getUser(req.userId);
     if (!user) return res.status(401).json({ error: 'User not found' });
-    if (getEffectivePlan(user) !== 'premium') return res.status(403).json({ error: 'premium_required' });
+    if (!['pro'].includes(getEffectivePlan(user))) return res.status(403).json({ error: 'pro_required' });
 
     const cached = await redisGet('deals:global');
     if (!cached || !cached.deals || !cached.deals.length) {
@@ -5410,7 +5556,7 @@ app.post('/stripe/portal', authMiddleware, async (req, res) => {
 });
 
 app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.json({ ok: true });
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) { console.error('[Stripe] Webhook received but not configured'); return res.status(500).json({ error: 'Webhook not configured' }); }
   let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
@@ -5423,7 +5569,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
       if (userId && priceId) {
         const user = await getUser(userId);
         if (user) {
-          user.plan = PRICE_TO_PLAN[priceId] || 'basic';
+          user.plan = PRICE_TO_PLAN[priceId] || 'free';
           user.stripeCustomerId     = session.customer;
           user.stripeSubscriptionId = session.subscription;
           await saveUser(user);
@@ -5581,7 +5727,7 @@ const K_push = userId => `fr:push:${userId}`;
 
 // POST /ai/vehicle — vehicle appraisal grounded in DB data when available
 // DB data is fetched FIRST so AI can reason from real market numbers.
-app.post('/ai/vehicle', authMiddleware, async (req, res) => {
+app.post('/ai/vehicle', authMiddleware, appraisalLimiter, async (req, res) => {
   try {
     if (!GEMINI_API_KEY && !ANTHROPIC_API_KEY) return res.status(500).json({ error: 'No AI keys configured' });
 
@@ -6014,7 +6160,7 @@ app.post('/ai/text', authMiddleware, async (req, res) => {
 // 4. For bundles: each item gets its own price lookup, tallied up, compared to ask
 // 5. Final verdict based on real market data, not RRP or retail
 
-app.post('/ai/appraise', authMiddleware, async (req, res) => {
+app.post('/ai/appraise', authMiddleware, appraisalLimiter, async (req, res) => {
   try {
     if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini not configured' });
 
@@ -6716,8 +6862,9 @@ app.delete('/appraisal-cache', authMiddleware, async (req, res) => {
 
 // ── DEV: force-set plan (secret-gated, remove before public launch) ──
 // POST /dev/set-plan  { secret: "...", plan: "premium" }
-const DEV_SECRET = process.env.DEV_SECRET || 'flipradar-dev';
+const DEV_SECRET = process.env.DEV_SECRET || null; // null = endpoint disabled
 app.post('/dev/set-plan', authMiddleware, async (req, res) => {
+  if (!DEV_SECRET) return res.status(404).json({ error: 'Not found' }); // endpoint disabled when DEV_SECRET not set
   const { secret, plan } = req.body;
   if (secret !== DEV_SECRET) return res.status(403).json({ error: 'Forbidden' });
   const validPlans = ['free', 'basic', 'premium'];
