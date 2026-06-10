@@ -76,29 +76,66 @@ const pool = new Pool({
 
 pool.on('error', (e) => console.error('[DB] Pool error:', e.message));
 
-// ── Gemini call with exponential backoff on 503/429 ──────────────────────────
+// ── Global Gemini semaphore — caps total concurrent Gemini calls across ALL users ──
+// Without this, 4 users scanning simultaneously = 20 parallel Gemini requests → 429 storm.
+// All geminiPost calls share this single queue regardless of which route triggered them.
+const GEMINI_MAX_CONCURRENT = 8; // safe ceiling for Tier 1; raise if you upgrade quota
+let _geminiActive = 0;
+const _geminiQueue = [];
+function _geminiAcquire() {
+  return new Promise(resolve => {
+    if (_geminiActive < GEMINI_MAX_CONCURRENT) {
+      _geminiActive++;
+      resolve();
+    } else {
+      _geminiQueue.push(resolve);
+    }
+  });
+}
+function _geminiRelease() {
+  if (_geminiQueue.length > 0) {
+    const next = _geminiQueue.shift();
+    next(); // transfer slot directly — active count stays the same
+  } else {
+    _geminiActive--;
+  }
+}
+
+// ── Gemini call with global concurrency cap + exponential backoff on 503/429 ──
 // Drop-in wrapper for all Gemini API calls. Retries up to 4 times with
 // doubling delay (2s → 4s → 8s → 16s, capped 30s) on transient errors.
 async function geminiPost(url, body, opts = {}) {
+  await _geminiAcquire();
   const MAX_RETRIES = 4;
   let delay = 2000;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      return await axios.post(url, body, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 25000,
-        ...opts,
-      });
-    } catch (e) {
-      const status = e.response?.status;
-      if ((status === 503 || status === 429) && attempt < MAX_RETRIES) {
-        console.warn(`[Gemini] ${status} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
-        await new Promise(r => setTimeout(r, delay));
-        delay = Math.min(delay * 2, 30000);
-        continue;
+  try {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        return await axios.post(url, body, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 25000,
+          ...opts,
+        });
+      } catch (e) {
+        const status = e.response?.status;
+        if ((status === 503 || status === 429) && attempt < MAX_RETRIES) {
+          // Log WHICH quota Google says is exhausted — names the exact metric + limit
+          if (status === 429 && attempt === 0) {
+            try {
+              const detail = JSON.stringify(e.response?.data?.error?.details || e.response?.data?.error?.message || '').slice(0, 600);
+              console.warn(`[Gemini] 429 detail: ${detail}`);
+            } catch (_) {}
+          }
+          console.warn(`[Gemini] ${status} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+          await new Promise(r => setTimeout(r, delay));
+          delay = Math.min(delay * 2, 30000);
+          continue;
+        }
+        throw e;
       }
-      throw e;
     }
+  } finally {
+    _geminiRelease();
   }
 }
 
@@ -1223,7 +1260,7 @@ async function aiExtractVehicleFields(title, keyword, description = '') {
     let text = '';
     if (GEMINI_API_KEY) {
       const res = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
         { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
       );
@@ -2482,7 +2519,7 @@ async function aiImageFilter(listings, keyword) {
   if (!GEMINI_API_KEY) return listings;
   if (!listings.length) return listings;
 
-  const CONCURRENCY = 6;
+  const CONCURRENCY = 3; // global semaphore handles cross-user throttling
   const results     = new Array(listings.length).fill(null);
 
   async function checkOne(listing, idx) {
@@ -5230,7 +5267,7 @@ Look at the photo and return ONLY this JSON (no markdown):
 Only mark matches_keyword false if it is clearly a DIFFERENT type of product.`;
 
     const geminiRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: [
         { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
         { text: prompt }
@@ -5711,9 +5748,9 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
 // gemini-2.5-flash-lite  — vision + text, cheapest. Use for bulk image gate checks.
 // gemini-2.5-flash       — smarter reasoning. Use for appraisals and border ratings.
 // gemini-2.5-flash-lite was shut down June 1 2026 — updated to 2.5 equivalents
-const GEMINI_CHEAP  = 'gemini-2.5-flash-lite'; // bulk image checks — same price, better quality
-const GEMINI_SMART  = 'gemini-2.5-flash';       // appraisals, text reasoning
-const GEMINI_RATE   = 'gemini-2.5-flash';       // rate-batch border colours — quality matters here
+const GEMINI_CHEAP  = 'gemini-2.5-flash-lite'; // stable until Jul 22 2026 // bulk image checks — same price, better quality
+const GEMINI_SMART  = 'gemini-2.5-flash-lite'; // stable until Jul 22 2026 — preview models have shared/free-tier quotas, avoid       // appraisals, text reasoning
+const GEMINI_RATE   = 'gemini-2.5-flash-lite'; // stable until Jul 22 2026 — preview models have shared/free-tier quotas, avoid       // rate-batch border colours — quality matters here
 const geminiUrl = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
 
 // ── Web Push (VAPID) ──────────────────────────────────────
@@ -5969,14 +6006,14 @@ app.post('/ai/vehicle', authMiddleware, appraisalLimiter, async (req, res) => {
       }
       parts.push({ text: prompt });
       const geminiRes = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
         { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
       );
       text = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else if (GEMINI_API_KEY) {
       const geminiRes = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
         { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
       );
@@ -6212,7 +6249,7 @@ Return ONLY JSON (no markdown):
     if (imgData) identifyParts.unshift({ inline_data: imgData });
 
     const identRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: identifyParts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
       { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
     );
@@ -6289,7 +6326,7 @@ CRITICAL PRICING RULES:
     if (imgData) appraisalParts.unshift({ inline_data: imgData });
 
     const appraisalRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
       { contents: [{ parts: appraisalParts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
       { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
     );
@@ -6350,7 +6387,7 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
     //   3. Keyword context so AI knows what a valid match looks like
     // This means the rating reflects real condition, not just a title/price guess.
 
-    const CONCURRENCY = 5; // parallel calls — fast enough, won't hammer Gemini
+    const CONCURRENCY = 3; // per-request cap — global semaphore handles cross-user throttling
     const results = new Array(listings.length).fill(null);
 
     async function rateOne(l, idx) {
@@ -6394,50 +6431,28 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
         } catch (_) {}
       }
 
-      // ── Get description + image analysis ────────────────────────────────
-      // Priority 1: description sent directly from frontend payload (no DB cost)
-      //   SociaVault returns descriptions on ~50% of search results — these come
-      //   through on the listing object and get passed here directly.
-      // Priority 2: DB query for the rest (no extra SociaVault credit)
-      //   Covers listings where description came through on a previous scan.
-      let priorCondition = l.imgCondition || null;
-      let priorMatches   = true;
-      let listingDesc    = l.description || null; // from frontend payload if available
+      // ── Get description from payload or DB ──────────────────────────────
+      // Priority 1: from frontend payload (SociaVault returns ~50% of the time)
+      // Priority 2: DB lookup (covers listings seen on a previous scan)
+      let listingDesc = l.description || null;
 
-      if ((!listingDesc || !priorCondition) && l.id) {
+      if (!listingDesc && l.id) {
         try {
           const { rows: dbRows } = await pool.query(
-            `SELECT description, img_condition, img_matches_keyword
-             FROM listings WHERE listing_id = $1`,
+            `SELECT description FROM listings WHERE listing_id = $1`,
             [String(l.id)]
           );
-          if (dbRows[0]) {
-            // Only use DB description if we don't already have one from payload
-            if (!listingDesc && dbRows[0].description) {
-              listingDesc = dbRows[0].description.slice(0, 300).trim();
-            }
-            priorCondition = priorCondition || dbRows[0].img_condition || null;
-            priorMatches   = dbRows[0].img_matches_keyword !== false;
+          if (dbRows[0]?.description) {
+            listingDesc = dbRows[0].description.slice(0, 300).trim();
           }
         } catch (_) {}
       }
 
-      // ── Fetch image ─────────────────────────────────────────────────────
-      // Only fetch if we don't already have condition from the DB gate.
-      // Image URLs expire fast on FB CDN so fetch immediately, not later.
-      let imgData = null;
-      if (GEMINI_API_KEY && l.image) {
-        try {
-          const imgRes = await axios.get(l.image, {
-            responseType: 'arraybuffer', timeout: 8000,
-            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.facebook.com/' },
-          });
-          imgData = {
-            mime_type: imgRes.headers['content-type']?.split(';')[0] || 'image/jpeg',
-            data: Buffer.from(imgRes.data).toString('base64'),
-          };
-        } catch (_) { /* image expired — use priorCondition if available */ }
-      }
+      // ── Image analysis removed — text-only rating for throughput ────────
+      // Images were the main quota bottleneck (multimodal calls count ~10x against
+      // Gemini RPM). Rating on title + price + description is fast, scalable,
+      // and accurate enough for the border colour system.
+      const imgData = null;
 
       // ── Build prompt ────────────────────────────────────────────────────
       const specParts = [
@@ -6501,10 +6516,6 @@ app.post('/ai/rate-batch', authMiddleware, async (req, res) => {
 
       const sellRates = CATEGORY_SELL_RATES[kwToSellCategory(kw)] || CATEGORY_SELL_RATES._default;
 
-      const imgNote = imgData
-        ? `A photo is attached. Use it to verify the item matches the keyword and assess overall quality.`
-        : `No photo available — rate based on title and price only.`;
-
       const prompt = `You are a ruthless Australian Facebook Marketplace flipper. Your job is to find cheap deals to buy and resell for profit. You pass on 90% of listings.
 
 LISTING:
@@ -6516,13 +6527,11 @@ Year: ${l.year}` : ''}${listingDesc ? `
 Description: "${listingDesc}"` : ''}
 
 
-${imgNote}
 
 YOUR JOB:
-1. Look at the photo — does it match the keyword? Is this a real secondhand item?
-2. Read the description — any red flags? (needs work, as is, not running, no RWC, engine issues, flood, hail, project car, parts only)
-3. Is this a realistic flip? Can you buy it, clean it up, relist and profit?
-4. What does this actually sell for secondhand on AU Facebook Marketplace right now?
+1. Read the title and description — any red flags? (needs work, as is, not running, no RWC, engine issues, flood, hail, project car, parts only)
+2. Is this a realistic flip? Can you buy it, clean it up, relist and profit?
+3. What does this actually sell for secondhand on AU Facebook Marketplace right now?
 
 REASON FIELD — must be a clean price verdict, NOT analysis:
 GOOD: "25% below typical sell price" | "Overpriced for AU market" | "Strong demand, good price" | "No real resale market"
@@ -6553,11 +6562,9 @@ KM ADJUSTMENT FOR VEHICLES (critical — do not ignore):
 - The km note above already tells you which category this vehicle is in.
 
 INSTANT RED FLAGS (automatic red rating):
-- Photo shows damage, heavy rust, broken parts, flood or hail damage
 - Description mentions: needs work / as is / not working / engine issues / for parts / project / no RWC / unregistered
-- Retail stock photo or ORDER NOW advertisement (relevant:false)
+- Title contains ORDER NOW / wholesale / brand new stock (relevant:false)
 - Kids toy version of adult item (relevant:false)
-- Wrong item in photo (relevant:false)
 - Used mattress — hygiene issues, almost no resale in AU. Always red.
 - IKEA / flat-pack particle board furniture — depreciates to zero. Always red.
 - Generic budget sofas (Kmart/Fantastic/no-brand fabric) — no demand, hard to move. Red.
@@ -6566,7 +6573,7 @@ INSTANT RED FLAGS (automatic red rating):
 - Listed price is at or above what it actually sells for on AU FB
 
 RATING SCALE:
-rainbow — exceptional. 35%+ below real AU FB secondhand sell price, great condition confirmed in photo, high demand item
+rainbow — exceptional. 35%+ below real AU FB secondhand sell price, high demand item, no red flags in description
 green — solid deal. 15-35% below real AU FB secondhand sell price, condition is fine, real liquid market
 yellow — fair. Within 15% of real AU FB sell price, or condition unclear, or slow moving
 red — pass. Overpriced, bad condition, red flags in description, or no real resale market
@@ -6579,10 +6586,9 @@ Return ONLY JSON:
       try {
         let text = '';
         if (GEMINI_API_KEY) {
-          const parts = imgData
-            ? [{ inline_data: imgData }, { text: prompt }]
-            : [{ text: prompt }];
-          // Always use GEMINI_RATE (2.5 Flash) for border ratings —
+          // Text-only — imgData removed for throughput (see Option 4 refactor)
+          const parts = [{ text: prompt }];
+          // Always use GEMINI_RATE (stable flash-lite) for border ratings —
           // this is the most user-visible output, quality matters
           const r = await geminiPost(
             geminiUrl(GEMINI_RATE),
@@ -6681,7 +6687,7 @@ app.post('/ai/text-image', authMiddleware, async (req, res) => {
       }
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
     const geminiRes = await axios.post(url, { contents: [{ parts }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 30000,
@@ -7099,7 +7105,7 @@ async function getKeywordPriceAnchor(keyword, sampleTitles = []) {
     let text = '';
     if (GEMINI_API_KEY) {
       const r = await geminiPost(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
         { contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
         { timeout: 10000 }
       );
@@ -7170,6 +7176,7 @@ async function refreshKeywordAnchors() {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`FlipRadar backend on port ${PORT}`);
+  console.log(`[BUILD] v2026-06-10-quota-fix — model=${GEMINI_RATE}, semaphore=${GEMINI_MAX_CONCURRENT}, text-only ratebatch`);
   console.log(`SociaVault: ${SOCIAVAULT_API_KEY ? 'set' : 'NO TOKEN — add SOCIAVAULT_API_KEY'}`);
   console.log(`Redis:      ${REDIS_URL           ? 'connected' : 'NOT SET'}`);
   console.log(`Gemini:     ${GEMINI_API_KEY   ? 'connected' : 'NOT SET — add GEMINI_API_KEY'}`);
